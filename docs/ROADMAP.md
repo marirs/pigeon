@@ -40,6 +40,7 @@ Expect this to deliver to a permissive destination and be rejected by a strict o
 - [ ] wildcard aliases
 - [ ] explicit reject rules
 - [ ] catch-all
+- [ ] redundant-alias detection against catch-all
 - [ ] plus-addressing
 - [ ] loop detection at configuration time
 - [ ] address normalisation

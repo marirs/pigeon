@@ -298,7 +298,11 @@ pigeon catchall remove example.com
 
 With catch-all on, any address that no alias claims is forwarded to the configured destination. Explicit aliases always win.
 
-Catch-all is never enabled implicitly. A missing alias argument will not silently turn it on.
+Catch-all is never enabled implicitly. A missing destination is an error, not a silent enable.
+
+Catch-all and aliases work together rather than replacing each other — catch-all takes the long tail, while aliases route the addresses that go somewhere else, split between people, or get refused. If every alias on a domain points where the catch-all already points, Pigeon tells you they are redundant instead of leaving you to find out.
+
+One thing to weigh: with catch-all on, every address on the domain is accepted at `RCPT TO`. Recipient rejection no longer applies, so dictionary attacks get `250` rather than `550` and spam volume rises. It is the right choice for a domain where every address should work, and a poor default for a domain with six real addresses.
 
 ---
 

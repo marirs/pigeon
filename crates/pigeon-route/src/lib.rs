@@ -18,6 +18,17 @@
 //! case — many addresses across many domains landing in one mailbox — stores
 //! and states that mailbox once.
 //!
+//! Catch-all and aliases coexist rather than excluding each other. Catch-all
+//! takes the long tail; aliases carry the addresses that route elsewhere, fan
+//! out to several destinations, or are refused. An alias resolving to the same
+//! destination as the catch-all is redundant — reported to the operator, never
+//! rejected, since it becomes meaningful again the moment the catch-all
+//! destination changes.
+//!
+//! Enabling catch-all has a cost the routing layer should make visible: every
+//! address on the domain then resolves, so recipient rejection at `RCPT TO`
+//! no longer applies and dictionary attacks are accepted rather than refused.
+//!
 //! # Loops are rejected when configured, not when mail arrives
 //!
 //! Forwarding an address to itself, or around a cycle of managed domains, is

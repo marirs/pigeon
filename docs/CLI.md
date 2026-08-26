@@ -375,6 +375,62 @@ Anything no alias claims is forwarded. Explicit aliases always win.
 
 Catch-all is never enabled implicitly. It exists only after `catchall add`.
 
+### Catch-all and aliases together
+
+They are not alternatives. Catch-all handles the long tail; aliases handle the addresses that need to go somewhere else, be split between people, or be refused outright.
+
+If every alias on a domain points at the same place as the catch-all, then yes — the aliases are doing nothing, and catch-all alone is the simpler configuration. Pigeon says so rather than leaving you to notice:
+
+```text
+$ pigeon alias add example.com sales
+
+Added:
+
+  sales@example.com → me@example.net
+
+Note: catch-all already forwards unmatched addresses to me@example.net,
+so this alias does not change where mail goes.
+
+  Useful anyway if you plan to point it elsewhere later, or want it
+  listed explicitly. Otherwise it can be removed.
+```
+
+Adding a catch-all reports the same thing from the other direction:
+
+```text
+$ pigeon catchall add example.com
+
+Catch-all enabled: → me@example.net
+
+6 of 8 existing aliases now forward to the same destination and no
+longer affect routing. Review with:
+
+  pigeon alias list example.com
+```
+
+`alias list` marks them, so a domain's real routing is visible at a glance:
+
+```text
+ALIAS                  DESTINATION              
+hello                  me@example.net           (same as catch-all)
+hi                     me@example.net           (same as catch-all)
+billing                finance@example.net      
+security               a@example.net, b@example.net
+postmaster-old         —                        REJECT
+
+catch-all              me@example.net
+```
+
+Nothing is refused or removed automatically. A redundant alias is a fact about your configuration, not an error, and it becomes meaningful the moment the catch-all destination changes.
+
+### The cost of catch-all
+
+With catch-all enabled, every address on the domain is accepted at `RCPT TO`.
+
+Recipient rejection stops applying, so dictionary attacks receive `250` instead of `550`, spam volume rises, and any accepted message that later proves undeliverable must be bounced — which is the backscatter path recipient rejection exists to avoid.
+
+Catch-all is the right choice for a domain where you genuinely want every address to work. It is a poor default for a domain with six real addresses on it.
+
 ## Destinations
 
 Aliases are managed per domain. Destinations are the other axis: one mailbox usually receives from many aliases across many domains, and when that mailbox changes you need to move all of them at once.
