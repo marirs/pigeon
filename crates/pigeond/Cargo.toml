@@ -1,0 +1,24 @@
+[package]
+name = "pigeond"
+description = "Pigeon mail forwarding daemon."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+pigeon-types = { workspace = true }
+pigeon-config = { workspace = true }
+pigeon-db = { workspace = true }
+pigeon-dns = { workspace = true }
+pigeon-auth = { workspace = true }
+pigeon-route = { workspace = true }
+pigeon-smtp = { workspace = true }
+pigeon-spool = { workspace = true }
+pigeon-alert = { workspace = true }
+
+[[bin]]
+name = "pigeond"
+path = "src/main.rs"

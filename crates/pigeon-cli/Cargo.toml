@@ -1,0 +1,20 @@
+[package]
+name = "pigeon-cli"
+description = "Pigeon command line interface."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+pigeon-types = { workspace = true }
+pigeon-config = { workspace = true }
+pigeon-db = { workspace = true }
+pigeon-dns = { workspace = true }
+pigeon-route = { workspace = true }
+
+[[bin]]
+name = "pigeon"
+path = "src/main.rs"

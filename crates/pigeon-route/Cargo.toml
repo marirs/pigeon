@@ -1,0 +1,12 @@
+[package]
+name = "pigeon-route"
+description = "Immutable routing snapshot and recipient resolution."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+pigeon-types = { workspace = true }

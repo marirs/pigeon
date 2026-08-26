@@ -1,0 +1,12 @@
+[package]
+name = "pigeon-auth"
+description = "DKIM signing/verification, ARC sealing, SRS, DMARC evaluation."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+pigeon-types = { workspace = true }
