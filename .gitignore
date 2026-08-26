@@ -1,0 +1,6 @@
+.*
+!.gitignore
+
+target/
+node_modules/
+Thumbs.db
