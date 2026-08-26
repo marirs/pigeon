@@ -2,19 +2,19 @@
 
 **Self-hosted email forwarding for your domains.**
 
-Pigeon is a lightweight, headless mail forwarding service built for developers, indie founders, and small teams who want to manage inbound email across multiple domains without a dashboard, external control plane, or recurring hosted-service dependency.
+Pigeon receives mail for the domains you own, resolves aliases and catch-all rules, and forwards messages to the mailboxes you already use. It can also send on behalf of those domains over authenticated SMTP submission.
 
-It is designed around a simple idea:
+It is built around a simple idea:
 
 **one binary, one SQLite database, your server, your DNS.**
 
-Pigeon receives email for your domains, resolves aliases and catch-all rules, validates mail-related DNS configuration, and forwards messages to your existing inboxes.
+No dashboard. No control plane. No hosted dependency. No telemetry.
 
 ---
 
-## Why Pigeon?
+## Why
 
-Running multiple domains often means maintaining addresses such as:
+Running several domains usually means maintaining addresses like:
 
 ```text
 hello@example.com
@@ -23,39 +23,49 @@ billing@example.com
 anything@anotherdomain.com
 ```
 
-Pigeon lets you route all of them from your own infrastructure.
+Hosted forwarding services do this well, and they do it on their infrastructure, under their limits, with your mail passing through their systems. Pigeon does the same job on a machine you control.
 
-There is no web interface to maintain and no separate database server to operate.
-
-Configuration is managed entirely through the CLI and stored locally in SQLite.
+Configuration lives in SQLite and is managed entirely through the `pigeon` command. There is no web interface to maintain and no external database to operate.
 
 ---
 
 ## Features
 
-- Multiple domains
+**Inbound forwarding**
+
+- Multiple domains on one host
 - Unlimited aliases
+- Exact, wildcard and reject rules
+- Plus-addressing (`hello+tag@` routes through `hello@`)
+- Multiple destinations per alias
+- Per-domain default destination, inherited by aliases
+- Bulk destination retargeting across domains
 - Catch-all forwarding
-- Multiple forwarding destinations
-- SQLite-backed configuration
+- SRS envelope rewriting
+- DKIM signature preservation
+- ARC sealing
+- Loop detection
+- Delivery queue with retry and bounce handling
+
+**Outbound sending**
+
+- Authenticated submission on port 587
+- Application credentials, not mailbox passwords
+- Per-identity and per-domain send authorisation
+- DKIM signing
+- Direct-to-MX or upstream relay delivery
+- Rate limits and abuse controls
+
+**Operations**
+
 - CLI-only management
 - Headless daemon
-- DNS readiness checks
-- MX validation
-- SPF validation
-- DKIM configuration checks
-- DMARC validation
-- TLS checks
-- Forwarding route inspection
-- Delivery queue and retry handling
-- Local DKIM key management
-- Loop detection
+- MX, SPF, DKIM, DMARC, PTR and TLS validation
+- Route inspection without sending mail
+- Email alerts when a domain is gated or recovers
 - Structured logging
-- IPv4 and IPv6 support
-- systemd-friendly operation
-- No dashboard
-- No telemetry
-- No cloud dependency
+- IPv4 and IPv6
+- systemd-friendly
 
 ---
 
@@ -75,61 +85,62 @@ Configuration is managed entirely through the CLI and stored locally in SQLite.
                 │ Route Engine  │
                 └───────┬───────┘
                         │
-                 ┌──────┴──────┐
-                 │             │
-                 ▼             ▼
-              Aliases       Catch-all
-                 │             │
-                 └──────┬──────┘
-                        │
-                        ▼
-                 Mail Forwarding
-                        │
-                        ▼
-              Gmail / Proton / iCloud
-              Outlook / Fastmail / etc.
+          ┌─────────────┼─────────────┐
+          ▼             ▼             ▼
+       Reject       Aliases       Catch-all
+                        │             │
+                        └──────┬──────┘
+                               ▼
+                     SRS · DKIM · ARC
+                               │
+                               ▼
+                       Mail Forwarding
+                               │
+                               ▼
+                    your existing mailbox
 ```
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 
 ---
 
 ## Philosophy
 
-Pigeon is intentionally small.
+Pigeon is intentionally small. It is not trying to become a mail platform.
 
-It is not trying to become a full mail platform.
+It does not provide mailboxes, IMAP, POP3, webmail, user accounts, billing, teams, marketing email, newsletters, or analytics.
 
-It does not provide:
+It does one job:
 
-- Mailboxes
-- IMAP
-- POP3
-- Webmail
-- User accounts
-- Billing
-- Teams
-- Marketing email
-- Newsletter delivery
-- Analytics dashboards
-
-Pigeon focuses on one job:
-
-> Receive mail for a domain and forward it reliably.
+> Receive mail for a domain and forward it reliably. Send mail for a domain when explicitly authorised.
 
 ---
 
-## CLI
+## Getting started
 
-Pigeon is managed through the `pigeon` command.
+Every level of the CLI documents itself, and a bare noun prints its help rather than an error:
+
+```bash
+pigeon                    # overview
+pigeon domain             # everything you can do to a domain
+pigeon domain add --help  # one command, in detail
+```
+
+A working setup is three commands:
+
+```bash
+pigeon domain add example.com --to me@example.net
+pigeon alias add example.com hello,hi,support
+pigeon domain check example.com
+```
+
+Commands read `pigeon <noun> <verb> [target]`, and the verbs repeat — `list`, `add`, `remove`, `show`, `check`, `test` — so learning one noun teaches the rest. Full reference in [`docs/CLI.md`](docs/CLI.md).
 
 ### Add a domain
 
 ```bash
-pigeon domain add example.com
+pigeon domain add example.com --to me@example.net
 ```
-
-Pigeon generates the required configuration and displays the DNS records that must be added.
-
-Example:
 
 ```text
 Adding example.com...
@@ -140,35 +151,32 @@ Adding example.com...
 Required DNS configuration:
 
 MX
-  @       10 mx1.pigeon.mx
+  @       10 mx1.yourserver.net
 
 TXT
-  @       v=spf1 mx ~all
+  @       v=spf1 mx -all
 
 TXT
   pigeon._domainkey
-          v=DKIM1; k=ed25519; p=...
+          v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFA...
 
 TXT
-  _dmarc
-          v=DMARC1; p=none
+  _dmarc  v=DMARC1; p=none; rua=mailto:dmarc@example.com
 
-Domain status: NOT READY
+Domain status: PENDING_DNS
 
 Run:
 
   pigeon domain check example.com
 ```
 
----
+`mx1.yourserver.net` is the hostname of *your* Pigeon host. One server can carry mail for as many domains as you like — each domain simply points its MX at it.
 
-## Validate a Domain
+### Publish the records, then validate
 
 ```bash
 pigeon domain check example.com
 ```
-
-Example:
 
 ```text
 example.com
@@ -182,7 +190,7 @@ example.com
 Domain ACTIVE.
 ```
 
-If something is wrong:
+When something is wrong, Pigeon tells you exactly what to change:
 
 ```text
 example.com
@@ -193,29 +201,206 @@ Current:
   mx.old-provider.net
 
 Expected:
-  mx1.pigeon.mx
+  mx1.yourserver.net
 
 Required:
 
   Type: MX
   Name: @
   Priority: 10
-  Value: mx1.pigeon.mx
+  Value: mx1.yourserver.net
 
 Domain NOT READY.
 ```
 
----
+A domain only becomes `ACTIVE` once every required check passes. There is no manual override.
 
-## Check Everything
-
-Pigeon includes a configuration test similar to other infrastructure tools.
+### Run it
 
 ```bash
-pigeon check
+pigeon run
 ```
 
-Example:
+Or under systemd:
+
+```bash
+systemctl enable --now pigeond
+pigeon status
+```
+
+---
+
+## Aliases
+
+A domain has one default destination, so the address you forward to is typed once rather than once per alias:
+
+```bash
+pigeon domain forward example.com me@example.net
+pigeon alias add example.com hello
+```
+
+Several at a time:
+
+```bash
+pigeon alias add example.com hello,hi,support
+```
+
+```text
+Added to example.com:
+
+  hello@example.com    → me@example.net
+  hi@example.com       → me@example.net
+  support@example.com  → me@example.net
+
+3 aliases using the domain default.
+```
+
+Override the destination where it differs, or fan one alias out:
+
+```bash
+pigeon alias add example.com billing --to finance@example.net
+pigeon alias add example.com security --to a@example.net,b@example.net
+```
+
+Wildcards, for patterned addresses:
+
+```bash
+pigeon alias add example.com 'shop-*'
+```
+
+Reject rules, for addresses that should never be accepted:
+
+```bash
+pigeon alias add example.com postmaster-old --reject
+```
+
+Removal:
+
+```bash
+pigeon alias remove example.com hello
+pigeon alias remove example.com hello,hi,support
+pigeon alias remove example.com --all
+```
+
+### Plus-addressing
+
+Enabled per domain and on by default. `hello+github@example.com` matches the `hello` alias, and the tag is preserved in the forwarded message so your destination mailbox can still filter on it.
+
+---
+
+## Catch-all
+
+```bash
+pigeon catchall add example.com
+pigeon catchall add example.com --to me@example.net
+pigeon catchall remove example.com
+```
+
+With catch-all on, any address that no alias claims is forwarded to the configured destination. Explicit aliases always win.
+
+Catch-all is never enabled implicitly. A missing alias argument will not silently turn it on.
+
+---
+
+## Destinations
+
+Aliases are managed per domain. Destinations are the other axis — one mailbox receiving from many aliases across many domains.
+
+```bash
+pigeon destination list
+```
+
+```text
+DESTINATION            ALIASES   DOMAINS   DEFAULT FOR
+me@example.net             187        38            38
+finance@example.net          4         2             -
+old@previous.net            11         3             1
+```
+
+When a mailbox changes, repoint every use of it in one command:
+
+```bash
+pigeon destination replace old@previous.net me@example.net
+```
+
+It covers aliases, catch-all destinations and domain defaults, spans every domain unless `--domain` narrows it, and previews what it will change before doing anything.
+
+`pigeon domain forward` is the same operation from the other side — one address across every domain, versus every alias on one domain — so it previews and confirms identically. Any command that changes more than you named shows you the list first.
+
+## Route testing
+
+Inspect how an address resolves without sending anything:
+
+```bash
+pigeon route inbound hello@example.com
+```
+
+```text
+hello@example.com
+      ↓
+example.com
+      ↓
+alias: hello
+      ↓
+me@example.net
+
+ACCEPT
+```
+
+```bash
+pigeon route inbound unknown@example.com
+```
+
+```text
+REJECT
+
+Reason:
+  alias not found
+  catch-all disabled
+```
+
+---
+
+## Outbound sending
+
+Sending is deliberately separate from forwarding. An inbound alias grants no authority to send.
+
+```text
+alias:            billing@example.com → finance@example.net
+sender identity:  hello@example.com
+principal:        macbook-mail
+```
+
+`macbook-mail` can send as `hello@example.com` only if granted that identity. The `billing` alias does not imply it.
+
+```bash
+pigeon domain outbound example.com on
+pigeon sender add example.com hello
+
+pigeon auth create macbook-mail
+pigeon auth allow macbook-mail hello@example.com
+```
+
+```text
+Credential created.
+
+Username: pg_7N...
+Password: ********
+
+The password is shown once. Store it securely.
+```
+
+Point any standard mail client at port 587 with STARTTLS. No Pigeon-specific protocol is required.
+
+See [`docs/OUTBOUND.md`](docs/OUTBOUND.md).
+
+---
+
+## Checking everything
+
+```bash
+pigeon domains check
+```
 
 ```text
 Checking 42 domains...
@@ -237,193 +422,23 @@ example.org
 Configuration check failed.
 ```
 
-This makes it easy to validate the entire installation after DNS or configuration changes.
-
----
-
-## Domain Information
-
 ```bash
-pigeon domain info example.com
-```
-
-Example:
-
-```text
-Domain: example.com
-
-STATUS
-  READY
-
-MAIL ROUTING
-  MX      mx1.pigeon.mx
-
-AUTHENTICATION
-  SPF     PASS
-  DKIM    PASS
-  DMARC   PASS
-
-ALIASES
-
-  hello@example.com
-    → me@example.net
-
-  security@example.com
-    → security@example.net
-
-CATCH-ALL
-  enabled
-  → me@example.net
-```
-
----
-
-## Aliases
-
-Add an alias:
-
-```bash
-pigeon domain add-alias example.com hello me@example.net
-```
-
-Result:
-
-```text
-Added:
-
-hello@example.com
-→ me@example.net
-```
-
-Add another:
-
-```bash
-pigeon domain add-alias example.com security security@example.net
-```
-
-Remove an alias:
-
-```bash
-pigeon domain remove-alias example.com hello
-```
-
-Remove every alias from a domain:
-
-```bash
-pigeon domain remove-all-aliases example.com
-```
-
----
-
-## Catch-All
-
-Enable catch-all forwarding:
-
-```bash
-pigeon domain catchall example.com enable me@example.net
-```
-
-Disable it:
-
-```bash
-pigeon domain catchall example.com disable
-```
-
-With catch-all enabled:
-
-```text
-anything@example.com
-random@example.com
-hello@example.com
-```
-
-can all be forwarded to the configured destination unless an explicit alias overrides the route.
-
----
-
-## Test a Route
-
-You can inspect how Pigeon would route an address without sending mail.
-
-```bash
-pigeon route test hello@example.com
-```
-
-Example:
-
-```text
-hello@example.com
-      ↓
-example.com
-      ↓
-alias: hello
-      ↓
-me@example.net
-
-ACCEPT
-```
-
-Unknown address:
-
-```bash
-pigeon route test unknown@example.com
+pigeon domains list
 ```
 
 ```text
-REJECT
-
-Reason:
-  alias not found
-  catch-all disabled
+DOMAIN              STATUS      ALIASES    CATCH-ALL   OUTBOUND
+example.com         healthy          6          yes         yes
+example.net         healthy          2           no          no
+anotherdomain.io    warning          4          yes          no
+project.dev         error            1           no          no
 ```
 
----
-
-## List Domains
-
-```bash
-pigeon domain list
-```
-
-Example:
-
-```text
-DOMAIN              STATUS      ALIASES    CATCH-ALL
-example.com         healthy          6          yes
-example.net         healthy          2           no
-anotherdomain.io    warning          4          yes
-project.dev         error            1           no
-```
-
----
-
-## Run Pigeon
-
-Start the daemon:
-
-```bash
-pigeon run
-```
-
-Or run it through systemd:
-
-```bash
-systemctl enable --now pigeond
-```
-
-Check status:
-
-```bash
-pigeon status
-```
+Singular commands act on one domain, plural on all of them. Every read command supports `--json`.
 
 ---
 
 ## Storage
-
-Pigeon uses SQLite as its local source of truth.
-
-A typical installation may look like:
 
 ```text
 /etc/pigeon/
@@ -435,160 +450,38 @@ A typical installation may look like:
         example.com.key
         example.net.key
 
+/var/spool/pigeon/
+
 /var/log/pigeon/
     pigeon.log
 ```
 
-The SQLite database stores information such as:
+SQLite holds domains, aliases, destinations, sender identities, credentials, DNS check state, queue metadata and delivery history. Message bodies never go in the database — they live in the spool, and are deleted once every recipient reaches a terminal state.
 
-- Domains
-- Aliases
-- Destinations
-- Catch-all rules
-- DNS validation state
-- Delivery queue
-- Retry state
-- Delivery history
-- Runtime configuration
-
-Private DKIM keys remain local to the server.
-
----
-
-## DNS Validation
-
-Pigeon can validate:
-
-- MX records
-- A / AAAA resolution
-- SPF
-- DKIM
-- DMARC
-- Reverse DNS
-- TLS configuration
-
-Run checks for all domains:
-
-```bash
-pigeon check
-```
-
-Or one domain:
-
-```bash
-pigeon domain check example.com
-```
-
----
-
-## Queued Mail
-
-Inspect the delivery queue:
-
-```bash
-pigeon queue list
-```
-
-Retry queued messages:
-
-```bash
-pigeon queue retry
-```
-
-Retry one message:
-
-```bash
-pigeon queue retry <message-id>
-```
-
-Remove a queued item:
-
-```bash
-pigeon queue remove <message-id>
-```
+Private DKIM keys never leave the server. **They are the one piece of state you cannot regenerate**: lose them and every domain needs a new key published in DNS by hand. Back up `/var/lib/pigeon/` accordingly.
 
 ---
 
 ## Requirements
 
-Pigeon is designed to run on a normal Linux server.
-
-You will generally need:
-
-- Linux
-- A public IP address
-- TCP port 25 available
-- Control over your DNS records
-- A hostname with valid forward and reverse DNS
-- TLS certificate
+- A Linux server with a public IP
+- TCP port 25 reachable inbound *and* permitted outbound
+- Control over your DNS
+- A hostname with matching forward and reverse DNS
+- A TLS certificate
 - A destination mailbox
 
-A single server can handle mail for many domains.
-
-For higher availability, multiple MX nodes can be configured.
+Two things worth checking before you commit to a host. Many cloud providers block outbound port 25 by default, which rules out direct delivery. And a recycled IP may already be on a blocklist — check before building on it.
 
 ---
 
-## Example DNS Layout
+## Startup and domain gating
 
-Pigeon server:
+Pigeon validates its environment before accepting mail, and treats two kinds of failure differently.
 
-```text
-mx1.pigeon.mx → 203.0.113.10
-```
+**Local failures abort startup.** An unreadable database, a failed migration, an unwritable spool, invalid TLS configuration, a missing DKIM key for a signing domain, or a listener that will not bind. These are unambiguous misconfiguration.
 
-Your domain:
-
-```text
-example.com MX 10 mx1.pigeon.mx
-```
-
-Another domain:
-
-```text
-example.net MX 10 mx1.pigeon.mx
-```
-
-And another:
-
-```text
-project.dev MX 10 mx1.pigeon.mx
-```
-
-All domains can share the same Pigeon server.
-
----
-
-## Security
-
-Pigeon is intended to be conservative by default.
-
-Planned and supported safeguards include:
-
-- Strict recipient validation
-- SMTP connection limits
-- Rate limiting
-- Message size limits
-- Loop detection
-- Bounce handling
-- DNS validation
-- Local DKIM key storage
-- Safe forwarding rules
-- TLS support
-- Structured audit logs
-- Atomic configuration changes
-- SQLite transactions
-- Safe startup validation
-
-Pigeon should refuse to start when critical configuration is invalid.
-
----
-
-## Startup Validation
-
-Before accepting mail, Pigeon validates its runtime environment.
-
-Example:
+**DNS failures gate a single domain.** A domain whose records regress moves to `ERROR` and stops accepting its own mail. The daemon still starts, and every other domain keeps working.
 
 ```text
 Pigeon startup check
@@ -603,143 +496,86 @@ SYSTEM
 DOMAINS
   ✓ example.com
   ✓ example.net
-  ✗ project.dev
+  ✗ project.dev — MX record is incorrect
 
-project.dev
-  MX record is incorrect
-
-Startup aborted.
+Started. 2 domains active, 1 gated.
 ```
 
-Warnings may be reported without preventing startup.
+This is deliberate: a resolver hiccup should never become a total mail outage across every domain on the host. Strictness belongs on the domain lifecycle, where nothing reaches `ACTIVE` without passing every check.
 
-Critical failures stop the daemon from accepting mail.
-
----
-
-## Configuration Changes
-
-CLI operations write directly to SQLite.
-
-For example:
+When a domain is gated while Pigeon is running, the operator is emailed — with what broke, what to publish, and the fact that mail is currently being refused. A recovery notice follows when it passes again.
 
 ```bash
-pigeon domain add-alias example.com accounts me@example.net
+pigeon domain notify example.com ops@example.net
+pigeon alerts test
 ```
 
-The running daemon can reload routing state without restarting.
+Alerts are sent from a dedicated identity on a domain you keep healthy, never from the failing domain itself — an alert about a broken DKIM record cannot be sent from the domain with the broken DKIM record. Test the path explicitly: when alerting breaks, the symptom is silence, which looks exactly like everything working.
 
-Invalid updates should never replace the currently active configuration.
+See [`docs/ALERTING.md`](docs/ALERTING.md).
 
 ---
 
-## Running Multiple MX Nodes
+## Building
 
-A future redundant installation may look like:
+Pigeon is a Rust workspace.
+
+```bash
+cargo build --release
+```
 
 ```text
-example.com
-
-MX 10 mx1.pigeon.mx
-MX 20 mx2.pigeon.mx
+crates/
+  pigeon-types      core types, no I/O
+  pigeon-config     bootstrap TOML
+  pigeon-db         SQLite, migrations
+  pigeon-dns        resolution and record validation
+  pigeon-auth       DKIM, SPF, DMARC, ARC, SRS
+  pigeon-route      routing snapshot and precedence
+  pigeon-smtp       receiver state machine and delivery client
+  pigeon-spool      durable spool, queue, retries
+  pigeon-alert      operator notifications
+  pigeon-testkit    test harness
+  pigeond           the daemon
+  pigeon-cli        the `pigeon` command
 ```
-
-Both nodes can provide inbound mail availability while sharing or replicating routing configuration.
-
-A single-node installation remains the recommended starting point.
-
----
-
-## Project Goals
-
-Pigeon aims to remain:
-
-**Small**
-
-No unnecessary services or dependencies.
-
-**Portable**
-
-Run it on almost any VPS or dedicated Linux host.
-
-**Understandable**
-
-Mail routing should be inspectable from the CLI.
-
-**Self-contained**
-
-SQLite instead of an external database.
-
-**Predictable**
-
-Invalid configuration should fail clearly.
-
-**Private**
-
-No telemetry or external control plane.
-
-**Developer-friendly**
-
-If something is wrong, Pigeon should tell you exactly what is wrong and what needs to be changed.
-
----
-
-## Roadmap
-
-Early development priorities:
-
-- [ ] SMTP receiver
-- [ ] SQLite schema
-- [ ] Domain management
-- [ ] Alias management
-- [ ] Catch-all routing
-- [ ] DNS validation
-- [ ] DKIM key generation
-- [ ] SPF validation
-- [ ] DMARC validation
-- [ ] Mail forwarding
-- [ ] Sender rewriting
-- [ ] Retry queue
-- [ ] Bounce handling
-- [ ] Route testing
-- [ ] Structured logging
-- [ ] systemd service
-- [ ] Docker image
-- [ ] Multi-MX support
-- [ ] Metrics endpoint
-- [ ] Packaging for common Linux distributions
 
 ---
 
 ## Status
 
-Pigeon is currently under development.
+Under active development. The CLI and configuration model may change before the first stable release.
 
-The CLI and configuration model may change before the first stable release.
+Do not use pre-release builds for mail you care about without keeping a fallback MX.
 
-Do not use pre-release builds for critical mail without maintaining a fallback MX path.
-
----
-
-## Website
-
-[pigeon.mx](https://pigeon.mx)
+Roadmap: [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ---
 
-## License
+## Documentation
 
-Pigeon is open source.
-
-License details will be added before the first public release.
+- [Architecture](docs/ARCHITECTURE.md)
+- [CLI reference](docs/CLI.md)
+- [Outbound sending](docs/OUTBOUND.md)
+- [Alerting](docs/ALERTING.md)
+- [Security model](docs/SECURITY.md)
+- [Roadmap](docs/ROADMAP.md)
 
 ---
 
 ## Contributing
 
-Issues, bug reports, documentation improvements, and pull requests are welcome.
+Issues, bug reports, documentation improvements and pull requests are welcome.
 
-If you are running Pigeon in an unusual environment or managing a large number of domains, feedback is especially useful.
+Feedback is especially useful if you are running Pigeon in an unusual environment or carrying a large number of domains.
+
+Contributions are accepted under the project licence.
+
+---
+
+## Licence
+
+Apache License 2.0. See [LICENSE](LICENSE).
 
 ---
 
