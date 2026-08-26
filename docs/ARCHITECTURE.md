@@ -172,6 +172,16 @@ SMTP 250 accepted
 
 The system must not send `250 OK` before it can recover the accepted message after a process crash.
 
+### 2.6.1 Retention
+
+Pigeon is a relay, not a mailbox. A message body is deleted once every recipient reaches a terminal state.
+
+Delivery *metadata* — envelope, recipients, outcome, SMTP response — is retained separately with configurable retention. Without it, queue inspection and post-incident debugging are guesswork.
+
+One consequence follows directly: because nothing is archived, `DEAD` is irreversible. The retry schedule is therefore deliberately generous (the ~5 day SMTP convention) before a message is abandoned.
+
+A second consequence shapes the receiver. Anything accepted and later undeliverable must be bounced, and bouncing mail that should have been refused makes Pigeon a backscatter source. This is why recipient rejection at `RCPT TO` is a correctness requirement rather than an optimisation.
+
 ### 2.7 Queue workers
 
 Workers claim due messages using a lease.
@@ -209,6 +219,40 @@ WAL mode is appropriate for the expected single-host workload.
 
 ## 3. Process model
 
+### 3.1 Crate layout
+
+Pigeon is a Cargo workspace. The split follows subsystem boundaries so that each piece can be tested in isolation and compiled in parallel.
+
+```text
+pigeon-types      core types, no I/O, no runtime
+pigeon-config     bootstrap TOML and its validation
+pigeon-db         SQLite, migrations, repositories
+pigeon-dns        resolution and record validation
+pigeon-auth       DKIM, SPF, DMARC, ARC, SRS
+pigeon-route      routing snapshot and precedence
+pigeon-smtp       receiver state machine and delivery client
+pigeon-spool      durable spool, queue leases, retries
+pigeon-testkit    scriptable SMTP peer, fake resolver, fixtures
+pigeond           the daemon binary
+pigeon-cli        the `pigeon` binary
+```
+
+The dependency graph is acyclic and shallow: everything depends on `pigeon-types`, `pigeon-route` and `pigeon-spool` additionally depend on `pigeon-db`, and only the two binaries depend on more than that.
+
+### 3.2 Zero-copy handling
+
+Message bytes are copied as few times as possible.
+
+- SMTP commands are parsed from `&[u8]` without intermediate `String` allocation.
+- Addresses borrow subslices of the parse buffer; plus-tag stripping is a subslice, not a new allocation.
+- DATA is read into `BytesMut` and frozen into `Bytes`, so fanning one message out to N destinations costs N refcount bumps rather than N copies.
+- Message parsing borrows from the input buffer rather than allocating.
+- Body hashing for DKIM and ARC is streamed; a message is canonicalised and hashed without materialising a second copy.
+
+Where a value must cross a task boundary or outlive its buffer, a refcounted handle is preferred over a borrow — lifetimes across `await` points cost more in complexity than they return in performance.
+
+### 3.3 Runtime
+
 Initial implementation:
 
 ```text
@@ -241,7 +285,7 @@ Machine bootstrap configuration lives in a small TOML file.
 Example:
 
 ```toml
-hostname = "mx1.pigeon.mx"
+hostname = "mx1.yourserver.net"
 database = "/var/lib/pigeon/pigeon.db"
 spool = "/var/spool/pigeon"
 
@@ -279,6 +323,31 @@ ACTIVE
 `ACTIVE` is the only state allowed to receive production mail.
 
 Outbound may have a separate enable flag because a domain can be valid for inbound forwarding but intentionally disabled for sending.
+
+### 5.1 Startup gating
+
+Onboarding is strict: a domain reaches `ACTIVE` only by passing every required DNS check, with no manual override.
+
+That strictness belongs on the domain lifecycle, not on process startup. Two classes of failure are treated differently:
+
+**Local and unambiguous — abort startup.**
+
+- unreadable database
+- failed migration
+- unwritable or unusable spool
+- invalid TLS configuration for a required listener
+- missing DKIM private key for a signing domain
+- listener that will not bind
+
+These are misconfiguration. Running half-configured is worse than not running.
+
+**Remote DNS state — gate the domain, keep serving.**
+
+A domain whose records regress moves to `ERROR` and stops accepting its own mail. The daemon still starts and every other domain is unaffected.
+
+The failure mode this avoids is specific and severe: if DNS validation gated process startup, a transient resolver outage would take down mail for *every* domain on the host simultaneously, and it would happen at the least convenient moment. One misconfigured domain out of forty must never be a total outage.
+
+This is consistent with `SECURITY.md`: temporary external DNS issues degrade checks rather than destroy runtime state.
 
 ## 6. Outbound delivery modes
 
