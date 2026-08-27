@@ -510,6 +510,37 @@ that a refused recipient never reaches the spool *and* never triggers an
 outbound connection, and that a message the receiver rejects is left in the
 spool rather than deleted.
 
+## 38. The `cargo deny` gate failed the first time it was ever run
+
+**Severity: medium.**
+
+`deny.toml` was written, committed, and wired into CI, and `cargo deny check`
+had never been executed against the repository it governs — the tool was not
+even installed. Running it produced ten errors, all `wildcard`, all against the
+workspace's own crates.
+
+The rule is right: a dependency with no upper bound defers a supply-chain
+decision to whatever resolves next. What it caught was the twelve internal
+crates referring to each other by path, which carry no version and are not meant
+to — they are one unit, versioned together, never resolved from a registry. So
+the rule fired twelve times on the project's own layout and zero times on a
+third-party crate, which is what it exists to catch.
+
+`allow-wildcard-paths` alone was not enough: cargo-deny applies it only to
+crates that cannot be published, since crates.io forbids path dependencies and a
+versionless path dep in a publishable crate really would be unresolvable. The
+workspace is now marked `publish = false`, which is accurate — nothing here is
+published, package publishing is Milestone 10 — and has the side benefit that
+`cargo publish` cannot be run by accident on crate names nobody has reserved.
+
+Verified non-vacuous the same way as the rest of this round: adding
+`thiserror = "*"` to a crate makes the gate fail.
+
+This is finding 11 with a longer fuse. That one was "CI had never run"; this is
+one gate inside CI that had never run even after CI did, because it needed a
+tool nobody had installed. **A policy file is not a policy until something
+executes it.**
+
 ## Every fix in this round was mutation-tested
 
 Round three's lesson was that a test written from the same mental model as the
@@ -523,6 +554,7 @@ was to break each fix deliberately and confirm its test fails:
 | Spool file mode set to 0644 | fails, naming the mode |
 | `hard_link` reverted to `rename` | fails, original destroyed |
 | Outbound envelope not readdressed | fails, printing the transcript |
+| `thiserror = "*"` added to a crate | `cargo deny` bans gate fails |
 
 That is not proof the tests are good. It is proof they are not vacuous, which is
 the failure mode this document has recorded three times.

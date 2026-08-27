@@ -24,6 +24,16 @@ license      = "Apache-2.0"
 repository   = "https://github.com/marirs/pigeon"
 authors      = ["Pigeon contributors"]
 
+# Nothing here is published yet. Declared rather than left to default for two
+# reasons: `cargo publish` cannot be run by accident on a pre-1.0 workspace
+# whose crate names are not reserved, and `cargo deny`'s wildcard exemption for
+# internal path dependencies applies only to crates that cannot be published —
+# crates.io forbids path dependencies, so for a publishable crate a versionless
+# path dep really would be unresolvable.
+#
+# Revisit at Milestone 10, which is where package publishing is scheduled.
+publish      = false
+
 # Declared centrally so crates pin one version each.
 # Unused entries are never fetched; add `workspace = true` in a member to pull one in.
 [workspace.dependencies]

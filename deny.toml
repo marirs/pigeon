@@ -39,7 +39,22 @@ confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
+
+# Wildcard version requirements are refused, because a dependency with no
+# upper bound is a supply-chain decision deferred to whatever resolves next.
+#
+# Internal path dependencies are exempt. The twelve crates here refer to each
+# other as `{ workspace = true }` resolving to `{ path = ... }`, which carries
+# no version and is not meant to: they are one unit, versioned together, and
+# never resolved from a registry. Without this exemption the rule fires ten
+# times on the workspace's own layout and never on a third-party crate — which
+# is what it exists to catch.
+#
+# This was found the first time `cargo deny check` was ever run. The policy was
+# written, committed, and wired into CI without once being executed against the
+# repository it governs; see finding 11.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 # Nothing in this workspace may pull OpenSSL, directly or transitively.
 #
