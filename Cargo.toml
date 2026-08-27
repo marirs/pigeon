@@ -18,7 +18,8 @@ members = [
 [workspace.package]
 version      = "0.0.1"
 edition      = "2024"
-rust-version = "1.85"
+# Floor set by hickory-resolver 0.26, which requires 1.88.
+rust-version = "1.88"
 license      = "Apache-2.0"
 repository   = "https://github.com/marirs/pigeon"
 authors      = ["Pigeon contributors"]
@@ -43,20 +44,42 @@ tokio-util  = { version = "0.7", features = ["codec"] }
 bytes       = "1"
 
 # Mail
+# Both are pure Rust and use RustCrypto primitives rather than a C backend.
 mail-auth   = "0.7"
 mail-parser = "0.11"
 
-# DNS + TLS
-hickory-resolver = "0.25"
-rustls           = "0.23"
-tokio-rustls     = "0.26"
+# DNS
+# default-features off keeps the optional DoT/DoH backends out; they are the
+# route by which a TLS stack, and with it a C crypto library, sneaks in.
+# (hickory pulls rustls only behind its `tls`/`https-rustls`/`quic` features.)
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
+
+# TLS
+#
+# rustls itself is pure Rust; its crypto provider is not. Version 0.23 defaults
+# to aws-lc-rs, which needs cmake and a C toolchain. `ring` is selected instead:
+# still C and assembly, but vendored, no system library, and a lighter build.
+#
+# The pure-Rust provider (rustls-rustcrypto) is not audited for production and
+# says so, which is not a trade worth making for a mail server's transport
+# security.
+#
+# What is non-negotiable is that neither path may reach OpenSSL. CI enforces
+# that; see deny.toml.
+rustls          = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+tokio-rustls    = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
+rustls-pemfile  = "2"
+rustls-pki-types = "1"
 
 # Storage
-rusqlite = { version = "0.37", features = ["bundled"] }
+# `bundled` compiles SQLite from vendored C source with `cc`. That is a C
+# dependency, but a self-contained one: no system library to locate, no
+# pkg-config, no version skew across hosts.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Plumbing
 serde       = { version = "1", features = ["derive"] }
-toml        = "0.9"
+toml        = "1"
 thiserror   = "2"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
