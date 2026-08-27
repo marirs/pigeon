@@ -18,7 +18,10 @@ pub struct MxRecord {
 
 impl MxRecord {
     pub fn new(preference: u16, exchange: impl Into<String>) -> Self {
-        Self { preference, exchange: exchange.into() }
+        Self {
+            preference,
+            exchange: exchange.into(),
+        }
     }
 
     /// Whether this is the RFC 7505 null MX.
@@ -70,8 +73,14 @@ impl std::error::Error for MxError {}
 /// entire queue at one member of a balanced pool.
 pub fn order_hosts(records: &[MxRecord], rotation: u64) -> Result<Vec<String>, MxError> {
     // A null MX is only meaningful as the *entire* answer, so the test is that
-    // every record is null — not that there is exactly one. Two null records,
-    // or a null beside an unusable one, is still a domain refusing mail.
+    // every record is null — not that there is exactly one. Two null records
+    // still mean a domain refusing mail.
+    //
+    // A null beside a merely *unusable* record does not qualify, since an empty
+    // exchange is not null: that answer falls through to `NoUsableHost`. Both
+    // outcomes are non-delivery, but only one of them is the domain's stated
+    // intent.
+    //
     // Alongside a real exchange it is a misconfiguration, and refusing over it
     // would be the worse error.
     if !records.is_empty() && records.iter().all(|r| r.is_null()) {
@@ -111,7 +120,11 @@ pub fn order_hosts(records: &[MxRecord], rotation: u64) -> Result<Vec<String>, M
         i = end;
     }
 
-    if out.is_empty() { Err(MxError::NoUsableHost) } else { Ok(out) }
+    if out.is_empty() {
+        Err(MxError::NoUsableHost)
+    } else {
+        Ok(out)
+    }
 }
 
 /// Trim a DNS name into something connectable, or reject it.
@@ -143,7 +156,14 @@ mod tests {
             MxRecord::new(10, "first.example.com."),
             MxRecord::new(20, "second.example.com."),
         ];
-        assert_eq!(hosts(&r), ["first.example.com", "second.example.com", "third.example.com"]);
+        assert_eq!(
+            hosts(&r),
+            [
+                "first.example.com",
+                "second.example.com",
+                "third.example.com"
+            ]
+        );
     }
 
     #[test]
@@ -161,8 +181,9 @@ mod tests {
         ];
         // Every host leads for some rotation, so a queue does not land
         // entirely on one member of a balanced pool.
-        let firsts: Vec<String> =
-            (0..3).map(|n| order_hosts(&r, n).unwrap()[0].clone()).collect();
+        let firsts: Vec<String> = (0..3)
+            .map(|n| order_hosts(&r, n).unwrap()[0].clone())
+            .collect();
         assert_eq!(firsts, ["a.example.com", "b.example.com", "c.example.com"]);
 
         // Rotation reorders, never drops.
@@ -191,9 +212,15 @@ mod tests {
     fn null_mx_is_a_permanent_refusal() {
         // RFC 7505: the domain is stating it accepts no mail. Retrying for
         // five days would be wrong.
-        assert_eq!(order_hosts(&[MxRecord::new(0, ".")], 0), Err(MxError::NullMx));
+        assert_eq!(
+            order_hosts(&[MxRecord::new(0, ".")], 0),
+            Err(MxError::NullMx)
+        );
         // A root exchange at any preference means the same thing.
-        assert_eq!(order_hosts(&[MxRecord::new(10, ".")], 0), Err(MxError::NullMx));
+        assert_eq!(
+            order_hosts(&[MxRecord::new(10, ".")], 0),
+            Err(MxError::NullMx)
+        );
         // The test is that *every* record is null, not that there is one.
         assert_eq!(
             order_hosts(&[MxRecord::new(0, "."), MxRecord::new(10, ".")], 0),
@@ -205,8 +232,14 @@ mod tests {
     fn an_empty_exchange_is_malformed_not_a_refusal() {
         // Permanent refusal is the lossy direction, so a syntax problem must
         // not be read as a deliberate declaration.
-        assert_eq!(order_hosts(&[MxRecord::new(10, "")], 0), Err(MxError::NoUsableHost));
-        assert_eq!(order_hosts(&[MxRecord::new(0, "   ")], 0), Err(MxError::NoUsableHost));
+        assert_eq!(
+            order_hosts(&[MxRecord::new(10, "")], 0),
+            Err(MxError::NoUsableHost)
+        );
+        assert_eq!(
+            order_hosts(&[MxRecord::new(0, "   ")], 0),
+            Err(MxError::NoUsableHost)
+        );
     }
 
     #[test]
@@ -219,8 +252,14 @@ mod tests {
 
     #[test]
     fn rejects_unusable_exchanges() {
-        assert_eq!(order_hosts(&[MxRecord::new(10, "")], 0), Err(MxError::NoUsableHost));
-        assert_eq!(order_hosts(&[MxRecord::new(10, "localhost")], 0), Err(MxError::NoUsableHost));
+        assert_eq!(
+            order_hosts(&[MxRecord::new(10, "")], 0),
+            Err(MxError::NoUsableHost)
+        );
+        assert_eq!(
+            order_hosts(&[MxRecord::new(10, "localhost")], 0),
+            Err(MxError::NoUsableHost)
+        );
         assert_eq!(
             order_hosts(&[MxRecord::new(10, "bad host.example.com")], 0),
             Err(MxError::NoUsableHost)
@@ -230,7 +269,10 @@ mod tests {
 
     #[test]
     fn keeps_good_records_when_some_are_unusable() {
-        let r = [MxRecord::new(10, "  "), MxRecord::new(20, "mx.example.com.")];
+        let r = [
+            MxRecord::new(10, "  "),
+            MxRecord::new(20, "mx.example.com."),
+        ];
         assert_eq!(hosts(&r), ["mx.example.com"]);
     }
 

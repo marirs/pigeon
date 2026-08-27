@@ -51,7 +51,11 @@ pub struct LineReader {
 
 impl LineReader {
     pub fn new(max: usize) -> Self {
-        Self { buf: Vec::with_capacity(256), max, discarding: false }
+        Self {
+            buf: Vec::with_capacity(256),
+            max,
+            discarding: false,
+        }
     }
 
     /// Add bytes read from the socket.
@@ -409,7 +413,11 @@ mod tests {
         r.feed(b"NOOP\r\nNOOP\r\n");
         assert_eq!(r.take_line(&mut buf), Ok(true));
         assert_eq!(r.take_line(&mut buf), Ok(true));
-        assert_eq!(buf.capacity(), cap, "buffer should be reused, not reallocated");
+        assert_eq!(
+            buf.capacity(),
+            cap,
+            "buffer should be reused, not reallocated"
+        );
     }
 
     // ---- DataReader ----

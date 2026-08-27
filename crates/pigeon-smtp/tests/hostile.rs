@@ -63,7 +63,10 @@ async fn start(sink: LocalOnly, config: ServerConfig) -> SocketAddr {
 }
 
 fn config() -> ServerConfig {
-    ServerConfig { hostname: "mx.test".into(), ..Default::default() }
+    ServerConfig {
+        hostname: "mx.test".into(),
+        ..Default::default()
+    }
 }
 
 // ------------------------------------------------------------ relay refusal
@@ -81,7 +84,9 @@ async fn refuses_recipients_on_domains_it_does_not_own() {
     assert_eq!(c.read_reply().await.unwrap().0, 220);
     c.send(b"EHLO attacker.test\r\n").await.unwrap();
     assert_eq!(c.read_reply().await.unwrap().0, 250);
-    c.send(b"MAIL FROM:<attacker@attacker.test>\r\n").await.unwrap();
+    c.send(b"MAIL FROM:<attacker@attacker.test>\r\n")
+        .await
+        .unwrap();
     assert_eq!(c.read_reply().await.unwrap().0, 250);
 
     for victim in [
@@ -90,7 +95,9 @@ async fn refuses_recipients_on_domains_it_does_not_own() {
         "VICTIM@SOMEWHERE-ELSE.COM",
         "victim@example.net.attacker.test",
     ] {
-        c.send(format!("RCPT TO:<{victim}>\r\n").as_bytes()).await.unwrap();
+        c.send(format!("RCPT TO:<{victim}>\r\n").as_bytes())
+            .await
+            .unwrap();
         let (code, _) = c.read_reply().await.unwrap();
         assert_eq!(code, 550, "would have relayed for {victim}");
     }
@@ -111,10 +118,16 @@ async fn accepts_recipients_on_domains_it_does_own() {
     c.read_reply().await.unwrap();
     c.send(b"EHLO sender.test\r\n").await.unwrap();
     c.read_reply().await.unwrap();
-    c.send(b"MAIL FROM:<someone@sender.test>\r\n").await.unwrap();
+    c.send(b"MAIL FROM:<someone@sender.test>\r\n")
+        .await
+        .unwrap();
     c.read_reply().await.unwrap();
     c.send(b"RCPT TO:<hello@EXAMPLE.NET>\r\n").await.unwrap();
-    assert_eq!(c.read_reply().await.unwrap().0, 250, "domain match must ignore case");
+    assert_eq!(
+        c.read_reply().await.unwrap().0,
+        250,
+        "domain match must ignore case"
+    );
     c.send(b"DATA\r\n").await.unwrap();
     assert_eq!(c.read_reply().await.unwrap().0, 354);
     c.send(b"hi\r\n.\r\n").await.unwrap();
@@ -128,7 +141,14 @@ async fn accepts_recipients_on_domains_it_does_own() {
 #[tokio::test]
 async fn connection_cap_holds_back_the_surplus() {
     let sink = LocalOnly::new(&["example.net"]);
-    let addr = start(sink, ServerConfig { max_connections: 2, ..config() }).await;
+    let addr = start(
+        sink,
+        ServerConfig {
+            max_connections: 2,
+            ..config()
+        },
+    )
+    .await;
 
     // Two get served.
     let mut a = RawClient::connect(addr).await.unwrap();
@@ -141,14 +161,18 @@ async fn connection_cap_holds_back_the_surplus() {
     // a burst should wait rather than bounce.
     let mut c = RawClient::connect(addr).await.unwrap();
     assert!(
-        c.read_reply_within(Duration::from_millis(250)).await.is_none(),
+        c.read_reply_within(Duration::from_millis(250))
+            .await
+            .is_none(),
         "third connection was served despite the cap"
     );
 
     // Freeing a slot lets it through.
     a.disconnect();
     assert_eq!(
-        c.read_reply_within(Duration::from_secs(2)).await.map(|r| r.0),
+        c.read_reply_within(Duration::from_secs(2))
+            .await
+            .map(|r| r.0),
         Some(220),
         "slot did not free after a connection closed"
     );
@@ -162,7 +186,10 @@ async fn idle_client_is_disconnected_rather_than_held_forever() {
     let sink = LocalOnly::new(&["example.net"]);
     let addr = start(
         sink,
-        ServerConfig { command_timeout: Duration::from_millis(150), ..config() },
+        ServerConfig {
+            command_timeout: Duration::from_millis(150),
+            ..config()
+        },
     )
     .await;
 
@@ -170,8 +197,14 @@ async fn idle_client_is_disconnected_rather_than_held_forever() {
     assert_eq!(c.read_reply().await.unwrap().0, 220);
 
     // Say nothing at all.
-    let (code, _) = c.read_reply_within(Duration::from_secs(2)).await.expect("expected a timeout reply");
-    assert_eq!(code, 421, "should announce the timeout rather than vanishing");
+    let (code, _) = c
+        .read_reply_within(Duration::from_secs(2))
+        .await
+        .expect("expected a timeout reply");
+    assert_eq!(
+        code, 421,
+        "should announce the timeout rather than vanishing"
+    );
     assert!(c.is_closed(Duration::from_secs(1)).await);
 }
 
@@ -180,7 +213,10 @@ async fn stalling_mid_body_also_times_out() {
     let sink = LocalOnly::new(&["example.net"]);
     let addr = start(
         sink.clone(),
-        ServerConfig { data_timeout: Duration::from_millis(150), ..config() },
+        ServerConfig {
+            data_timeout: Duration::from_millis(150),
+            ..config()
+        },
     )
     .await;
 
@@ -198,7 +234,10 @@ async fn stalling_mid_body_also_times_out() {
     // Start a body and never finish it.
     c.send(b"Subject: never ends\r\n").await.unwrap();
 
-    let (code, _) = c.read_reply_within(Duration::from_secs(2)).await.expect("expected a timeout");
+    let (code, _) = c
+        .read_reply_within(Duration::from_secs(2))
+        .await
+        .expect("expected a timeout");
     assert_eq!(code, 421);
     // An unfinished message must not be delivered.
     assert_eq!(sink.count(), 0);

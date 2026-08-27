@@ -155,7 +155,11 @@ impl Peer {
             for step in self.steps {
                 match step {
                     Step::Send(line) => {
-                        if stream.write_all(format!("{line}\r\n").as_bytes()).await.is_err() {
+                        if stream
+                            .write_all(format!("{line}\r\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -164,22 +168,18 @@ impl Peer {
                             return;
                         }
                     }
-                    Step::ReadLine => {
-                        match read_until(&mut stream, &mut buffered, b"\n").await {
-                            Some(line) => {
-                                recorder.push(String::from_utf8_lossy(&line).trim().to_string())
-                            }
-                            None => return,
+                    Step::ReadLine => match read_until(&mut stream, &mut buffered, b"\n").await {
+                        Some(line) => {
+                            recorder.push(String::from_utf8_lossy(&line).trim().to_string())
                         }
-                    }
+                        None => return,
+                    },
                     Step::ReadBody => {
                         // Scanned here rather than by the codec under test, so
                         // a codec that looked for the wrong bytes could not
                         // agree with itself.
                         match read_until(&mut stream, &mut buffered, b"\r\n.\r\n").await {
-                            Some(body) => {
-                                recorder.push(String::from_utf8_lossy(&body).to_string())
-                            }
+                            Some(body) => recorder.push(String::from_utf8_lossy(&body).to_string()),
                             None => return,
                         }
                     }
@@ -238,7 +238,10 @@ pub struct RawClient {
 
 impl RawClient {
     pub async fn connect(addr: SocketAddr) -> std::io::Result<Self> {
-        Ok(Self { stream: tokio::net::TcpStream::connect(addr).await?, buffered: Vec::new() })
+        Ok(Self {
+            stream: tokio::net::TcpStream::connect(addr).await?,
+            buffered: Vec::new(),
+        })
     }
 
     /// Write bytes verbatim. Nothing is appended, so partial commands are
@@ -268,7 +271,10 @@ impl RawClient {
     /// `None` means nothing arrived — which is the assertion when checking that
     /// a connection is being held back by a limit.
     pub async fn read_reply_within(&mut self, limit: Duration) -> Option<(u16, String)> {
-        tokio::time::timeout(limit, self.read_reply()).await.ok().flatten()
+        tokio::time::timeout(limit, self.read_reply())
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Whether the server has closed the connection.

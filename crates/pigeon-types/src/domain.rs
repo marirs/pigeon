@@ -47,6 +47,15 @@ pub enum ForwardPolicy {
     /// rewriting only the envelope sender via SRS and adding an ARC seal.
     /// This is the default and the only policy that preserves DMARC alignment
     /// on the original `From:` domain.
+    ///
+    /// One exception, forced by the protocol rather than chosen: a body whose
+    /// final line is unterminated, or terminated with a bare LF, gains a CRLF
+    /// before the end-of-data marker. The marker only counts at the start of a
+    /// line, so the alternative is a `.` written mid-line that no receiver
+    /// recognises as end-of-data. It is DKIM-safe — RFC 6376 §3.4.3 has the
+    /// signer add the same CRLF during body canonicalisation — but it is not
+    /// literally byte-for-byte, and the difference is worth knowing before
+    /// someone diffs a spooled message against what arrived.
     #[default]
     Preserve,
     /// Replace the `From:` header with a Pigeon-owned address and set

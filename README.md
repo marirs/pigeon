@@ -118,6 +118,13 @@ It does one job:
 
 ## Getting started
 
+> **Not yet implemented.** Everything in this section describes the intended
+> interface, not what a build does today. The `pigeon` command currently prints
+> `not yet implemented` and exits; the CLI, SQLite control plane and DNS
+> validation arrive in Milestones 1 and 5. What runs today is `pigeond`, which
+> takes its entire configuration from environment variables. See
+> [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is actually built.
+
 Every level of the CLI documents itself, and a bare noun prints its help rather than an error:
 
 ```bash

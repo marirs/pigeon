@@ -75,8 +75,14 @@ mod tests {
     #[test]
     fn formats_known_timestamps() {
         // Both of these are widely cited, so a mistake here is easy to spot.
-        assert_eq!(rfc5322_date(1_000_000_000), "Sun, 09 Sep 2001 01:46:40 +0000");
-        assert_eq!(rfc5322_date(1_234_567_890), "Fri, 13 Feb 2009 23:31:30 +0000");
+        assert_eq!(
+            rfc5322_date(1_000_000_000),
+            "Sun, 09 Sep 2001 01:46:40 +0000"
+        );
+        assert_eq!(
+            rfc5322_date(1_234_567_890),
+            "Fri, 13 Feb 2009 23:31:30 +0000"
+        );
     }
 
     #[test]
@@ -84,13 +90,22 @@ mod tests {
         // 2000 is a leap year; 1900 was not. The century rule is where
         // hand-rolled date maths usually breaks.
         assert_eq!(rfc5322_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 +0000");
-        assert_eq!(rfc5322_date(1_709_164_800), "Thu, 29 Feb 2024 00:00:00 +0000");
+        assert_eq!(
+            rfc5322_date(1_709_164_800),
+            "Thu, 29 Feb 2024 00:00:00 +0000"
+        );
     }
 
     #[test]
     fn handles_year_boundaries() {
-        assert_eq!(rfc5322_date(1_735_689_599), "Tue, 31 Dec 2024 23:59:59 +0000");
-        assert_eq!(rfc5322_date(1_735_689_600), "Wed, 01 Jan 2025 00:00:00 +0000");
+        assert_eq!(
+            rfc5322_date(1_735_689_599),
+            "Tue, 31 Dec 2024 23:59:59 +0000"
+        );
+        assert_eq!(
+            rfc5322_date(1_735_689_600),
+            "Wed, 01 Jan 2025 00:00:00 +0000"
+        );
     }
 
     #[test]
@@ -103,8 +118,9 @@ mod tests {
     #[test]
     fn weekdays_advance_correctly() {
         const DAY: i64 = 86_400;
-        let names: Vec<String> =
-            (0..7).map(|i| rfc5322_date(i * DAY)[..3].to_string()).collect();
+        let names: Vec<String> = (0..7)
+            .map(|i| rfc5322_date(i * DAY)[..3].to_string())
+            .collect();
         assert_eq!(names, ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]);
     }
 

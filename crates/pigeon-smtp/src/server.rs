@@ -76,6 +76,28 @@ fn count_hops(body: &[u8]) -> usize {
     hops
 }
 
+/// Make a peer-supplied string safe to place inside a header.
+///
+/// Replaces anything that could end a line or a syntactic element. Truncated,
+/// too: the greeting may be up to a full command line, and a trace header is
+/// not the place for 500 bytes of attacker-chosen text.
+fn sanitise_for_header(raw: &str) -> String {
+    const MAX: usize = 128;
+    let mut out: String = raw
+        .chars()
+        .take(MAX)
+        .map(|c| match c {
+            c if c.is_control() => '?',
+            '(' | ')' | '<' | '>' | ';' | '\\' | '"' => '?',
+            c => c,
+        })
+        .collect();
+    if raw.chars().count() > MAX {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Build the `Received:` header for a message.
 ///
 /// RFC 5321 §4.4 requires one on everything relayed. It is also the only loop
@@ -91,7 +113,16 @@ fn received_header(hostname: &str, session: &Session, peer: SocketAddr, tls: boo
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let helo = session.peer_name().unwrap_or("unknown");
+    // Sanitised, not trusted. The greeting argument is checked only for being
+    // non-empty and ASCII, and `strip_terminator` removes just the *trailing*
+    // CR — so `EHLO a\rb` yields a bare CR that lands in this header, is
+    // written to the spool, and is relayed onward. A parser treating bare CR
+    // as a line break sees a forged header.
+    //
+    // `Address::parse` was hardened against exactly this and the EHLO name,
+    // which reaches the same header, was left unguarded. Parentheses, angle
+    // brackets and semicolons are structural here too.
+    let helo = sanitise_for_header(session.peer_name().unwrap_or("unknown"));
     let protocol = if tls { "ESMTPS" } else { "ESMTP" };
 
     // The `for` clause names a recipient only when there is exactly one.
@@ -224,8 +255,11 @@ async fn handle<S: MessageSink>(
     config: Arc<ServerConfig>,
     sink: S,
 ) -> io::Result<()> {
-    let mut session =
-        Session::new(config.hostname.clone(), config.tls_available, config.max_message_size);
+    let mut session = Session::new(
+        config.hostname.clone(),
+        config.tls_available,
+        config.max_message_size,
+    );
     let mut lines = LineReader::new(MAX_COMMAND_LINE);
     let mut line = Vec::with_capacity(MAX_COMMAND_LINE);
     let mut chunk = vec![0u8; 8 * 1024];
@@ -245,7 +279,11 @@ async fn handle<S: MessageSink>(
         }
         let remaining = config.max_session - elapsed;
 
-        let phase = if data.is_some() { config.data_timeout } else { config.command_timeout };
+        let phase = if data.is_some() {
+            config.data_timeout
+        } else {
+            config.command_timeout
+        };
         let wait = phase.min(remaining);
 
         let n = match tokio::time::timeout(wait, stream.read(&mut chunk)).await {
@@ -418,7 +456,12 @@ async fn finish_data<S: MessageSink>(
         tracing::warn!(%peer, hops, "refusing message: too many trace hops, likely a loop");
         Err(DataError::TooManyHops)
     } else {
-        sink.deliver(Message { envelope, received, body }).await
+        sink.deliver(Message {
+            envelope,
+            received,
+            body,
+        })
+        .await
     };
 
     let action = session.data_received(outcome);
@@ -438,11 +481,21 @@ async fn emit(stream: &mut TcpStream, action: Action) -> io::Result<Flow> {
             Ok(Flow::Stop)
         }
         Action::StartTls(r) => {
-            // Unreachable while tls_available is false: the session answers 454
-            // before producing this. Kept explicit so that adding TLS is a
-            // compile error here rather than a silent no-op.
-            write_reply(stream, &r).await?;
-            Ok(Flow::Continue)
+            // Unreachable: `serve` refuses to start with `tls_available` set,
+            // and the session answers 454 without it.
+            //
+            // An earlier comment here claimed this arm made adding TLS "a
+            // compile error rather than a silent no-op". It did not — an
+            // exhaustive match arm is neither — and writing `220 Ready` while
+            // continuing to read plaintext is exactly the silent no-op it
+            // disclaimed. The guard in `serve` is the real protection; this is
+            // a loud failure rather than a quiet downgrade if it is ever
+            // removed.
+            let _ = r;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "STARTTLS reached the I/O layer with no TLS implementation",
+            ))
         }
     }
 }
@@ -464,7 +517,10 @@ async fn write_reply(stream: &mut TcpStream, r: &Reply) -> io::Result<()> {
     .await
     {
         Ok(r) => r,
-        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "peer stopped reading")),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "peer stopped reading",
+        )),
     }
 }
 
@@ -492,6 +548,29 @@ mod tests {
     #[test]
     fn tolerates_bare_lf_headers() {
         assert_eq!(count_hops(b"Received: a\nReceived: b\n\nbody\n"), 2);
+    }
+
+    #[test]
+    fn sanitises_peer_supplied_header_text() {
+        // A bare CR survives command framing, and a header carrying one can be
+        // read as two by a lenient downstream parser.
+        assert_eq!(sanitise_for_header("a\rb"), "a?b");
+        assert_eq!(sanitise_for_header("a\nb"), "a?b");
+        // Structural characters in the header's own syntax.
+        assert_eq!(sanitise_for_header("evil(comment)"), "evil?comment?");
+        assert_eq!(sanitise_for_header("a;b<c>d"), "a?b?c?d");
+        // Ordinary names pass through untouched.
+        assert_eq!(sanitise_for_header("mail.example.com"), "mail.example.com");
+    }
+
+    #[test]
+    fn truncates_overlong_header_text() {
+        // The greeting can be most of a command line; a trace header is not the
+        // place for hundreds of bytes of attacker-chosen text.
+        let long = "a".repeat(500);
+        let out = sanitise_for_header(&long);
+        assert!(out.len() < 200, "not truncated: {} bytes", out.len());
+        assert!(out.ends_with("..."));
     }
 
     #[test]

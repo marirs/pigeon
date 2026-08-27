@@ -22,7 +22,13 @@ fn envelope() -> Envelope {
 async fn deliver_to(peer: Peer) -> Result<pigeon_smtp::Accepted, ClientError> {
     let (addr, _t) = peer.spawn().await;
     let stream = TcpStream::connect(addr).await.unwrap();
-    pigeon_smtp::deliver(stream, "client.test", &envelope(), &[b"Subject: hi\r\n\r\nBody\r\n".as_slice()]).await
+    pigeon_smtp::deliver(
+        stream,
+        "client.test",
+        &envelope(),
+        &[b"Subject: hi\r\n\r\nBody\r\n".as_slice()],
+    )
+    .await
 }
 
 #[tokio::test]
@@ -30,14 +36,19 @@ async fn accepts_a_well_behaved_server() {
     let (addr, transcript) = Peer::accepting().spawn().await;
     let stream = TcpStream::connect(addr).await.unwrap();
 
-    let accepted = pigeon_smtp::deliver(stream, "client.test", &envelope(), &[b"hi\r\n".as_slice()])
-        .await
-        .expect("should deliver");
+    let accepted =
+        pigeon_smtp::deliver(stream, "client.test", &envelope(), &[b"hi\r\n".as_slice()])
+            .await
+            .expect("should deliver");
 
     assert_eq!(accepted.code, 250);
     // The remote's text is kept because it usually carries their queue id,
     // which is the only handle you have when asking them what happened.
-    assert!(accepted.message.contains("TESTPEER"), "lost remote text: {}", accepted.message);
+    assert!(
+        accepted.message.contains("TESTPEER"),
+        "lost remote text: {}",
+        accepted.message
+    );
 
     assert!(transcript.saw("EHLO client.test"));
     assert!(transcript.saw("MAIL FROM:<sender@example.org>"));
@@ -113,7 +124,10 @@ async fn greylisting_is_transient() {
     .await
     .expect_err("should fail");
 
-    assert!(!err.is_permanent(), "greylisting must be retried, got {err}");
+    assert!(
+        !err.is_permanent(),
+        "greylisting must be retried, got {err}"
+    );
 }
 
 #[tokio::test]
@@ -187,7 +201,10 @@ async fn hanging_up_mid_reply_is_a_protocol_error() {
         .expect_err("should fail");
 
     assert!(matches!(err, ClientError::Protocol(_)), "got {err}");
-    assert!(!err.is_permanent(), "an interrupted reply should be retried");
+    assert!(
+        !err.is_permanent(),
+        "an interrupted reply should be retried"
+    );
 }
 
 #[tokio::test]
@@ -203,7 +220,10 @@ async fn garbage_does_not_panic_the_client() {
         let err = deliver_to(Peer::new().send_raw(junk).close())
             .await
             .expect_err("should fail");
-        assert!(matches!(err, ClientError::Protocol(_)), "got {err} for {junk:?}");
+        assert!(
+            matches!(err, ClientError::Protocol(_)),
+            "got {err} for {junk:?}"
+        );
     }
 }
 
@@ -211,7 +231,10 @@ async fn garbage_does_not_panic_the_client() {
 async fn reply_code_changing_mid_reply_is_refused() {
     // Trusting either half of a contradictory reply would be a guess.
     let err = deliver_to(
-        Peer::new().send("220-test.invalid").send("550 actually no").close(),
+        Peer::new()
+            .send("220-test.invalid")
+            .send("550 actually no")
+            .close(),
     )
     .await
     .expect_err("should fail");
@@ -260,12 +283,21 @@ async fn body_arrives_dot_stuffed_and_terminated() {
     let stream = TcpStream::connect(addr).await.unwrap();
 
     let env = envelope();
-    pigeon_smtp::deliver(stream, "client.test", &env, &[b".leading\r\nplain\r\n".as_slice()])
-        .await
-        .unwrap();
+    pigeon_smtp::deliver(
+        stream,
+        "client.test",
+        &env,
+        &[b".leading\r\nplain\r\n".as_slice()],
+    )
+    .await
+    .unwrap();
 
     // Checked against the peer's own scan for the terminator, not against the
     // codec that produced it.
-    let body = transcript.lines().into_iter().find(|l| l.contains("plain")).expect("no body");
+    let body = transcript
+        .lines()
+        .into_iter()
+        .find(|l| l.contains("plain"))
+        .expect("no body");
     assert_eq!(body, "..leading\r\nplain\r\n.\r\n");
 }

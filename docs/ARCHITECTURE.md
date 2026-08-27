@@ -87,6 +87,8 @@ explicit reject
     ↓
 exact alias
     ↓
+wildcard alias (longest match wins)
+    ↓
 catch-all
     ↓
 unknown recipient reject

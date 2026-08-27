@@ -62,15 +62,21 @@ impl<'a> Address<'a> {
         if local.is_empty() || local.len() > 64 {
             return Err(AddressError::InvalidLocalPart);
         }
-        if domain.is_empty() || domain.len() > 255 || !domain.contains('.') {
+        if domain.is_empty() || domain.len() > 255 {
             return Err(AddressError::InvalidDomain);
         }
         // `>` and whitespace reach here through the unbracketed path form and
-        // would break out of the `for <...>` clause of a trace header.
-        if domain.bytes().any(|b| b == b'>' || b == b'<' || b.is_ascii_whitespace()) {
+        // would break out of the `for <...>` clause of a trace header. Checked
+        // separately from the syntax rules below so the intent survives if
+        // those are ever relaxed.
+        if local.bytes().any(|b| b == b'>' || b == b'<') {
+            return Err(AddressError::InvalidLocalPart);
+        }
+
+        if !is_valid_domain(domain) {
             return Err(AddressError::InvalidDomain);
         }
-        if local.bytes().any(|b| b == b'>' || b == b'<') {
+        if !is_valid_local_part(local) {
             return Err(AddressError::InvalidLocalPart);
         }
 
@@ -124,6 +130,88 @@ impl<'a> Address<'a> {
     }
 }
 
+/// Whether a domain is syntactically usable as a mail destination.
+///
+/// A length check and a `contains('.')` are not enough: `x@.` passes both, and
+/// a destination like that is accepted at startup, resolves to nothing, and
+/// makes every forward fail. Labels are validated individually — non-empty, at
+/// most 63 octets, letters, digits and hyphens, and no leading or trailing
+/// hyphen.
+///
+/// Address literals (`[192.0.2.1]`, `[IPv6:...]`) are refused. They are legal
+/// RFC 5321 and Pigeon has no use for them: a forwarder resolves MX records for
+/// named domains, and accepting a form nothing downstream handles only moves
+/// the failure later. Revisit if a real destination ever needs one.
+fn is_valid_domain(domain: &str) -> bool {
+    // A single label is not a mail domain. This also rejects the trailing-root
+    // form `example.com.`, whose final label is empty.
+    if !domain.contains('.') {
+        return false;
+    }
+    domain.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+/// Whether a local part is syntactically valid per RFC 5321 §4.1.2.
+///
+/// Two accepted forms. A quoted string carries almost anything, which is why
+/// `"odd@name"@example.com` parses at all. An unquoted dot-string is limited to
+/// `atext` plus interior dots — so `a b@example.com`, which a naive length
+/// check admits, is refused here: the space would end the address in every
+/// command and header it is later written into.
+fn is_valid_local_part(local: &str) -> bool {
+    if local.starts_with('"') {
+        return is_valid_quoted_string(local);
+    }
+
+    // No leading dot, no trailing dot, no empty interior label.
+    !local.split('.').any(|atom| {
+        atom.is_empty()
+            || !atom
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&b))
+    })
+}
+
+/// Whether a local part is a well-formed quoted string.
+///
+/// Must open and close with `"`, and any interior `"` or `\` must be escaped.
+/// An unterminated quote is refused rather than tolerated: `"a@example.com`
+/// would otherwise be read as a quoted local part running to the end of the
+/// input, which is how a parser disagreement becomes an address two systems
+/// read differently.
+fn is_valid_quoted_string(local: &str) -> bool {
+    let inner = match local.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        // `local.len() > 1` excludes a lone `"`, which strips to itself.
+        Some(inner) if local.len() > 1 => inner,
+        _ => return false,
+    };
+
+    let mut escaped = false;
+    for b in inner.bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match b {
+            b'\\' => escaped = true,
+            b'"' => return false,
+            // Printable ASCII only; control characters were refused earlier.
+            0x20..=0x7e => {}
+            _ => return false,
+        }
+    }
+    // A trailing backslash escapes the closing quote, leaving it unterminated.
+    !escaped
+}
+
 impl fmt::Display for Address<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}@{}", self.local, self.domain)
@@ -141,7 +229,10 @@ impl AddressBuf {
     /// Borrow this owned address back as an [`Address`].
     #[inline]
     pub fn as_address(&self) -> Address<'_> {
-        Address { local: &self.local, domain: &self.domain }
+        Address {
+            local: &self.local,
+            domain: &self.domain,
+        }
     }
 
     #[inline]
@@ -177,10 +268,25 @@ mod tests {
 
     #[test]
     fn strips_plus_tag() {
-        assert_eq!(Address::parse("hello+github@example.com").unwrap().local_without_tag(), "hello");
-        assert_eq!(Address::parse("hello@example.com").unwrap().local_without_tag(), "hello");
+        assert_eq!(
+            Address::parse("hello+github@example.com")
+                .unwrap()
+                .local_without_tag(),
+            "hello"
+        );
+        assert_eq!(
+            Address::parse("hello@example.com")
+                .unwrap()
+                .local_without_tag(),
+            "hello"
+        );
         // A leading '+' is a real local part, not an empty base.
-        assert_eq!(Address::parse("+tag@example.com").unwrap().local_without_tag(), "+tag");
+        assert_eq!(
+            Address::parse("+tag@example.com")
+                .unwrap()
+                .local_without_tag(),
+            "+tag"
+        );
     }
 
     #[test]
@@ -203,13 +309,93 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_domains() {
+        // `x@.` passed a length check and a `contains('.')` check, which is
+        // exactly how it reached the startup guard: a destination that is
+        // accepted, resolves to nothing, and fails every forward.
+        for raw in [
+            "x@.",
+            "x@..",
+            "x@.com",
+            "x@com.",
+            "x@example..com",
+            "x@-example.com",
+            "x@example-.com",
+            "x@example",
+            "x@exa mple.com",
+            "x@[192.0.2.1]",
+        ] {
+            assert_eq!(
+                Address::parse(raw),
+                Err(AddressError::InvalidDomain),
+                "accepted malformed domain: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_local_parts() {
+        // An unquoted space ends the address in every command and header it is
+        // later written into, so the two ends of a relay disagree about where
+        // the address stops.
+        for raw in [
+            "a b@example.com",
+            ".leading@example.com",
+            "trailing.@example.com",
+            "double..dot@example.com",
+            "\"unterminated@example.com",
+            "\"bad\"quote\"@example.com",
+            "a,b@example.com",
+        ] {
+            assert_eq!(
+                Address::parse(raw),
+                Err(AddressError::InvalidLocalPart),
+                "accepted malformed local part: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_ordinary_and_quoted_forms() {
+        // Tightening validation must not start refusing legitimate mail.
+        for raw in [
+            "hello@example.com",
+            "first.last@sub.example.co.uk",
+            "hello+tag@example.com",
+            "user_name-1@example.com",
+            "!#$%&'*+-/=?^_`{|}~@example.com",
+            "\"odd@name\"@example.com",
+            "\"quoted space\"@example.com",
+            "\"esc\\\\aped\"@example.com",
+            "x@a-b.example.com",
+        ] {
+            assert!(
+                Address::parse(raw).is_ok(),
+                "refused a valid address: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_control_characters() {
         // A bare CR survives command framing and would be interpolated into a
         // Received header and into outbound RCPT TO commands.
-        assert_eq!(Address::parse("a\r@example.com"), Err(AddressError::ControlCharacter));
-        assert_eq!(Address::parse("a@exa\rmple.com"), Err(AddressError::ControlCharacter));
-        assert_eq!(Address::parse("a\n@example.com"), Err(AddressError::ControlCharacter));
-        assert_eq!(Address::parse("a\0@example.com"), Err(AddressError::ControlCharacter));
+        assert_eq!(
+            Address::parse("a\r@example.com"),
+            Err(AddressError::ControlCharacter)
+        );
+        assert_eq!(
+            Address::parse("a@exa\rmple.com"),
+            Err(AddressError::ControlCharacter)
+        );
+        assert_eq!(
+            Address::parse("a\n@example.com"),
+            Err(AddressError::ControlCharacter)
+        );
+        assert_eq!(
+            Address::parse("a\0@example.com"),
+            Err(AddressError::ControlCharacter)
+        );
     }
 
     #[test]
@@ -224,8 +410,14 @@ mod tests {
     #[test]
     fn rejects_malformed() {
         assert_eq!(Address::parse("no-at-sign"), Err(AddressError::MissingAt));
-        assert_eq!(Address::parse("@example.com"), Err(AddressError::InvalidLocalPart));
+        assert_eq!(
+            Address::parse("@example.com"),
+            Err(AddressError::InvalidLocalPart)
+        );
         assert_eq!(Address::parse("hello@"), Err(AddressError::InvalidDomain));
-        assert_eq!(Address::parse("hello@localhost"), Err(AddressError::InvalidDomain));
+        assert_eq!(
+            Address::parse("hello@localhost"),
+            Err(AddressError::InvalidDomain)
+        );
     }
 }

@@ -50,8 +50,8 @@ Deviations worth carrying forward:
 - **MSRV is 1.88**, set by `hickory-resolver` 0.26 rather than by choice.
 - **A twelfth crate, `pigeon-alert`**, arrived early; its design is in `ALERTING.md` and its implementation belongs to Milestone 5.
 - **`DataReader` buffers the whole body in memory.** At the 50 MB ceiling that is 50 MB per concurrent connection — a denial of service, not a tuning question. Milestone 3 must make it write through to the spool.
-- **The resolver classifies errors by matching their text**, because hickory's error kinds are not a stable surface. It fails safe in one direction only and should be tightened once the real error type can be inspected.
-- **Forwarding does not retry.** A failure logs and leaves the message in the spool. This is the gap Milestone 3 closes.
+- **The resolver classified errors by matching their text**, because hickory's error kinds looked like an unstable surface. That was wrong in a way that lost mail: NXDOMAIN and NODATA share both the variant and the `Display` string, so a domain with an A record and no MX was refused permanently and the implicit-MX fallback became dead code. Classification now reads `response_code` off the error kind. See finding 13.
+- **Forwarding does not retry.** A failure logs — with its permanent/transient verdict, which is the seam the queue will act on — and leaves the message in the spool. This is the gap Milestone 3 closes.
 - **The envelope sender passes through unchanged**, so SPF fails at the receiver. This is expected, and it is exactly what Milestone 2 exists to fix.
 
 ---
@@ -105,7 +105,8 @@ Exit criteria:
 - [ ] SRS1 for double-forward chains
 - [ ] SRS replay window
 - [ ] DKIM verification on receipt
-- [ ] byte-for-byte body preservation
+- [ ] byte-for-byte body preservation, less the CRLF the end-of-data marker
+      requires before an unterminated final line
 - [ ] Authentication-Results
 - [ ] ARC validation
 - [ ] ARC sealing

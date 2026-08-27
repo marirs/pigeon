@@ -16,12 +16,18 @@ pub struct Reply {
 impl Reply {
     /// A single-line reply from static text. Allocates only the `Vec`.
     pub fn line(code: u16, text: &'static str) -> Self {
-        Self { code, lines: vec![Cow::Borrowed(text)] }
+        Self {
+            code,
+            lines: vec![Cow::Borrowed(text)],
+        }
     }
 
     /// A single-line reply from owned text.
     pub fn owned(code: u16, text: String) -> Self {
-        Self { code, lines: vec![Cow::Owned(text)] }
+        Self {
+            code,
+            lines: vec![Cow::Owned(text)],
+        }
     }
 
     /// A multi-line reply, used for the EHLO capability list.
@@ -73,7 +79,10 @@ pub fn service_ready(hostname: &str) -> Reply {
 }
 
 pub fn ehlo_ok(hostname: &str, extensions: &[&'static str]) -> Reply {
-    ehlo_ok_owned(hostname, extensions.iter().map(|e| Cow::Borrowed(*e)).collect())
+    ehlo_ok_owned(
+        hostname,
+        extensions.iter().map(|e| Cow::Borrowed(*e)).collect(),
+    )
 }
 
 /// As [`ehlo_ok`], for capability lines computed at runtime such as `SIZE`.
@@ -181,7 +190,10 @@ mod tests {
 
     #[test]
     fn multiline_marks_continuations_with_hyphen() {
-        let r = ehlo_ok("mx1.example.net", &["SIZE 52428800", "STARTTLS", "8BITMIME"]);
+        let r = ehlo_ok(
+            "mx1.example.net",
+            &["SIZE 52428800", "STARTTLS", "8BITMIME"],
+        );
         assert_eq!(
             r.to_wire(),
             "250-mx1.example.net greets you\r\n\
@@ -207,7 +219,12 @@ mod tests {
 
     #[test]
     fn every_line_ends_with_crlf() {
-        for r in [ok(), bad_sequence(), start_mail_input(), ehlo_ok("h", &["A", "B"])] {
+        for r in [
+            ok(),
+            bad_sequence(),
+            start_mail_input(),
+            ehlo_ok("h", &["A", "B"]),
+        ] {
             let wire = r.to_wire();
             assert!(wire.ends_with("\r\n"));
             for line in wire.trim_end_matches("\r\n").split("\r\n") {

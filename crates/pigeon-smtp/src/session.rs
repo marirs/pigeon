@@ -23,6 +23,17 @@ pub const MAX_RECIPIENTS: usize = 100;
 /// punishes exactly the well-behaved senders worth keeping.
 pub const MAX_ERRORS: usize = 10;
 
+/// Refused recipients tolerated over the whole connection.
+///
+/// Deliberately cumulative rather than consecutive, unlike [`MAX_ERRORS`].
+/// Probing an address list produces a refusal followed by something that
+/// succeeds, so a counter that resets on success is never reached — the
+/// harvest simply continues until the session lifetime runs out.
+///
+/// Set well above what ordinary mail produces: a legitimate sender occasionally
+/// has a stale address, but does not walk a dictionary.
+pub const MAX_REFUSALS: usize = 20;
+
 /// Where a session is in the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -114,6 +125,13 @@ pub struct Session {
     tls_available: bool,
     max_message_size: usize,
     errors: usize,
+    /// Refused recipients, counted for the life of the connection.
+    ///
+    /// Separate from `errors`, which resets on success. A directory harvest is
+    /// `RCPT`, `NOOP`, `RCPT`, `NOOP` — every refusal followed by something
+    /// that succeeds — so a resettable counter never reaches its limit and the
+    /// probing is bounded only by the session lifetime.
+    refusals: usize,
 }
 
 impl Session {
@@ -129,6 +147,7 @@ impl Session {
             tls_available,
             max_message_size,
             errors: 0,
+            refusals: 0,
         }
     }
 
@@ -300,6 +319,27 @@ impl Session {
         // hundred deliveries of one message to one mailbox, and consume the
         // recipient budget while doing it.
         //
+        // The byte-identical case is checked first and without parsing, which
+        // is both the common repeat and the cheap one. It deliberately runs
+        // *before* the recipient cap: a client sitting at the limit that
+        // resends an address already in the envelope has asked for nothing
+        // new, and answering 452 would tell it to retry work already done.
+        if self.envelope.recipients.iter().any(|r| r == path) {
+            self.state = State::Rcpt;
+            return Action::Reply(reply::ok());
+        }
+
+        // The cap next, so that the parsing pass below cannot be made to run
+        // once per command by a client that is already at the limit. The cost
+        // of that ordering is narrow: a repeat differing only in domain case,
+        // arriving at the cap, is answered 452 rather than 250. The client
+        // retries and loses nothing.
+        if self.envelope.recipients.len() >= MAX_RECIPIENTS {
+            // 4xx, not 5xx: the limit is ours, and the client may legitimately
+            // retry with a smaller batch.
+            return Action::Reply(reply::too_many_recipients());
+        }
+
         // Comparison folds the domain only. Folding the local part as well
         // would merge `Bob@x` into `bob@x`, answer 250, and then silently drop
         // one of them — see `Address::same_mailbox`.
@@ -307,18 +347,11 @@ impl Session {
             .envelope
             .recipients
             .iter()
-            .filter_map(|r| Address::parse(r).ok())
-            .any(|existing| existing.same_mailbox(&parsed));
+            .any(|r| Address::parse(r).is_ok_and(|existing| existing.same_mailbox(&parsed)));
 
         if duplicate {
             self.state = State::Rcpt;
             return Action::Reply(reply::ok());
-        }
-
-        if self.envelope.recipients.len() >= MAX_RECIPIENTS {
-            // 4xx, not 5xx: the limit is ours, and the client may legitimately
-            // retry with a smaller batch.
-            return Action::Reply(reply::too_many_recipients());
         }
         self.envelope.recipients.push(path.to_owned());
         self.state = State::Rcpt;
@@ -331,7 +364,12 @@ impl Session {
     /// free. Without this, refusals cost an attacker nothing and a directory
     /// harvest is bounded only by the session lifetime.
     pub fn recipient_refused(&mut self) -> Action {
-        self.protocol_error(reply::no_such_user())
+        self.refusals += 1;
+        if self.refusals >= MAX_REFUSALS {
+            self.state = State::Closed;
+            return Action::Close(reply::too_many_errors());
+        }
+        Action::Reply(reply::no_such_user())
     }
 
     fn data(&mut self) -> Action {
@@ -408,7 +446,9 @@ mod tests {
 
     fn code(a: &Action) -> u16 {
         match a {
-            Action::Reply(r) | Action::ReadData(r) | Action::StartTls(r) | Action::Close(r) => r.code,
+            Action::Reply(r) | Action::ReadData(r) | Action::StartTls(r) | Action::Close(r) => {
+                r.code
+            }
         }
     }
 
@@ -497,10 +537,17 @@ mod tests {
         // are deduplicated they cannot be used to consume the budget.
         for i in 0..MAX_RECIPIENTS {
             let line = format!("RCPT TO:<x{i}@example.net>\r\n");
-            assert_eq!(code(&run(&mut s, line.as_bytes())), 250, "rejected recipient {i}");
+            assert_eq!(
+                code(&run(&mut s, line.as_bytes())),
+                250,
+                "rejected recipient {i}"
+            );
         }
         // 452 tells the client to retry with fewer, rather than to give up.
-        assert_eq!(code(&run(&mut s, b"RCPT TO:<overflow@example.net>\r\n")), 452);
+        assert_eq!(
+            code(&run(&mut s, b"RCPT TO:<overflow@example.net>\r\n")),
+            452
+        );
         assert_eq!(s.envelope().recipients.len(), MAX_RECIPIENTS);
 
         // A repeat of one already accepted is still fine — it adds nothing.
@@ -627,27 +674,55 @@ mod tests {
         // a lie, and costs the sender a full transmission to discover it.
         let mut s = Session::new("mx1.example.net", false, 1000);
         run(&mut s, b"EHLO c\r\n");
-        assert_eq!(code(&run(&mut s, b"MAIL FROM:<a@b.com> SIZE=999999\r\n")), 552);
+        assert_eq!(
+            code(&run(&mut s, b"MAIL FROM:<a@b.com> SIZE=999999\r\n")),
+            552
+        );
         assert_eq!(code(&run(&mut s, b"MAIL FROM:<a@b.com> SIZE=500\r\n")), 250);
         // Keywords are case-insensitive.
         run(&mut s, b"RSET\r\n");
-        assert_eq!(code(&run(&mut s, b"MAIL FROM:<a@b.com> size=999999\r\n")), 552);
+        assert_eq!(
+            code(&run(&mut s, b"MAIL FROM:<a@b.com> size=999999\r\n")),
+            552
+        );
     }
 
     #[test]
-    fn refused_recipients_cost_the_error_budget() {
-        // Otherwise probing an address list is free and a directory harvest is
-        // bounded only by the session lifetime.
+    fn refused_recipients_are_capped_over_the_whole_connection() {
+        // The realistic harvest interleaves a successful command after every
+        // refusal. An earlier version of this test issued the refusals back to
+        // back, which is the one pattern a resettable counter catches — so it
+        // passed while the wire behaviour was unbounded.
         let mut s = session();
         run(&mut s, b"EHLO c\r\n");
         run(&mut s, b"MAIL FROM:<a@b.com>\r\n");
+
         let mut last = None;
-        for _ in 0..MAX_ERRORS {
+        for _ in 0..MAX_REFUSALS {
             last = Some(s.recipient_refused());
+            // The thing that defeated the previous fix.
+            run(&mut s, b"NOOP\r\n");
         }
+
         let last = last.unwrap();
-        assert!(matches!(last, Action::Close(_)), "harvesting was never cut off");
+        assert!(
+            matches!(last, Action::Close(_)),
+            "harvesting was never cut off"
+        );
         assert_eq!(code(&last), 421);
+    }
+
+    #[test]
+    fn occasional_stale_addresses_do_not_close_the_connection() {
+        // The cap must sit well above what ordinary mail produces, or a sender
+        // with a few dead addresses in its list gets hung up on.
+        let mut s = session();
+        run(&mut s, b"EHLO c\r\n");
+        run(&mut s, b"MAIL FROM:<a@b.com>\r\n");
+        for _ in 0..(MAX_REFUSALS - 1) {
+            assert_eq!(code(&s.recipient_refused()), 550);
+        }
+        assert_ne!(s.state(), State::Closed);
     }
 
     #[test]
@@ -672,7 +747,11 @@ mod tests {
             assert_eq!(code(&run(&mut s, b"NONSENSE\r\n")), 500);
             assert_eq!(code(&run(&mut s, b"NOOP\r\n")), 250);
         }
-        assert_ne!(s.state(), State::Closed, "dropped a client that kept recovering");
+        assert_ne!(
+            s.state(),
+            State::Closed,
+            "dropped a client that kept recovering"
+        );
     }
 
     #[test]

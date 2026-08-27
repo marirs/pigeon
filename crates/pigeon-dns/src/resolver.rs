@@ -172,7 +172,8 @@ impl FakeResolver {
     }
 
     pub fn with(mut self, domain: &str, records: Vec<MxRecord>) -> Self {
-        self.answers.insert(domain.to_ascii_lowercase(), Ok(records));
+        self.answers
+            .insert(domain.to_ascii_lowercase(), Ok(records));
         self
     }
 
@@ -200,11 +201,17 @@ mod tests {
     async fn fake_resolver_feeds_the_ordering() {
         let r = FakeResolver::new().with(
             "example.com",
-            vec![MxRecord::new(20, "backup.example.net."), MxRecord::new(10, "mx.example.net.")],
+            vec![
+                MxRecord::new(20, "backup.example.net."),
+                MxRecord::new(10, "mx.example.net."),
+            ],
         );
 
         let records = r.lookup_mx("EXAMPLE.COM").await.unwrap();
-        assert_eq!(order_hosts(&records, 0).unwrap(), ["mx.example.net", "backup.example.net"]);
+        assert_eq!(
+            order_hosts(&records, 0).unwrap(),
+            ["mx.example.net", "backup.example.net"]
+        );
     }
 
     #[tokio::test]
@@ -218,8 +225,8 @@ mod tests {
     async fn resolver_trouble_is_not_permanent() {
         // The asymmetry that matters: a retry costs queue time, a wrong bounce
         // costs the message.
-        let r = FakeResolver::new()
-            .failing("example.com", LookupError::Resolver("timed out".into()));
+        let r =
+            FakeResolver::new().failing("example.com", LookupError::Resolver("timed out".into()));
         let e = r.lookup_mx("example.com").await.unwrap_err();
         assert!(!e.is_permanent());
     }

@@ -56,7 +56,10 @@ struct Client {
 impl Client {
     async fn connect(addr: SocketAddr) -> Self {
         let (r, w) = TcpStream::connect(addr).await.unwrap().into_split();
-        let mut c = Self { reader: BufReader::new(r), writer: w };
+        let mut c = Self {
+            reader: BufReader::new(r),
+            writer: w,
+        };
         assert_eq!(c.read_reply().await.0, 220, "expected banner");
         c
     }
@@ -96,7 +99,14 @@ impl Client {
 }
 
 async fn start(sink: TestSink) -> SocketAddr {
-    start_with(sink, ServerConfig { hostname: "mx.test".into(), ..Default::default() }).await
+    start_with(
+        sink,
+        ServerConfig {
+            hostname: "mx.test".into(),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn start_with(sink: TestSink, config: ServerConfig) -> SocketAddr {
@@ -147,10 +157,19 @@ async fn adds_a_received_header() {
     let msg = &sink.messages()[0];
     let h = &msg.received;
 
-    assert!(h.starts_with("Received: from client.test "), "bad opening: {h:?}");
-    assert!(h.contains("by mx.test with ESMTP"), "missing receiver: {h:?}");
+    assert!(
+        h.starts_with("Received: from client.test "),
+        "bad opening: {h:?}"
+    );
+    assert!(
+        h.contains("by mx.test with ESMTP"),
+        "missing receiver: {h:?}"
+    );
     assert!(h.contains("127.0.0.1"), "missing peer address: {h:?}");
-    assert!(h.contains("for <hello@example.net>"), "missing for clause: {h:?}");
+    assert!(
+        h.contains("for <hello@example.net>"),
+        "missing for clause: {h:?}"
+    );
     assert!(h.ends_with("\r\n"), "header must be CRLF-terminated: {h:?}");
 
     // The body itself is untouched — a signature over it must still verify.
@@ -174,7 +193,10 @@ async fn received_header_omits_recipients_when_there_are_several() {
     c.cmd("hi\r\n.\r\n").await;
 
     let h = &sink.messages()[0].received;
-    assert!(!h.contains("for <"), "leaked recipients to each other: {h:?}");
+    assert!(
+        !h.contains("for <"),
+        "leaked recipients to each other: {h:?}"
+    );
     assert!(!h.contains("b@example.net"), "leaked a recipient: {h:?}");
 }
 
@@ -297,7 +319,11 @@ async fn oversized_message_is_refused_without_dropping_the_connection() {
     let sink = TestSink::new(&["hello@example.net"]);
     let addr = start_with(
         sink.clone(),
-        ServerConfig { hostname: "mx.test".into(), max_message_size: 32, ..Default::default() },
+        ServerConfig {
+            hostname: "mx.test".into(),
+            max_message_size: 32,
+            ..Default::default()
+        },
     )
     .await;
     let mut c = Client::connect(addr).await;
@@ -325,7 +351,10 @@ async fn starttls_is_not_offered_without_tls() {
     c.send(b"EHLO client.test\r\n").await;
     let (code, text) = c.read_reply().await;
     assert_eq!(code, 250);
-    assert!(!text.contains("STARTTLS"), "advertised TLS it cannot do: {text}");
+    assert!(
+        !text.contains("STARTTLS"),
+        "advertised TLS it cannot do: {text}"
+    );
     assert_eq!(c.cmd("STARTTLS\r\n").await, 454);
 }
 
@@ -405,9 +434,14 @@ async fn client_delivers_a_bounce_with_a_null_sender() {
     };
 
     let stream = TcpStream::connect(addr).await.unwrap();
-    pigeon_smtp::deliver(stream, "client.test", &envelope, &[b"delivery failed\r\n".as_slice()])
-        .await
-        .unwrap();
+    pigeon_smtp::deliver(
+        stream,
+        "client.test",
+        &envelope,
+        &[b"delivery failed\r\n".as_slice()],
+    )
+    .await
+    .unwrap();
 
     assert!(sink.messages()[0].envelope.is_bounce());
 }

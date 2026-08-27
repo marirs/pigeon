@@ -61,9 +61,15 @@ pub enum ClientError {
     Io(io::Error),
     /// 4xx or a connection failure. Retry later; the message is still ours to
     /// deliver.
-    Transient { code: u16, message: String },
+    Transient {
+        code: u16,
+        message: String,
+    },
     /// 5xx. The remote will never accept this message; bounce it.
-    Permanent { code: u16, message: String },
+    Permanent {
+        code: u16,
+        message: String,
+    },
     /// The peer stopped responding. Transient: a slow or overloaded server is
     /// the usual cause, and it is usually working again later.
     Timeout(&'static str),
@@ -281,7 +287,9 @@ where
         // panic the delivery task — remote input must never do that.
         let raw = trimmed.as_bytes();
         if raw.len() < 3 || !raw[..3].iter().all(u8::is_ascii_digit) {
-            return Err(ClientError::Protocol(format!("malformed reply line: {trimmed:?}")));
+            return Err(ClientError::Protocol(format!(
+                "malformed reply line: {trimmed:?}"
+            )));
         }
 
         let this: u16 = trimmed[..3]
@@ -311,7 +319,9 @@ where
         }
     }
 
-    Err(ClientError::Protocol("reply had too many continuation lines".into()))
+    Err(ClientError::Protocol(
+        "reply had too many continuation lines".into(),
+    ))
 }
 
 async fn read_line_capped<S>(io: &mut BufReader<S>, out: &mut String) -> Result<usize, ClientError>
@@ -352,7 +362,6 @@ where
     // Unix-generated message — silent, permanent body corruption.
     let mut prev: Option<u8> = None;
     let mut at_line_start = true;
-    let mut last: Option<u8> = None;
 
     // Several parts, stuffed as though they were one stream. A trace header and
     // a body are written in sequence rather than concatenated first, so a large
@@ -371,16 +380,17 @@ where
             prev = Some(part[i]);
         }
         w.write_all(&part[start..]).await?;
-        if let Some(&b) = part.last() {
-            last = Some(b);
-        }
     }
 
-    // The terminator only counts at the start of a line, so an unterminated
-    // final line needs one before it.
-    match last {
-        Some(b'\n') | None => {}
-        Some(_) => w.write_all(b"\r\n").await?,
+    // The terminator only counts at the start of a line, and a line starts only
+    // after CRLF — so the test is `at_line_start`, not "ends with any newline".
+    //
+    // Testing `last == Some(b'\n')` looks equivalent and is not: a body ending
+    // in a bare LF then gets `.\r\n` written mid-line, the receiver never sees
+    // end-of-data, and the delivery hangs until the acknowledgement timeout,
+    // reports transient, and repeats against the next MX host.
+    if !at_line_start {
+        w.write_all(b"\r\n").await?;
     }
     w.write_all(b".\r\n").await
 }
@@ -410,8 +420,10 @@ mod tests {
             b"Received: x\r\n..hidden\r\n.\r\n"
         );
         // A part ending mid-line must not make the next part look line-initial.
-        assert_eq!(stuff_parts(&[b"no newline", b".still same line\r\n"]).await,
-            b"no newline.still same line\r\n.\r\n");
+        assert_eq!(
+            stuff_parts(&[b"no newline", b".still same line\r\n"]).await,
+            b"no newline.still same line\r\n.\r\n"
+        );
     }
 
     #[tokio::test]
@@ -455,6 +467,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_trailing_bare_lf_still_needs_a_crlf_before_the_terminator() {
+        // A bare LF does not begin a line as far as the receiver is concerned,
+        // so the terminator must not be written straight after one.
+        assert_eq!(stuff(b"x\n").await, b"x\n\r\n.\r\n");
+        assert_eq!(stuff(b"unix\nlines\n").await, b"unix\nlines\n\r\n.\r\n");
+    }
+
+    #[tokio::test]
     async fn empty_body_is_just_the_terminator() {
         assert_eq!(stuff(b"").await, b".\r\n");
     }
@@ -478,12 +498,36 @@ mod tests {
             b"a\n.b\r\n",
             b"unix\nlines\n.dotted\r\n",
             b"\n.\n\r\n",
+            // Ending in a bare LF. Every bare-LF case above still ends in
+            // CRLF, so they all pass with a terminator guard that tests
+            // "ends with any newline" instead of "is at a line start" — and
+            // that guard writes `.` mid-line, so the receiver never sees the
+            // end of the message at all. The test was shaped to miss it.
+            b"unix\nlines\n",
+            b"x\n",
+            b"\n",
+            b"no newline at all",
         ] {
             let wire = stuff(original).await;
             let mut r = DataReader::new(1 << 20);
             r.feed(&wire);
             assert!(r.is_complete(), "no terminator for {original:?}");
-            assert_eq!(r.body(), original, "round trip failed for {original:?}");
+
+            // Byte-for-byte, with one exception the protocol forces. The
+            // terminator only counts at the start of a line, so a body whose
+            // final line is unterminated — or terminated with a bare LF, which
+            // the receiver does not count as a line ending — must gain a CRLF
+            // before it. That CRLF is part of the message the receiver sees.
+            //
+            // The alternative is writing `.` mid-line, which no receiver ever
+            // recognises as end-of-data. Preservation loses to deliverability
+            // here, and the exception belongs in `OUTBOUND.md` rather than
+            // being quietly absorbed by the assertion.
+            let mut expected = original.to_vec();
+            if !expected.ends_with(b"\r\n") {
+                expected.extend_from_slice(b"\r\n");
+            }
+            assert_eq!(r.body(), expected, "round trip failed for {original:?}");
         }
     }
 

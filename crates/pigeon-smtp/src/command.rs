@@ -81,7 +81,10 @@ impl<'a> Command<'a> {
     /// Everything else earns a 503 until EHLO or HELO has been accepted.
     #[inline]
     pub fn allowed_before_greeting(&self) -> bool {
-        matches!(self, Self::Ehlo(_) | Self::Helo(_) | Self::Quit | Self::Noop | Self::Rset)
+        matches!(
+            self,
+            Self::Ehlo(_) | Self::Helo(_) | Self::Quit | Self::Noop | Self::Rset
+        )
     }
 }
 
@@ -218,8 +221,14 @@ mod tests {
 
     #[test]
     fn parses_greetings() {
-        assert_eq!(parse(b"EHLO mail.example.com\r\n"), Ok(Command::Ehlo("mail.example.com")));
-        assert_eq!(parse(b"HELO mail.example.com\r\n"), Ok(Command::Helo("mail.example.com")));
+        assert_eq!(
+            parse(b"EHLO mail.example.com\r\n"),
+            Ok(Command::Ehlo("mail.example.com"))
+        );
+        assert_eq!(
+            parse(b"HELO mail.example.com\r\n"),
+            Ok(Command::Helo("mail.example.com"))
+        );
     }
 
     #[test]
@@ -240,19 +249,31 @@ mod tests {
     fn parses_mail_from() {
         assert_eq!(
             parse(b"MAIL FROM:<sender@example.com>\r\n"),
-            Ok(Command::Mail { path: "sender@example.com", params: "" })
+            Ok(Command::Mail {
+                path: "sender@example.com",
+                params: ""
+            })
         );
         // Parameter case and spacing after the colon both vary in the wild.
         assert_eq!(
             parse(b"mail from: <sender@example.com>\r\n"),
-            Ok(Command::Mail { path: "sender@example.com", params: "" })
+            Ok(Command::Mail {
+                path: "sender@example.com",
+                params: ""
+            })
         );
     }
 
     #[test]
     fn null_sender_is_valid() {
         let cmd = parse(b"MAIL FROM:<>\r\n").unwrap();
-        assert_eq!(cmd, Command::Mail { path: "", params: "" });
+        assert_eq!(
+            cmd,
+            Command::Mail {
+                path: "",
+                params: ""
+            }
+        );
         match cmd {
             Command::Mail { path, .. } => assert!(Command::is_null_sender(path)),
             _ => panic!("expected MAIL"),
@@ -263,7 +284,10 @@ mod tests {
     fn keeps_esmtp_parameters() {
         assert_eq!(
             parse(b"MAIL FROM:<a@example.com> SIZE=1024 BODY=8BITMIME\r\n"),
-            Ok(Command::Mail { path: "a@example.com", params: "SIZE=1024 BODY=8BITMIME" })
+            Ok(Command::Mail {
+                path: "a@example.com",
+                params: "SIZE=1024 BODY=8BITMIME"
+            })
         );
     }
 
@@ -271,7 +295,10 @@ mod tests {
     fn accepts_unbracketed_path() {
         assert_eq!(
             parse(b"RCPT TO:user@example.com\r\n"),
-            Ok(Command::Rcpt { path: "user@example.com", params: "" })
+            Ok(Command::Rcpt {
+                path: "user@example.com",
+                params: ""
+            })
         );
     }
 
@@ -284,13 +311,22 @@ mod tests {
 
     #[test]
     fn unterminated_bracket_is_rejected() {
-        assert_eq!(parse(b"MAIL FROM:<a@example.com\r\n"), Err(ParseError::InvalidPath));
+        assert_eq!(
+            parse(b"MAIL FROM:<a@example.com\r\n"),
+            Err(ParseError::InvalidPath)
+        );
     }
 
     #[test]
     fn wrong_keyword_is_a_syntax_error() {
-        assert_eq!(parse(b"MAIL TO:<a@example.com>\r\n"), Err(ParseError::Syntax));
-        assert_eq!(parse(b"RCPT FROM:<a@example.com>\r\n"), Err(ParseError::Syntax));
+        assert_eq!(
+            parse(b"MAIL TO:<a@example.com>\r\n"),
+            Err(ParseError::Syntax)
+        );
+        assert_eq!(
+            parse(b"RCPT FROM:<a@example.com>\r\n"),
+            Err(ParseError::Syntax)
+        );
     }
 
     #[test]
@@ -318,7 +354,10 @@ mod tests {
     #[test]
     fn rejects_non_ascii_without_panicking() {
         // Multi-byte input must not be indexed into mid-character.
-        assert_eq!(parse("EHLO exämple.com\r\n".as_bytes()), Err(ParseError::NotAscii));
+        assert_eq!(
+            parse("EHLO exämple.com\r\n".as_bytes()),
+            Err(ParseError::NotAscii)
+        );
         assert_eq!(parse(b"EHLO \xff\xfe\r\n"), Err(ParseError::NotAscii));
     }
 
@@ -338,6 +377,10 @@ mod tests {
         assert!(parse(b"EHLO h\r\n").unwrap().allowed_before_greeting());
         assert!(parse(b"QUIT\r\n").unwrap().allowed_before_greeting());
         assert!(!parse(b"DATA\r\n").unwrap().allowed_before_greeting());
-        assert!(!parse(b"MAIL FROM:<a@b.com>\r\n").unwrap().allowed_before_greeting());
+        assert!(
+            !parse(b"MAIL FROM:<a@b.com>\r\n")
+                .unwrap()
+                .allowed_before_greeting()
+        );
     }
 }
