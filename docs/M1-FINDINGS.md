@@ -307,6 +307,22 @@ says so.
 Five mutations, all caught: the original ordering, a non-unique key name, no
 cleanup after rollback, a derived `Debug`, and the algorithm check disabled.
 
+### And a note on how the gates were being read
+
+Two commits in a row went to CI with a clippy failure after a local run I had
+called clean. The first was a genuine platform difference —
+`clippy::result_large_err` is a byte count against a struct layout, and
+`StartupError` crossed 128 bytes on x86_64 and not on aarch64.
+
+The second was not. It reproduced locally the moment the file was touched: the
+result I had read was **cached**, and I was grepping its output for lines
+starting with `error` rather than checking the exit code. A stale cache
+produces no such lines, which reads exactly like success.
+
+Gate runs now check exit codes. Grepping a tool's output for the absence of
+something is the same shape of mistake as a comment asserting a guarantee: it
+looks like evidence and is not.
+
 ---
 
 ## What to carry into the rest of Milestone 1

@@ -461,7 +461,7 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
                     if !cli.dry_run {
                         let _ = std::fs::remove_file(&key_path);
                     }
-                    return Err(e.into());
+                    return Err(e);
                 }
             };
 
