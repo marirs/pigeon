@@ -150,11 +150,12 @@ the same week as the code they misdescribe.
   inside it.** This is SQLite's documented procedure for altering tables, and it
   is what makes a future table rebuild possible at all. The design document said
   ON throughout, which works for migration 1 and forbids migration 2.
-- **The DKIM startup check refuses rather than pretends.** Deriving a public key
-  from a private one needs an RSA implementation the workspace does not yet
-  carry, so a `dkim_key` row that cannot be verified stops startup. There are no
-  such rows yet, which is what makes refusing cheap — and the difference between
-  a deferred branch and a comment claiming a guarantee.
+- **The DKIM startup check refused rather than pretended, until it could
+  actually check.** While the workspace carried no RSA implementation, a
+  `dkim_key` row that could not be verified stopped startup — which cost nothing
+  because no such rows could exist, and was the difference between a deferred
+  branch and a comment claiming a guarantee. It performs the real comparison
+  now; see §6.
 - **Repositories write and do not decide.** `add_alias` does not know whether the
   domain has a default to inherit. That is a property of the resulting
   configuration, and `Snapshot::build` owns it, on the same transaction, before
