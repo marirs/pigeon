@@ -19,6 +19,15 @@ jobs:
   fuzz:
     name: fuzz
     runs-on: ubuntu-latest
+    # `rust-toolchain.toml` pins `channel = "stable"`, and rustup's directory
+    # override beats the toolchain `dtolnay/rust-toolchain@nightly` installs —
+    # so without this the job builds on stable and dies on `-Zsanitizer`.
+    #
+    # This is finding 20k exactly: the MSRV job carries the same workaround for
+    # the same reason, and this workflow was written without applying it. It
+    # failed on its first run, which is the argument for the workflow existing.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     strategy:
       # One failing target must not cancel the others; each is independent and
       # a crash in one says nothing about the rest.
@@ -36,6 +45,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
+
+      - name: Confirm the nightly toolchain is actually in use
+        run: |
+          rustc --version
+          rustc --version | grep -q nightly || {
+            echo "::error::fuzz job is not running on nightly"; exit 1; }
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked

@@ -655,6 +655,21 @@ example-based test structurally cannot hold, because its author picks the
 splits they thought of. A terminator split across two reads is the bug class
 this codebase has already been bitten by twice.
 
+## 42. The fuzz workflow failed on its first run, for a reason already in this document
+
+`rust-toolchain.toml` pins `channel = "stable"`, and rustup's directory override
+beats the toolchain `dtolnay/rust-toolchain@nightly` installs. So all five jobs
+built on stable and died on `-Zsanitizer=address`.
+
+That is finding 20k verbatim. The MSRV job carries a `RUSTUP_TOOLCHAIN` override
+and a version assertion for exactly this reason; the fuzz workflow was written
+without applying either, because the local runs used `RUSTUP_TOOLCHAIN=nightly`
+on the command line and so never met the problem.
+
+**Fixed:** the override, plus an explicit check that the running compiler is
+nightly — the same pair, for the same reason. A job that silently runs on the
+wrong toolchain is worse than one that fails, because it reports success.
+
 See `fuzz/README.md`.
 
 ---
