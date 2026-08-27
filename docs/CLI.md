@@ -124,8 +124,13 @@ USAGE
   pigeon domain add <domain> [options]
 
 Creates the domain, generates an RSA-2048 DKIM key, and prints the DNS
-records you need to publish. The domain starts in PENDING_DNS and cannot
-receive mail until every record is live and validated.
+records you need to publish. The domain starts in NEW and cannot receive
+mail until every record is live and validated.
+
+It moves to PENDING_DNS when the records have been rendered and to ACTIVE
+when they all pass, both of which arrive with DNS validation in Milestone 5.
+Until then a domain stays in NEW, and `pigeon domain show` reports that
+rather than a state nothing sets.
 
 The private key is written to the keys directory and never leaves this
 host. It cannot be regenerated without republishing DNS, so include it in
@@ -349,14 +354,22 @@ Both alternatives are ambiguous in a way that loses data. `*` is already valid a
 
 ### Rejects
 
-An address that must never be accepted is an alias with no destination:
+An address that must never be accepted is an alias created with `--reject`:
 
 ```bash
 pigeon alias add example.com postmaster-old --reject
 pigeon alias remove example.com postmaster-old
 ```
 
-It appears in `alias list` marked `REJECT` and takes precedence over everything else.
+A reject rule is a *kind*, not an absence. An alias with no destination is a
+different thing: it inherits the domain default, which is what makes
+`pigeon domain forward` able to move all of them at once.
+
+It appears in `alias list` marked `REJECT`, and it refuses everything that no
+*more specific* rule claims. It does not outrank every rule — specificity wins
+first, so `hell*` set to reject does not disable an explicit `hello` alias. An
+address that must never be accepted under any circumstances is written as an
+exact reject, which nothing outranks.
 
 ## Catch-all
 
@@ -629,7 +642,9 @@ pigeon import csv aliases.csv
 
 `--dry-run` prints the diff without writing. Run it first.
 
-Imported domains land in `PENDING_DNS` regardless of their state elsewhere, because their DNS still points at the previous host. Keep the previous provider as a lower-priority MX during cutover:
+Imported domains are created exactly as `pigeon domain add` creates them, in NEW, regardless of their state elsewhere — their DNS still points at the previous host, and nothing about the file changes that. A domain in the file that Pigeon already carries keeps whatever lifecycle and administrative state it has: import adds routing, and is not a lifecycle operation.
+
+Keep the previous provider as a lower-priority MX during cutover:
 
 ```text
 example.com  MX 10 mx1.yourserver.net
