@@ -334,16 +334,28 @@ PENDING_DNS
 READY
  │
  ▼
-ACTIVE
- │
- ├──→ SUSPENDED
- │
- └──→ ERROR
+ACTIVE ←──→ ERROR
 ```
 
 `ACTIVE` is the only state allowed to receive production mail.
 
-Outbound may have a separate enable flag because a domain can be valid for inbound forwarding but intentionally disabled for sending.
+Administrative suspension is **not** a lifecycle state. It is a separate flag,
+because the two are independent: a domain switched off by the operator is still
+somewhere in the DNS lifecycle, and a domain can be gated by DNS *and* disabled
+at once. Collapsing them into one column means re-deriving a domain's DNS state
+when it is re-enabled, and being unable to represent the pair.
+
+So there are two axes, and a domain accepts inbound mail only when both agree:
+
+```text
+status = ACTIVE   AND   inbound_enabled = true
+```
+
+`pigeon domain enable|disable` moves the flag and never touches `status`, so a
+disabled domain keeps passing or failing its checks and returns exactly as it
+was. Outbound carries its own flag for the same reason, defaulting to off: a
+domain can be valid for inbound forwarding and intentionally not permitted to
+send. See `M1-SCHEMA.md` §4.
 
 ### 5.1 Startup gating
 

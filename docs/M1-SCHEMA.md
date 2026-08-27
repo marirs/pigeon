@@ -78,19 +78,60 @@ match the one in the binary. A developer who edits migration 3 after it has run
 on their own machine finds out immediately, which is where that mistake is
 cheap.
 
-### I3 — One transaction per migration, including its version row.
+### I3 — One transaction for the whole pending batch.
 
-SQLite runs DDL inside transactions, unlike MySQL. So a migration and the row
-recording it commit together, and there is no state in which a migration is
-half-applied or applied-but-unrecorded.
+Not one per migration. SQLite has no nested transactions — a second
+`BEGIN IMMEDIATE` inside an open one fails with *cannot start a transaction
+within a transaction* — so "a transaction per migration" and "a lock held for
+the whole run" cannot both be true.
 
-Two pragmas cannot participate and are therefore set outside, on the
-connection, before any migration runs:
+The batch is the unit:
+
+```text
+BEGIN IMMEDIATE
+  read current version                -- inside the lock, so no one races it
+  apply migration N, insert its row
+  apply migration N+1, insert its row
+  ...
+  PRAGMA user_version = <highest>
+  PRAGMA foreign_key_check
+COMMIT
+```
+
+One `BEGIN IMMEDIATE` also *is* the lock in I6, so the two invariants collapse
+into one mechanism rather than contradicting each other.
+
+This is stronger than per-migration atomicity, not weaker: the daemon never
+boots on a schema that is three migrations along a five-migration upgrade.
+SQLite rolls DDL back, `user_version` is transactional, and `foreign_key_check`
+runs inside the transaction — all verified in §7.
+
+The cost is that a failure loses the whole batch and the next attempt re-runs
+it from the start. For a single-host mail configuration database, that is the
+right trade: the alternative is a half-upgraded schema that no code was written
+against.
+
+Two pragmas cannot participate and are set outside, on the connection, before
+the transaction opens:
 
 - `journal_mode = WAL` — persistent, set once at database creation.
 - `foreign_keys = ON` — **per connection, not persistent.** Every connection
   the daemon or CLI opens must set it. This is the single most common way a
   SQLite schema's referential integrity turns out to be decorative.
+
+### I3a — A durable backup is taken before any migration is applied.
+
+I1 makes restore-from-backup the only rollback path. An invariant that depends
+on a backup nobody was required to take is a plan, not a guarantee.
+
+Before applying a pending batch, the runner copies the database with SQLite's
+Backup API — not a file copy, which is unsafe against a live WAL — fsyncs the
+copy and its directory, and only then opens the migration transaction. The
+backup is named for the version being migrated *from*, so what it contains is
+evident without opening it.
+
+A backup that cannot be written **aborts startup**. Refusing to migrate is
+recoverable; migrating with no way back is not.
 
 ### I4 — Versions are dense, ordered integers.
 
@@ -106,11 +147,12 @@ that does not know about a column keeps working, writes rows that the newer
 schema's constraints would have rejected, and the damage is discovered after
 the next upgrade.
 
-### I6 — The runner holds a write lock for the whole run.
+### I6 — The batch transaction is the lock.
 
-`BEGIN IMMEDIATE` before reading the current version, so two processes starting
-at once cannot both decide migration 5 needs applying. The daemon and the CLI
-can both be launched by an operator in the same second.
+`BEGIN IMMEDIATE` takes the write lock before the current version is read, so
+two processes starting in the same second cannot both decide migration 5 needs
+applying. This is the same transaction as I3, not a second one — see the note
+there about why it cannot be.
 
 ### I7 — Only the daemon migrates.
 
@@ -122,10 +164,12 @@ exits, rather than reading a schema it will misinterpret. Offline mutation,
 which `CLI.md` permits when the daemon is stopped, is the one exception and
 takes the same lock.
 
-### I8 — `foreign_key_check` after every run.
+### I8 — `foreign_key_check` inside the batch, before it commits.
 
 Cheap at this scale, and the alternative is discovering a violated constraint
-during a delivery.
+during a delivery. Running it inside the transaction means a migration that
+breaks referential integrity is rolled back rather than reported after the
+fact.
 
 ### I9 — `user_version` mirrors the table.
 
@@ -133,15 +177,24 @@ during a delivery.
 timestamps. `PRAGMA user_version` is set to the same number so an operator with
 nothing but `sqlite3` can read it in one line.
 
-### Open question M-1
+### I10 — Migrations are embedded `.sql`, checksummed as exact bytes.
 
-Should migrations be embedded `.sql` files (`include_str!`) or Rust functions?
+`include_bytes!`, not `include_str!`. The checksum in I2 covers the bytes that
+were compiled in, so no normalisation sits between what was reviewed and what
+is verified.
 
-**Recommend: `.sql` files, embedded.** A migration is then reviewable as
-SQL, checksummable as text, and reproducible by hand against a backup. Rust
-migrations are only needed for data transforms that SQL cannot express, and the
-moment one is needed it can be added as a separate mechanism rather than
-shaping every migration around the possibility.
+That makes line endings part of the checksum, which would turn a checkout on a
+machine configured for CRLF into a spurious "migration has been edited" abort.
+So `.gitattributes` pins them:
+
+```gitattributes
+*.sql text eol=lf
+```
+
+SQL rather than Rust functions: a migration is then reviewable as SQL,
+checksummable as text, and reproducible by hand against a backup. A data
+transform that SQL cannot express can be added as a separate mechanism if one
+is ever needed, rather than shaping every migration around the possibility.
 
 ---
 
@@ -217,11 +270,9 @@ Punycode, normalised on write. DNS lookups, DKIM selectors and `Received:`
 headers all use the A-label; storing the U-label would mean converting at every
 read and getting it wrong somewhere.
 
-### Open question C-1
+### C7 — Separate `local` and `domain` columns, not one `address`
 
-`local` and `domain` as separate columns, or one `address` column?
-
-**Recommend: separate.** It is the only way the two case rules in C5 can be
+Ruled in review (C-1). It is the only way the two case rules in C5 can be
 expressed as column collations rather than as application discipline, and
 `destination list` needs to group by domain.
 
@@ -280,6 +331,29 @@ Every reference uses `ON DELETE RESTRICT`. A destination is deleted only by an
 explicit prune of unreferenced rows, so no path can orphan a mailbox that is
 still routing.
 
+### `relay`
+
+Declared before `domain`, which references it. Creation order is
+`schema_migration`, `setting`, `destination`, `relay`, `domain`, `alias`,
+`alias_destination`, `dkim_key`, `sender_identity`, `principal`,
+`principal_grant`.
+
+```sql
+CREATE TABLE relay (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    host       TEXT NOT NULL,
+    port       INTEGER NOT NULL DEFAULT 587,
+    username   TEXT,
+    -- A *name*, not a path. Resolved against the configured `secrets` root
+    -- and required to stay inside it — see §5. A path column would carry the
+    -- traversal problem that motivated a root for `keys`, with nothing
+    -- constraining it, so a hand-edited row could name any readable file.
+    secret_ref TEXT,
+    created_at INTEGER NOT NULL
+) STRICT;
+```
+
 ### `domain`
 
 ```sql
@@ -287,8 +361,9 @@ CREATE TABLE domain (
     id                      INTEGER PRIMARY KEY,
     name                    TEXT NOT NULL UNIQUE COLLATE NOCASE,
 
+    -- DNS lifecycle only. `suspended` is deliberately absent: see below.
     status                  TEXT NOT NULL DEFAULT 'new'
-        CHECK (status IN ('new','pending_dns','ready','active','suspended','error')),
+        CHECK (status IN ('new','pending_dns','ready','active','error')),
 
     inbound_enabled         INTEGER NOT NULL DEFAULT 1 CHECK (inbound_enabled IN (0,1)),
     outbound_enabled        INTEGER NOT NULL DEFAULT 0 CHECK (outbound_enabled IN (0,1)),
@@ -314,10 +389,52 @@ CREATE TABLE domain (
     -- Catch-all is never enabled implicitly, and a destination for a disabled
     -- catch-all is a contradiction that would route mail after a later enable.
     CHECK (catchall_enabled = 1 OR catchall_destination_id IS NULL),
-    -- Relay delivery without a relay is a domain that cannot send.
-    CHECK (delivery_mode = 'direct' OR relay_id IS NOT NULL)
+
+    -- An enabled catch-all must have somewhere to go: its own destination, or
+    -- the domain default it inherits. Without this, clearing a default silently
+    -- leaves a catch-all accepting every address on the domain and routing it
+    -- nowhere. Row CHECKs are re-evaluated on UPDATE, so this blocks the
+    -- clearing path and not merely the creating one.
+    CHECK (catchall_enabled = 0
+           OR catchall_destination_id IS NOT NULL
+           OR default_destination_id IS NOT NULL),
+
+    -- Equivalence, not implication. The one-way form permitted a domain in
+    -- direct mode still carrying a relay_id, which reads as configured relay
+    -- delivery to anything inspecting the row.
+    CHECK ((delivery_mode = 'relay') = (relay_id IS NOT NULL))
 ) STRICT;
+
+CREATE INDEX domain_by_relay        ON domain(relay_id);
+CREATE INDEX domain_by_default_dest ON domain(default_destination_id);
+CREATE INDEX domain_by_catchall_dest ON domain(catchall_destination_id);
+CREATE INDEX domain_by_notify_dest  ON domain(notify_destination_id);
 ```
+
+**`suspended` is gone from `status`, and `inbound_enabled` is the authority.**
+
+The first draft carried both, which let a row say `status='suspended'` and
+`inbound_enabled=1` at once — two encodings of one administrative state,
+disagreeing. Of the two ways to resolve that, dropping the flag loses
+information: a domain that is administratively off is also somewhere in the DNS
+lifecycle, and collapsing both into `status` means re-deriving its DNS state on
+re-enable, with no way to represent "gated by DNS *and* switched off".
+
+So the two axes stay separate, which is what they are:
+
+| Axis | Column | Meaning |
+|---|---|---|
+| DNS lifecycle | `status` | what validation has established |
+| Administrative | `inbound_enabled`, `outbound_enabled` | what the operator has permitted |
+
+Effective acceptance is `status = 'active' AND inbound_enabled = 1`, computed in
+one place when the routing snapshot is built. `pigeon domain enable|disable`
+moves the flag and never touches `status`, so a disabled domain keeps failing
+or passing its DNS checks and comes back exactly as it was.
+
+This requires two changes outside this document: `ARCHITECTURE.md` §5's
+lifecycle diagram, and `DomainStatus::Suspended` in `pigeon-types`, whose
+`accepts_mail()` must stop being the whole answer.
 
 `outbound_enabled` defaults to `0` while `inbound_enabled` defaults to `1`.
 That asymmetry is the point: forwarding is what the operator asked for by
@@ -326,7 +443,7 @@ adding the domain, and the authority to *send* as it is a separate grant
 
 Catch-all lives as two columns rather than its own table because a nullable
 foreign key alone cannot distinguish *enabled, inheriting the domain default*
-from *disabled*. The flag plus the `CHECK` encodes both states without a 1:1
+from *disabled*. The flag plus the `CHECK`s encodes every state without a 1:1
 table.
 
 ### `alias`
@@ -336,7 +453,11 @@ CREATE TABLE alias (
     id          INTEGER PRIMARY KEY,
     domain_id   INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
 
-    pattern     TEXT NOT NULL,              -- lowercased: see C5
+    -- Lowercased on write (C5), and COLLATE NOCASE so the database enforces it
+    -- rather than trusting every writer to have remembered. Without it, `Hello`
+    -- and `hello` coexist as separate aliases on one domain and only one of
+    -- them ever matches.
+    pattern     TEXT NOT NULL COLLATE NOCASE,
     kind        TEXT NOT NULL DEFAULT 'forward' CHECK (kind IN ('forward','reject')),
 
     -- Generated, not stored by the application, so it cannot drift from the
@@ -346,9 +467,11 @@ CREATE TABLE alias (
     created_at  INTEGER NOT NULL,
     UNIQUE (domain_id, pattern)
 ) STRICT;
-
-CREATE INDEX alias_by_domain ON alias(domain_id);
 ```
+
+No separate index on `domain_id`: `UNIQUE (domain_id, pattern)` already creates
+one with `domain_id` leading, which serves both the per-domain listing and the
+cascade on domain delete.
 
 ### `alias_destination`
 
@@ -358,6 +481,12 @@ CREATE TABLE alias_destination (
     destination_id INTEGER NOT NULL REFERENCES destination(id) ON DELETE RESTRICT,
     PRIMARY KEY (alias_id, destination_id)
 ) STRICT;
+
+-- The primary key indexes `alias_id` (leading), but not `destination_id`.
+-- SQLite does not index foreign-key children automatically, so without this
+-- every ON DELETE RESTRICT check and every `destination list` count scans the
+-- whole table.
+CREATE INDEX alias_destination_by_destination ON alias_destination(destination_id);
 ```
 
 Three alias states, and how they are distinguished:
@@ -396,8 +525,19 @@ CREATE TABLE dkim_key (
     state            TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retiring','retired')),
     created_at       INTEGER NOT NULL,
     retired_at       INTEGER,
-    UNIQUE (domain_id, selector)
+    UNIQUE (domain_id, selector),
+
+    -- A retired key with no retirement time, or a live key carrying one, is a
+    -- row whose state cannot be trusted by rotation logic.
+    CHECK ((state = 'retired') = (retired_at IS NOT NULL))
 ) STRICT;
+
+-- "At most one active key per algorithm" was prose in the first draft, which
+-- means it was not a rule. Two active RSA keys for one domain would make the
+-- signer's choice arbitrary and the published TXT record wrong for half the
+-- mail it signs.
+CREATE UNIQUE INDEX dkim_key_one_active
+    ON dkim_key(domain_id, algorithm) WHERE state = 'active';
 ```
 
 Private key material stays on disk and out of the database, so a database
@@ -417,20 +557,10 @@ Created now, used in Milestone 7. Per the rule in §1: this is the relational
 part that would be disruptive to retrofit.
 
 ```sql
-CREATE TABLE relay (
-    id           INTEGER PRIMARY KEY,
-    name         TEXT NOT NULL UNIQUE,
-    host         TEXT NOT NULL,
-    port         INTEGER NOT NULL DEFAULT 587,
-    username     TEXT,
-    secret_ref   TEXT,          -- reference, never the secret: see SECURITY.md
-    created_at   INTEGER NOT NULL
-) STRICT;
-
 CREATE TABLE sender_identity (
     id         INTEGER PRIMARY KEY,
     domain_id  INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
-    local      TEXT NOT NULL,   -- lowercased: Pigeon is authoritative here (C5)
+    local      TEXT NOT NULL COLLATE NOCASE,   -- authoritative: C5
     created_at INTEGER NOT NULL,
     UNIQUE (domain_id, local)
 ) STRICT;
@@ -450,9 +580,23 @@ CREATE TABLE principal_grant (
     principal_id INTEGER NOT NULL REFERENCES principal(id) ON DELETE CASCADE,
     domain_id    INTEGER NOT NULL REFERENCES domain(id)    ON DELETE CASCADE,
     -- NULL means the whole domain: `pigeon auth allow name '*@example.com'`.
-    local        TEXT,
-    created_at   INTEGER NOT NULL
+    local        TEXT COLLATE NOCASE,
+    created_at   INTEGER NOT NULL,
+
+    -- A grant naming a local part must name a real sender identity. Without
+    -- this, a grant can authorise an identity that is not on the domain's
+    -- allowlist at all — and removing the identity leaves the grant behind, so
+    -- re-adding it later silently restores an authority nobody re-granted.
+    --
+    -- Composite and nullable: SQL skips a foreign key when any of its columns
+    -- is NULL, so a domain-wide grant is exempt without needing a special case.
+    FOREIGN KEY (domain_id, local)
+        REFERENCES sender_identity(domain_id, local) ON DELETE CASCADE
 ) STRICT;
+
+-- Neither foreign-key child column is indexed by the partial indexes below,
+-- which lead with `principal_id`.
+CREATE INDEX principal_grant_by_domain ON principal_grant(domain_id, local);
 
 -- Two partial indexes, not one UNIQUE constraint. See below — this is the one
 -- place in this schema where the obvious spelling is silently wrong.
@@ -505,6 +649,7 @@ spool    = "/var/spool/pigeon"
 keys     = "/var/lib/pigeon/keys"
 
 srs_secret_file = "/var/lib/pigeon/srs.key"
+secrets         = "/var/lib/pigeon/secrets"
 
 [smtp.inbound]
 listen = "0.0.0.0:25"
@@ -535,6 +680,14 @@ Two fields exist because of decisions above:
   every bounce return path issued before the restart stops verifying. It is a
   secret, so it is a `0600` file referenced by path rather than a value in a
   TOML that is convenient to make readable.
+- **`secrets`** — the root for `relay.secret_ref`, and it exists for exactly
+  the reason `keys` does. The first draft described `secret_ref` as "a
+  reference, never the secret", which solves the wrong half: keeping the
+  password out of the row does nothing if the row can name
+  `/etc/shadow`. `secret_ref` is therefore a *name*, not a path — resolved
+  against this root, canonicalised, and required to remain inside it after
+  symlink resolution. A relay row can only ever name a file the operator put
+  in the secrets directory.
 
 ### Startup ordering
 
@@ -556,59 +709,86 @@ system is known to work.
 9  serve
 ```
 
-Step 5 is the step that only exists because of this schema, and it is three
-checks that can each abort startup:
+Step 5 is the step that only exists because of this schema. **Two of its three
+checks abort startup; the third only warns.**
 
-1. **Every `dkim_key` row in state `active` for a domain that signs has a
-   readable private key at its path, `0600`, inside `keys`.** This is the
-   `SECURITY.md` startup-abort item made concrete. It cannot happen earlier —
-   the rows are not readable until migrations have run.
-2. **`alerts.identity`'s domain is not a row in `domain`.** `ALERTING.md` is
-   explicit that an alert must never be sent as a domain under test, and that
-   the failure mode is silent: the alert is destroyed by the fault it reports.
-   Config alone cannot check this; it needs the domain table.
-3. **`hostname` resolves and its reverse DNS agrees.** DNS, and therefore *not*
-   a startup abort — this one gates nothing and is reported as a warning, per
-   the local-versus-remote split in `ARCHITECTURE.md` §5.1.
+1. **Every `active` `dkim_key` row for a signing domain has a private key that
+   is present, `0600`, inside `keys` — and that actually matches the stored
+   public key.** *Aborts.*
 
-That third item is the reason this list is worth writing down. Two of these
-three look identical when read as "validate configuration at startup", and one
-of them must not stop the daemon.
+   Existence is not enough. A key file replaced during a botched rotation, or
+   restored from a backup taken before the last one, passes an existence check
+   and then signs every message with a key whose public half is not the one in
+   DNS. Every signature verifies as `dkim=fail`, at the receiver, silently, and
+   the daemon reports a clean start. So the check derives the public key from
+   the private key and compares it against `dkim_key.public_key`.
+
+   It cannot happen earlier: the rows are not readable until migrations run.
+
+2. **`alerts.identity`'s domain is not a row in `domain`.** *Aborts.*
+   `ALERTING.md` is explicit that an alert must never be sent as a domain under
+   test, and that the failure mode is silent — the alert is destroyed by the
+   fault it exists to report. Config alone cannot check this; it needs the
+   domain table.
+
+3. **`hostname` resolves and its reverse DNS agrees.** *Warns only.* This is
+   remote state, and the local-versus-remote split in `ARCHITECTURE.md` §5.1
+   says remote state gates a domain, never the process.
+
+That third item is the reason this list is worth writing down. All three read
+identically as "validate configuration at startup", and one of them must not
+stop the daemon.
 
 ---
 
-## 6. Open questions
+## 6. Rulings
 
-Decisions I have taken a position on but that change work downstream, so worth
-settling before code exists.
+Settled in review. Recorded because the reasoning is what makes them
+reviewable again later.
 
-**S-1 — Is `destination` normalised, or is address text repeated?**
-Recommend normalised (§4). Cost: a prune step and one more join when loading
-the snapshot. Benefit: `destination list` and `destination replace` become
-foreign-key operations with exact previews, and the case rules in C5 live in
-column collations rather than in every query.
+**S-1 — `destination` is normalised.** Accepted as proposed.
 
-**S-2 — Who owns the invariants SQLite cannot express?**
-`kind='reject'` implies no destinations; a domain's default destination must
-not create a routing loop; a redundant alias must be reported, not rejected.
-Recommend: the repository layer enforces on write, and `pigeon check` verifies
-the whole database — so an invariant violated by a hand-edited row is found by
-a command rather than by a message going to the wrong place. The alternative is
-SQLite triggers, which are invisible in code review and hard to test.
+**S-2 — Repository enforcement, plus mandatory snapshot validation.**
+Accepted with a correction that matters: `pigeon check` is *optional detection,
+not enforcement*. A hand-edited row that violates an invariant must not be able
+to go live merely because nobody ran a command.
 
-**S-3 — Where does loop detection read from?**
-Configuration-time loop detection walks destination → managed domain → alias →
-destination. Recommend it runs against the **in-memory routing snapshot**, not
-against SQL, so the CLI's prediction and the daemon's routing cannot diverge —
-which is Milestone 1's exit criterion stated as a design constraint rather than
-as a test.
+So the enforcement point is **routing-snapshot construction**, which every path
+into service already goes through — startup, live reload, and offline
+mutation. A snapshot that fails validation is not installed; at startup that
+aborts, and on reload the previously valid snapshot stays in place. `pigeon
+check` runs the same validation and reports, which makes it a diagnostic rather
+than the guarantee.
 
-**S-4 — Does `--json` expose a schema version?**
-Recommend yes: a top-level `"schema": <n>` on every read command. `CLI.md`
-promises `--json` is stable across releases; a consumer that can see the
-version can tell a stable field from a new one.
+**S-3 — Loop detection runs in memory, against the proposed snapshot.**
+Accepted, with the timing made explicit: the check runs against the
+*post-mutation* snapshot, built but not yet installed, before the write
+commits. Validating the pre-mutation snapshot would answer a question nobody
+asked.
 
-**C-1, M-1** — stated inline above.
+**S-4 — Ruled the other way. `--json` carries `"format_version": 1`, not the
+migration number.**
+
+I proposed exposing the schema version, which conflates two things that must be
+free to move independently. A storage migration that adds an index changes
+nothing a consumer can observe; a rename of a JSON field changes everything and
+might need no migration at all. Tying them means every internal storage change
+looks like a breaking output change, and consumers learn to ignore the signal.
+
+`format_version` starts at 1 and increments only when the public output
+contract changes.
+
+**M-1 — Embedded `.sql`, `include_bytes!`, `*.sql text eol=lf`.** Accepted and
+recorded as I10.
+
+**C-1 — `local` and `domain` as separate columns.** Accepted as proposed.
+
+**Address case rule (C5) — accepted as written.** Now enforced by the database
+as well as the application: `COLLATE NOCASE` on `alias.pattern`,
+`sender_identity.local` and `principal_grant.local`, which are the addresses
+Pigeon is authoritative for. `destination.local` keeps binary collation. The
+ASCII-only limit of SQLite's `NOCASE` matches the current scope — SMTPUTF8 is
+not advertised (finding 2) — and must be revisited with it.
 
 ---
 
@@ -637,12 +817,49 @@ What did **not** hold, and is the reason this section exists:
 
 **`UNIQUE (principal_id, domain_id, local)` accepted two identical domain-wide
 grants.** SQL treats NULLs as distinct inside `UNIQUE`. Two rows went in
-cleanly. Corrected to the two partial indexes in §4, and re-verified: the
-second domain-wide grant is now refused, a duplicate identity grant is refused,
-and a domain-wide grant coexisting with a specific one is still allowed.
+cleanly. Corrected to the two partial indexes in §4.
 
-An audit of every other `UNIQUE` in the schema found no second instance —
-`principal_grant.local` is the only nullable column inside one.
+### Second round, after review
+
+Every correction from review was applied and then re-executed. The DDL in §4 is
+now extracted from this document in reading order and applied unmodified, which
+is also what settles the dependency-order question — `relay` precedes `domain`
+here because SQLite requires it to.
+
+Migration mechanics:
+
+| Claim | Result |
+|---|---|
+| A second `BEGIN IMMEDIATE` inside one fails | `cannot start a transaction within a transaction` — confirms I3/I6 could not both have been implemented |
+| `PRAGMA user_version` is transactional | rolled back to 0, committed as 7 |
+| `PRAGMA foreign_key_check` runs inside a transaction | yes |
+| DDL rolls back | two `CREATE TABLE`s, `ROLLBACK`, zero tables |
+
+Constraints — sixteen cases, every one as intended:
+
+| Must be refused | Must be allowed |
+|---|---|
+| `status='suspended'` (removed from the enum) | domain disabled while `status='active'` |
+| direct mode carrying a `relay_id` | `status='error'` **and** disabled — both axes at once |
+| relay mode with no relay | relay mode with a relay |
+| catch-all on with no effective destination | catch-all inheriting the domain default |
+| alias `Hello` beside `hello` | grant to a real identity |
+| grant naming a nonexistent identity | domain-wide grant (`local IS NULL`) |
+| a second active RSA key | active ed25519 beside active RSA |
+| retired key with no `retired_at` | |
+
+Two results worth stating separately, because they are the ones that would have
+been assumed rather than known:
+
+- **The catch-all `CHECK` fires on `UPDATE`, not only `INSERT`.** Clearing a
+  domain default that an enabled catch-all inherits is refused. That is the
+  path that actually loses mail — a catch-all accepting every address on a
+  domain and routing it nowhere — and it is reached by editing a *different*
+  column.
+- **Removing a sender identity cascades its specific grants and leaves the
+  domain-wide one.** Exactly the intended authorisation semantics, and it
+  follows from SQL skipping a composite foreign key when any of its columns is
+  NULL rather than from a special case anyone wrote.
 
 ---
 
@@ -674,3 +891,17 @@ the host's SQLite 3.51.0, one patch release behind the bundled 3.51.3 that will
 actually execute it. Nothing here is near a version boundary, but the schema
 tests should run through `rusqlite` rather than the `sqlite3` binary, so what
 is tested is what ships.
+
+### Carried into implementation
+
+Three changes this design requires outside the schema itself:
+
+1. **`DomainStatus::Suspended` is removed from `pigeon-types`**, and
+   `accepts_mail()` stops being the whole answer — effective acceptance is
+   `status = Active && inbound_enabled`. `ARCHITECTURE.md` §5 is already
+   updated to match.
+2. **`.gitattributes` gains `*.sql text eol=lf`** before the first migration is
+   written, or the I2 checksum aborts on any CRLF checkout.
+3. **The snapshot builder is the enforcement point for S-2**, so it must exist
+   before any mutating command does — a repository write that cannot be
+   validated against a proposed snapshot has nothing to validate it.
