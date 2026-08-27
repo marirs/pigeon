@@ -20,7 +20,12 @@ use crate::DbError;
 /// `local` keeps its case and `domain` is folded. RFC 5321 §2.4 reserves the
 /// local part to the destination host, and folding it merges distinct
 /// recipients — finding 12.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Ord` is derived so a fan-out set can be sorted into a canonical order:
+/// two files listing the same destinations differently must produce the same
+/// configuration. It orders by local part then domain, which is arbitrary and
+/// only ever used for that.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Address {
     pub local: String,
     pub domain: String,

@@ -89,6 +89,8 @@
 //! `--quiet` prints nothing on success and relies on the exit code, which is
 //! also stable — see `docs/CLI.md`.
 
+mod import;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -164,6 +166,11 @@ enum Command {
     Destination {
         #[command(subcommand)]
         verb: Option<DestinationVerb>,
+    },
+    /// Bulk import from a file.
+    Import {
+        #[command(subcommand)]
+        verb: Option<ImportVerb>,
     },
     /// Trace where an address would go.
     Route {
@@ -255,6 +262,23 @@ enum DestinationVerb {
         /// Narrow to one domain.
         #[arg(long)]
         domain: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportVerb {
+    /// Import aliases from a CSV file.
+    Csv {
+        file: PathBuf,
+        /// Keep existing routing; a differing alias is a conflict.
+        #[arg(long, conflicts_with = "replace")]
+        merge: bool,
+        /// Remove aliases and the catch-all on the imported domains first.
+        /// The domain default is preserved.
+        #[arg(long)]
+        replace: bool,
         #[arg(long)]
         yes: bool,
     },
@@ -485,6 +509,13 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         Command::Destination { verb } => match verb {
             None | Some(DestinationVerb::List) => destination_list(cli),
             Some(v) => destination(cli, v),
+        },
+        Command::Import { verb } => match verb {
+            None => {
+                print_help("import");
+                Ok(exit::OK)
+            }
+            Some(v) => import_cmd(cli, v),
         },
         Command::Route { verb } => match verb {
             None => {
@@ -1415,6 +1446,35 @@ EXAMPLES
   pigeon catchall add example.com --to me@example.net
   pigeon catchall remove example.com"#
         ),
+        "import" => println!(
+            r#"Bulk import from a file.
+
+USAGE
+  pigeon import csv <file> [--merge | --replace] [--yes]
+
+The file needs a header row naming `address` and `destination`, and
+optionally `kind`. Columns are matched by name, so their order does not
+matter. One destination per row; repeating an address fans it out.
+
+  address,destination
+  hello@example.com,me@example.net
+  support@example.com,me@example.net
+  support@example.com,ops@example.net
+  shop-*@example.com,shop@example.net
+  *@example.com,catchall@example.net
+
+If any imported domain already has aliases or a catch-all, --merge or
+--replace is required. An import file says what should exist and nothing
+about what should stop existing, so Pigeon will not guess.
+
+--replace removes aliases and catch-alls on the imported domains only, and
+keeps their default destinations.
+
+EXAMPLES
+  pigeon import csv aliases.csv --dry-run
+  pigeon import csv aliases.csv
+  pigeon import csv aliases.csv --replace --yes"#
+        ),
         "route" => println!(
             r#"Trace where an address would go, without sending anything.
 
@@ -1464,7 +1524,7 @@ fn keys_root(cli: &Cli) -> anyhow::Result<PathBuf> {
 /// `create_new`, so an existing key is never overwritten: it is the one piece
 /// of state no backup of the database restores, and silently replacing it makes
 /// every signature the old key made unverifiable.
-fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
     let mut options = std::fs::OpenOptions::new();
@@ -1508,7 +1568,7 @@ fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
 /// name is stored in the database. It exists so that a key file can never
 /// collide with one an earlier domain of the same name left behind, which is
 /// what made `remove` then `add` break deterministically.
-fn nonce() -> String {
+pub(crate) fn nonce() -> String {
     use rsa::rand_core::RngCore;
     let mut bytes = [0u8; 6];
     rsa::rand_core::OsRng.fill_bytes(&mut bytes);
@@ -1607,3 +1667,286 @@ const ROUTE_CAVEAT: &str = "\nNote: pigeond does not yet route from this table �
      from PIGEON_ACCEPT and delivery from PIGEON_FORWARD_TO. This predicts the \
      control plane, not the running daemon — that is Milestone 3. See \
      docs/M1-FINDINGS.md.";
+
+// ------------------------------------------------------------------ import
+
+fn import_cmd(cli: &Cli, verb: &ImportVerb) -> anyhow::Result<u8> {
+    use import::plan::{Mode, PrepareError};
+
+    let ImportVerb::Csv {
+        file,
+        merge,
+        replace,
+        yes,
+    } = verb;
+
+    let mode = match (merge, replace) {
+        (true, _) => Some(Mode::Merge),
+        (_, true) => Some(Mode::Replace),
+        _ => None,
+    };
+
+    // Step 1. Nothing is written, and the whole file is read before anything
+    // else happens.
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", file.display()))?;
+    let (plan, mut conflicts) = import::parse::parse(&text);
+
+    let mut conn = open_write(cli)?;
+
+    // Step 2 and 3.
+    let prepared = match import::plan::prepare(&conn, plan, mode) {
+        Ok(p) => p,
+        Err(PrepareError::Conflicts(mut c)) => {
+            conflicts.append(&mut c);
+            return report_conflicts(cli, &conflicts);
+        }
+        Err(PrepareError::ModeRequired(scoped)) => {
+            return mode_required(cli, &scoped);
+        }
+        Err(PrepareError::Db(e)) => return Err(e.into()),
+    };
+    if !conflicts.is_empty() {
+        return report_conflicts(cli, &conflicts);
+    }
+
+    if prepared.mode == Mode::Replace && !yes && !cli.dry_run {
+        return replace_needs_confirmation(cli, &prepared);
+    }
+
+    if cli.dry_run {
+        return dry_run(cli, &mut conn, &prepared);
+    }
+
+    // Steps 4 to 6.
+    let keys_root = keys_root(cli)?;
+    let applied =
+        import::apply::apply(&mut conn, &keys_root, &prepared, &nonce).map_err(|e| match e {
+            import::apply::ApplyError::Conflicts(c) => {
+                anyhow::anyhow!(format_conflicts(&c))
+            }
+            other => anyhow::anyhow!("{other}"),
+        })?;
+
+    if cli.json {
+        json::ok(serde_json::json!({
+            "applied": true,
+            "mode": mode_name(prepared.mode),
+            "rows": prepared.plan.rows_read,
+            "domains_created": applied.domains_created,
+            "domains_matched": applied.domains_matched,
+            "aliases_created": applied.aliases_created,
+            "aliases_replaced": applied.aliases_replaced,
+            "aliases_unchanged": applied.unchanged,
+            "catchalls_set": applied.catchalls_set,
+            "keys_generated": applied.keys_generated,
+            "conflicts": [],
+        }));
+    } else {
+        println!("Imported {} row(s).\n", prepared.plan.rows_read);
+        println!("  {} domain(s) created", applied.domains_created);
+        println!("  {} domain(s) already present", applied.domains_matched);
+        println!("  {} alias(es) created", applied.aliases_created);
+        if applied.aliases_replaced > 0 {
+            println!("  {} alias(es) replaced", applied.aliases_replaced);
+        }
+        if applied.unchanged > 0 {
+            println!("  {} alias(es) already correct", applied.unchanged);
+        }
+        if applied.catchalls_set > 0 {
+            println!("  {} catch-all(s) set", applied.catchalls_set);
+        }
+        println!("  {} DKIM key(s) generated", applied.keys_generated);
+    }
+
+    for path in &applied.orphaned_keys {
+        note(
+            cli,
+            &format!(
+                "\nWarning: a key file at {} could not be removed. Nothing references it.",
+                path.display()
+            ),
+        );
+    }
+    note_reload(cli);
+    Ok(exit::OK)
+}
+
+fn mode_name(mode: import::plan::Mode) -> &'static str {
+    match mode {
+        import::plan::Mode::Merge => "merge",
+        import::plan::Mode::Replace => "replace",
+    }
+}
+
+/// Steps 1, 2, 3 and 5, committing nothing.
+///
+/// Generates no keys, so it does not create `dkim_key` rows. That is sound —
+/// the routing snapshot does not read them — and it is why a dry run proves the
+/// *routing snapshot* builds rather than that the whole configuration is
+/// serveable. The daemon refuses to start on a key it cannot verify, and a dry
+/// run has no key to verify.
+fn dry_run(
+    cli: &Cli,
+    conn: &mut rusqlite::Connection,
+    prepared: &import::plan::Prepared,
+) -> anyhow::Result<u8> {
+    let outcome = pigeon_route::preview(conn, |tx| {
+        let mut created = 0usize;
+        for domain in &prepared.new_domains {
+            pigeon_db::repo::add_domain(tx, domain, None)?;
+            created += 1;
+        }
+        for (domain, rules) in &prepared.plan.domains {
+            if prepared.mode == import::plan::Mode::Replace
+                && prepared.existing_domains.contains(domain)
+            {
+                pigeon_db::repo::remove_all_aliases(tx, domain)?;
+                pigeon_db::repo::clear_catchall(tx, domain)?;
+            }
+            for rule in rules.values() {
+                if rule.is_catchall() {
+                    pigeon_db::repo::set_catchall(tx, domain, rule.destinations.first())?;
+                    continue;
+                }
+                let kind = if rule.reject {
+                    pigeon_db::repo::AliasKind::Reject
+                } else {
+                    pigeon_db::repo::AliasKind::Forward
+                };
+                if pigeon_db::repo::list_aliases(tx, domain)?
+                    .iter()
+                    .any(|a| a.pattern == rule.pattern)
+                {
+                    continue;
+                }
+                pigeon_db::repo::add_alias(tx, domain, &rule.pattern, kind, &rule.destinations)?;
+            }
+        }
+        Ok::<_, pigeon_db::DbError>(created)
+    })?;
+
+    if cli.json {
+        json::ok(serde_json::json!({
+            "applied": false,
+            "mode": mode_name(prepared.mode),
+            "rows": prepared.plan.rows_read,
+            "domains_created": outcome.value,
+            "domains_matched": prepared.existing_domains.len(),
+            "aliases_created": prepared.plan.rule_count(),
+            "aliases_replaced": serde_json::Value::Null,
+            "aliases_unchanged": prepared.unchanged,
+            "catchalls_set": serde_json::Value::Null,
+            "keys_generated": 0,
+            "conflicts": [],
+        }));
+    } else {
+        println!("Would import {} row(s).\n", prepared.plan.rows_read);
+        println!("  {} domain(s) created", outcome.value);
+        println!(
+            "  {} domain(s) already present",
+            prepared.existing_domains.len()
+        );
+        println!("  {} rule(s) applied", prepared.plan.rule_count());
+        if prepared.unchanged > 0 {
+            println!("  {} alias(es) already correct", prepared.unchanged);
+        }
+    }
+    note(
+        cli,
+        "\nNothing was written, and no DKIM keys were generated. A dry run proves the file \
+         parses and that the routing it produces is one Pigeon can serve — not that key \
+         generation will succeed.",
+    );
+    Ok(exit::OK)
+}
+
+fn format_conflicts(conflicts: &[import::Conflict]) -> String {
+    let mut out = format!("{} conflict(s); nothing was imported.\n", conflicts.len());
+    for c in conflicts {
+        out.push_str(&format!("\n  {c}"));
+    }
+    out
+}
+
+fn conflicts_json(conflicts: &[import::Conflict]) -> Vec<serde_json::Value> {
+    conflicts
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "row": if c.row == 0 { serde_json::Value::Null } else { serde_json::json!(c.row) },
+                "address": c.address,
+                "kind": c.kind.as_str(),
+                "message": c.message,
+            })
+        })
+        .collect()
+}
+
+fn report_conflicts(cli: &Cli, conflicts: &[import::Conflict]) -> anyhow::Result<u8> {
+    if cli.json {
+        // The failure envelope carries the list, so a consumer needs one shape
+        // rather than two for the same command.
+        println!(
+            "{}",
+            serde_json::json!({
+                "format_version": 1,
+                "error": {
+                    "code": "import_conflicts",
+                    "message": format!("{} conflict(s); nothing was imported", conflicts.len()),
+                },
+                "conflicts": conflicts_json(conflicts),
+            })
+        );
+    } else {
+        eprintln!("Error: {}", format_conflicts(conflicts));
+    }
+    Ok(exit::USAGE)
+}
+
+fn mode_required(cli: &Cli, scoped: &[import::plan::ExistingRouting]) -> anyhow::Result<u8> {
+    let listed: Vec<String> = scoped.iter().map(|s| s.describe()).collect();
+    let message = format!(
+        "these domains already have routing this import could replace:\n\n  {}\n\n\
+         An import file says what should exist, and nothing about what should stop \
+         existing, so Pigeon will not guess:\n\n  \
+         --merge    keep what is there; a differing alias is a conflict\n  \
+         --replace  remove those aliases and catch-alls first (needs --yes)",
+        listed.join("\n  ")
+    );
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "format_version": 1,
+                "error": { "code": "mode_required", "message": message },
+                "domains": scoped.iter().map(|s| serde_json::json!({
+                    "domain": s.domain,
+                    "aliases": s.aliases,
+                    "catchall": s.catchall,
+                })).collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        eprintln!("Error: {message}");
+    }
+    Ok(exit::USAGE)
+}
+
+fn replace_needs_confirmation(cli: &Cli, prepared: &import::plan::Prepared) -> anyhow::Result<u8> {
+    let aliases: usize = prepared.scoped.iter().map(|s| s.aliases).sum();
+    let catchalls = prepared.scoped.iter().filter(|s| s.catchall).count();
+    let message = format!(
+        "--replace removes {aliases} alias(es) and {catchalls} catch-all(s) across \
+         {} domain(s). Domain defaults are kept. Re-run with --yes.",
+        prepared.scoped.len()
+    );
+
+    if cli.json {
+        json::fail("confirmation_required", &message);
+    } else {
+        eprintln!("Error: {message}");
+    }
+    Ok(exit::USAGE)
+}

@@ -81,7 +81,7 @@ Deviations worth carrying forward:
 - [ ] live config reload
 - [x] `pigeon route inbound`
 - [x] `--json` on every read command
-- [ ] bulk import from an existing forwarding provider
+- [x] bulk import from a CSV file (provider adapters are additive; see `M1-IMPORT.md` §3)
 
 Route precedence:
 

@@ -1,6 +1,7 @@
 # Milestone 1 — bulk import
 
-Design for review. **No implementation until this is settled.**
+**Implemented.** `crates/pigeon-cli/src/import/`, reviewed and approved as below,
+with the review's corrections applied before any of it was written.
 
 Import is the first command that writes many rows and generates many keys from
 one invocation, so the ordering that `domain add` got wrong once — and that its
@@ -358,3 +359,49 @@ domain already carried by Pigeon keeps its `status`, `inbound_enabled`,
 `outbound_enabled`, `plus_addressing`, delivery mode and default destination.
 Import adds routing; it is not a lifecycle operation, and moving a live domain
 because a file mentioned it would stop its mail.
+
+---
+
+## 9. As built
+
+| Design | Where |
+|---|---|
+| §1 steps 1–2, §3 format, §4 file conflicts | `import/parse.rs` |
+| §1 step 3, §2 merge/replace, §4 database conflicts | `import/plan.rs` |
+| §1 steps 4–7, the post-lock re-check | `import/apply.rs` |
+
+Twenty-four tests through the real binary, plus four driving the re-check guard
+directly.
+
+### The re-check is tested, the race is not
+
+`recheck_plan` is exercised by building a plan and then moving the database
+underneath it — which is the state the race produces. Reproducing the race
+itself would mean timing a concurrent write against key generation, and a
+timing-dependent test of a safety property is worse than none.
+
+Stated because "the post-lock re-check is tested" would otherwise imply more
+than it should.
+
+### Mutations
+
+All nine turned a test red: cleanup skipped on rollback, the flag trigger
+ignoring the catch-all, `--replace` removing the domain default, `--replace`
+widened past the file's domains, only the first conflict reported, the mode
+inferred rather than required, the re-check skipped, the re-check's comparison
+disabled, and its new-domain check disabled.
+
+### Two things the dead-code lint found
+
+Neither was dead code; both were gaps.
+
+**An unknown column reported `missing_header`.** The two need different
+messages, because the fixes differ — one means add a row, the other means
+correct a word. Reporting the first cell of a data row as an "unknown column"
+is accurate and useless, so the classification now turns on whether *any*
+column was recognised.
+
+**A snapshot failure never became a conflict.** A loop between two imported rows
+returned a bare error rather than an entry in `conflicts`, so an import failure
+had two shapes depending on where it came from — and the more interesting one
+was the shape a consumer had not been given.
