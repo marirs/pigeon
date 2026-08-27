@@ -576,6 +576,7 @@ Design and review records, kept because the reasoning outlives the diffs:
 
 - [Schema and configuration](docs/M1-SCHEMA.md)
 - [Routing snapshot](docs/M1-SNAPSHOT.md)
+- [Bulk import](docs/M1-IMPORT.md)
 - [Milestone 0 findings](docs/M0-FINDINGS.md)
 - [Milestone 1 findings](docs/M1-FINDINGS.md)
 
