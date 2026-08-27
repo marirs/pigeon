@@ -27,9 +27,13 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
-    "OpenSSL",   # ring's licence file is a compound including this text;
-                 # ring itself is still banned below on build-dependency grounds
-                 # being unnecessary — remove this line if ring is dropped.
+    # `ring` is a deliberate dependency (see Cargo.toml: it is rustls's crypto
+    # provider, chosen over aws-lc-rs to avoid a cmake requirement). Its licence
+    # file is a compound that includes this text, so the allowance is required
+    # for it to pass. An earlier version of this comment claimed ring was banned
+    # below; it never was, and the claim contradicted both the ban list and the
+    # manifest. Remove this line only if ring itself is dropped.
+    "OpenSSL",
 ]
 confidence-threshold = 0.9
 
