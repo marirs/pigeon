@@ -325,6 +325,52 @@ looks like evidence and is not.
 
 ---
 
+## 8. `--json` as a versioned API
+
+Treated as a contract rather than a formatting option, which changed what the
+work was: the fields were mostly there already, and none of the five rules were.
+
+**Failures wrote no JSON at all.** `--json` printed prose to stderr and left
+stdout empty, so a consumer had to check the exit status before deciding whether
+there was anything to parse. Now every invocation emits exactly one value, and
+`error` is the discriminator — `null` on success, an object with a stable `code`
+otherwise. The code is what a script matches; the message beside it is free to
+be reworded, which is the point of having both.
+
+**Notes were dropped rather than moved.** `route inbound` carries a standing
+caveat that it predicts the control plane and not the daemon, and under `--json`
+it was skipped entirely — hiding it from exactly the consumers most likely to
+build something on the answer. Notes now go to stderr in JSON mode: still said,
+still unable to corrupt the parse.
+
+**`null` versus omitted needed a rule, not a habit.** The one adopted: a field a
+command can produce is always present, `null` means it applies and has no value,
+and a missing key means only that the producing build did not have the field.
+Without that, `format_version` cannot do its job — a consumer has no way to tell
+an absent value from an absent feature.
+
+**Confirmation prompts have no JSON form.** A destructive command run without
+`--yes` returns `confirmation_required` as a failure rather than a success
+object saying "please confirm", because the latter is what a script is least
+likely to check and most likely to mistake for the outcome. `--dry-run` is how a
+consumer gets the preview as data.
+
+Six mutations, all caught: prose instead of JSON on failure, `format_version`
+dropped, `error` omitted on success, a note printed to stdout, the route caveat
+dropped, and an empty list emitted as `null`.
+
+### The contract found a test that was conflating the streams
+
+`domain_add.rs` concatenated stdout and stderr into one string. That was
+harmless only because `--json` produced no stderr at the time — the moment notes
+moved there, it was parsing a JSON value with prose stuck to it, and it failed.
+
+Worth recording because the test was not wrong when it was written. It encoded
+an accident of the implementation as though it were a property, and the accident
+changed.
+
+---
+
 ## What to carry into the rest of Milestone 1
 - Live configuration reload, so a mutation reaches a running daemon without a
   restart. Until it exists, the CLI says so after every change.

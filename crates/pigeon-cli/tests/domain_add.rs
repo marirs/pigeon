@@ -49,19 +49,24 @@ impl Fixture {
         self.dir.join("keys")
     }
 
-    fn run(&self, args: &[&str]) -> (bool, String) {
+    /// Returns success and the two streams *separately*.
+    ///
+    /// They were concatenated when this file was written, which was harmless
+    /// only because `--json` produced no stderr at the time. It does now — notes
+    /// move there rather than being dropped — and merging them means parsing a
+    /// JSON value with prose stuck to it.
+    fn run(&self, args: &[&str]) -> (bool, String, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_pigeon"))
             .arg("--db")
             .arg(self.db())
             .args(args)
             .output()
             .expect("run pigeon");
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        (out.status.success(), text)
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     }
 
     fn key_files(&self) -> Vec<String> {
@@ -131,7 +136,7 @@ impl Drop for Fixture {
 #[test]
 fn adding_a_domain_leaves_a_usable_key() {
     let f = Fixture::new("add");
-    let (ok, out) = f.run(&["domain", "add", "example.com"]);
+    let (ok, out, _err) = f.run(&["domain", "add", "example.com"]);
     assert!(ok, "{out}");
     assert!(out.contains("v=DKIM1; k=rsa; p="), "{out}");
     assert_eq!(f.key_files().len(), 1);
@@ -152,12 +157,12 @@ fn removing_and_re_adding_a_domain_produces_a_usable_key() {
     // the previous key, and the daemon refused to start.
     let f = Fixture::new("readd");
 
-    let (ok, out) = f.run(&["domain", "add", "example.com"]);
+    let (ok, out, _err) = f.run(&["domain", "add", "example.com"]);
     assert!(ok, "{out}");
     let first = f.key_files();
     assert_eq!(first.len(), 1);
 
-    let (ok, out) = f.run(&["domain", "remove", "example.com", "--yes"]);
+    let (ok, out, _err) = f.run(&["domain", "remove", "example.com", "--yes"]);
     assert!(ok, "{out}");
     assert_eq!(
         f.key_files(),
@@ -165,7 +170,7 @@ fn removing_and_re_adding_a_domain_produces_a_usable_key() {
         "removing a domain deleted its private key"
     );
 
-    let (ok, out) = f.run(&["domain", "add", "example.com"]);
+    let (ok, out, _err) = f.run(&["domain", "add", "example.com"]);
     assert!(ok, "re-adding a removed domain failed: {out}");
 
     // Two files now: the orphan and the new one, under different names.
@@ -192,7 +197,7 @@ fn a_key_that_cannot_be_written_leaves_no_domain_behind() {
     let f = Fixture::new("nowrite");
     std::fs::set_permissions(f.keys(), std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let (ok, out) = f.run(&["domain", "add", "example.com"]);
+    let (ok, out, _err) = f.run(&["domain", "add", "example.com"]);
     assert!(
         !ok,
         "a domain was added despite the key being unwritable: {out}"
@@ -214,13 +219,13 @@ fn a_refused_mutation_leaves_no_key_file_behind() {
     // or the command leaves private key material for a domain that does not
     // exist.
     let f = Fixture::new("rollback");
-    let (ok, _) = f.run(&["domain", "add", "example.com"]);
+    let (ok, _, _) = f.run(&["domain", "add", "example.com"]);
     assert!(ok);
     let after_first = f.key_files();
 
     // The same domain again: `add_domain` refuses, so the transaction never
     // commits.
-    let (ok, out) = f.run(&["domain", "add", "example.com"]);
+    let (ok, out, _err) = f.run(&["domain", "add", "example.com"]);
     assert!(!ok, "a duplicate domain was accepted: {out}");
     assert_eq!(
         f.key_files(),
@@ -233,7 +238,7 @@ fn a_refused_mutation_leaves_no_key_file_behind() {
 #[test]
 fn a_dry_run_writes_neither_a_row_nor_a_key() {
     let f = Fixture::new("dryrun");
-    let (ok, out) = f.run(&["--dry-run", "domain", "add", "example.com"]);
+    let (ok, out, _err) = f.run(&["--dry-run", "domain", "add", "example.com"]);
     assert!(ok, "{out}");
     assert!(f.recorded().is_empty(), "a dry run committed a domain");
     assert!(f.key_files().is_empty(), "a dry run wrote a private key");
@@ -245,7 +250,7 @@ fn the_private_key_is_not_readable_by_anyone_else() {
     use std::os::unix::fs::PermissionsExt;
 
     let f = Fixture::new("mode");
-    let (ok, out) = f.run(&["domain", "add", "example.com"]);
+    let (ok, out, _err) = f.run(&["domain", "add", "example.com"]);
     assert!(ok, "{out}");
 
     let name = &f.key_files()[0];
@@ -262,7 +267,7 @@ fn the_printed_record_is_the_one_that_was_stored() {
     // A record that does not match the stored public key is a record that
     // publishes a key nothing signs with.
     let f = Fixture::new("record");
-    let (ok, out) = f.run(&["domain", "add", "example.com", "--json"]);
+    let (ok, out, _err) = f.run(&["domain", "add", "example.com", "--json"]);
     assert!(ok, "{out}");
 
     let json: serde_json::Value = serde_json::from_str(out.trim()).expect("json");

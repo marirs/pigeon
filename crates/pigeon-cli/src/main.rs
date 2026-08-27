@@ -51,10 +51,40 @@
 //!
 //! # The `--json` contract
 //!
-//! Every read command supports `--json`, and that output is stable across
-//! releases. It is the seam anything built on top of Pigeon consumes, and a
-//! process boundary keeps such integrations free of any coupling to the
-//! database schema.
+//! `--json` output is a versioned API, not a convenience. It is the seam
+//! anything built on top of Pigeon consumes, and a process boundary keeps such
+//! integrations free of any coupling to the database schema.
+//!
+//! Five rules, and they hold for failures as well as successes:
+//!
+//! 1. **Exactly one JSON value on stdout.** Every invocation, including one
+//!    that fails. A consumer parses stdout unconditionally and never has to
+//!    decide whether there is anything there.
+//! 2. **Nothing else on stdout.** Human notes, warnings and progress go to
+//!    stderr, where they cannot corrupt the parse.
+//! 3. **`format_version` on every response.** It starts at 1 and moves only
+//!    when the output contract changes — never because storage did. See
+//!    `M1-SCHEMA.md` S-4.
+//! 4. **`error` is always present**, `null` on success and an object with a
+//!    stable `code` on failure. The discriminator is a field rather than the
+//!    exit code, so a consumer that pipes stdout does not need the exit status
+//!    to interpret it.
+//! 5. **Deterministic ordering.** Arrays are sorted by a stated key; object
+//!    keys are emitted in sorted order. Two runs against the same database
+//!    produce byte-identical output.
+//!
+//! ## `null` versus omitted
+//!
+//! A field that a command can produce is **always present**. `null` means the
+//! field applies and has no value — a domain with no default destination, a
+//! route that matched no rule.
+//!
+//! A **missing key** therefore means only one thing: the build that produced
+//! this output did not have that field. That is what makes `format_version`
+//! useful rather than decorative — without the rule, a consumer cannot tell an
+//! absent value from an absent feature.
+//!
+//! Empty collections are `[]`, never `null`.
 //!
 //! `--quiet` prints nothing on success and relies on the exit code, which is
 //! also stable — see `docs/CLI.md`.
@@ -241,9 +271,61 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(code) => exit::code(code),
         Err(e) => {
-            eprintln!("Error: {e}");
+            // Under `--json` the failure is still exactly one JSON value on
+            // stdout. A consumer parses stdout unconditionally and branches on
+            // `error`, rather than having to notice that this particular run
+            // wrote nothing there.
+            if cli.json {
+                json::fail(&error_code(&e), &e.to_string());
+            } else {
+                eprintln!("Error: {e}");
+            }
             exit::code(classify(&e))
         }
+    }
+}
+
+/// A stable machine-readable name for a failure.
+///
+/// Part of the `--json` contract: these strings do not change without
+/// `format_version` moving. The human `message` beside them is free to be
+/// rewritten, which is the point of having both.
+fn error_code(e: &anyhow::Error) -> String {
+    use pigeon_db::DbError;
+    use pigeon_route::MutationError;
+
+    if let Some(db) = e.downcast_ref::<DbError>() {
+        return db_code(db).to_string();
+    }
+    if let Some(m) = e.downcast_ref::<MutationError>() {
+        return match m {
+            MutationError::Invalid(_) => "invalid_configuration",
+            MutationError::Db(db) => db_code(db),
+            MutationError::Load(_) => "unreadable_configuration",
+            MutationError::Sqlite(_) => "database",
+        }
+        .to_string();
+    }
+    if e.downcast_ref::<pigeon_auth::DkimError>().is_some() {
+        return "dkim".to_string();
+    }
+    if e.downcast_ref::<pigeon_config::ConfigError>().is_some() {
+        return "configuration".to_string();
+    }
+    "usage".to_string()
+}
+
+fn db_code(e: &pigeon_db::DbError) -> &'static str {
+    use pigeon_db::DbError as E;
+    match e {
+        E::NoSuchDomain(_) => "no_such_domain",
+        E::DomainExists(_) => "domain_exists",
+        E::AliasExists { .. } => "alias_exists",
+        E::RejectWithDestinations(_) => "reject_with_destinations",
+        E::CatchAllNeedsDestination(_) => "catchall_needs_destination",
+        E::BadAddress(_) => "invalid_address",
+        E::DatabaseFromTheFuture { .. } => "schema_too_new",
+        _ => "database",
     }
 }
 
@@ -333,8 +415,11 @@ fn apply<T>(
 /// this is the honest version: the rows are committed and the running daemon
 /// has not read them.
 fn note_reload(cli: &Cli) {
-    if !cli.json && !cli.dry_run {
-        println!("\nA running pigeond will not see this until it restarts.");
+    if !cli.dry_run {
+        note(
+            cli,
+            "\nA running pigeond will not see this until it restarts.",
+        );
     }
 }
 
@@ -354,12 +439,14 @@ fn names(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// The human form of each report.
+///
+/// Under `--json` these go to stderr *as well as* appearing as structured
+/// `reports` in the response. Dropping them there would hide a redundant alias
+/// from exactly the operator most likely to be running a script over it.
 fn print_reports(cli: &Cli, reports: &[pigeon_route::Report]) {
-    if cli.json {
-        return;
-    }
     for r in reports {
-        println!("\nNote: {r}");
+        note(cli, &format!("\nNote: {r}"));
     }
 }
 
@@ -466,21 +553,17 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
             };
 
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "format_version": 1,
-                        "domain": name,
-                        "status": "new",
-                        "default_destination": to,
-                        "dkim": {
-                            "selector": selector,
-                            "record_name": pigeon_auth::dkim::record_name(selector, &name),
-                            "record_value": pair.txt_record(),
-                            "private_key": key_path.display().to_string(),
-                        },
-                    })
-                );
+                json::ok(serde_json::json!({
+                    "domain": name,
+                    "status": "new",
+                    "default_destination": to,
+                    "dkim": {
+                        "selector": selector,
+                        "record_name": pigeon_auth::dkim::record_name(selector, &name),
+                        "record_value": pair.txt_record(),
+                        "private_key": key_path.display().to_string(),
+                    },
+                }));
             } else {
                 println!("Adding {name}...\n");
                 println!("  Domain created");
@@ -511,9 +594,9 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
                     "{name} will not carry mail until DNS validation moves it to ACTIVE, \
                      which is Milestone 5."
                 );
-                print_reports(cli, &outcome.reports);
-                note_reload(cli);
             }
+            print_reports(cli, &outcome.reports);
+            note_reload(cli);
             Ok(exit::OK)
         }
 
@@ -522,6 +605,24 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
             let impact = repo::removal_impact(&conn, domain)?;
 
             if !yes && !cli.dry_run {
+                // A confirmation prompt has no JSON form: there is nothing for a
+                // consumer to do with it except pass `--yes`, and printing a
+                // "please confirm" object would invite a script to treat it as
+                // the outcome. So the machine-readable answer is the failure
+                // envelope, and the prose goes to stderr.
+                if cli.json {
+                    json::fail(
+                        "confirmation_required",
+                        &format!(
+                            "removing {} deletes {} aliases and orphans {} DKIM key(s); \
+                             re-run with --yes",
+                            domain.to_ascii_lowercase(),
+                            impact.aliases,
+                            impact.dkim_selectors.len()
+                        ),
+                    );
+                    return Ok(exit::USAGE);
+                }
                 // The heaviest prompt in Pigeon, because two of these lines are
                 // irreversible in ways that are not obvious while typing.
                 println!("This permanently deletes:\n");
@@ -562,19 +663,15 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
             let aliases = repo::list_aliases(&conn, domain)?;
 
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "format_version": 1,
-                        "domain": d.name,
-                        "status": d.status,
-                        "inbound_enabled": d.inbound_enabled,
-                        "outbound_enabled": d.outbound_enabled,
-                        "default_destination": d.default_destination,
-                        "catchall": d.catchall,
-                        "aliases": aliases.len(),
-                    })
-                );
+                json::ok(serde_json::json!({
+                    "domain": d.name,
+                    "status": d.status,
+                    "inbound_enabled": d.inbound_enabled,
+                    "outbound_enabled": d.outbound_enabled,
+                    "default_destination": d.default_destination,
+                    "catchall": d.catchall,
+                    "aliases": aliases.len(),
+                }));
             } else {
                 println!("{}\n", d.name);
                 println!("  Status     {}", d.status);
@@ -618,15 +715,19 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
             let outcome = apply(cli, &mut conn, |tx| {
                 repo::set_default_destination(tx, domain, Some(&to))
             })?;
-            if !cli.json {
-                println!(
-                    "{} now forwards to {address} by default.",
-                    domain.to_ascii_lowercase()
-                );
+            let name = domain.to_ascii_lowercase();
+            if cli.json {
+                json::ok(serde_json::json!({
+                    "domain": name,
+                    "default_destination": address,
+                    "reports": reports_json(&outcome.reports),
+                }));
+            } else {
+                println!("{name} now forwards to {address} by default.");
                 println!("  Aliases with their own destination are unchanged.");
-                print_reports(cli, &outcome.reports);
-                note_reload(cli);
             }
+            print_reports(cli, &outcome.reports);
+            note_reload(cli);
             Ok(exit::OK)
         }
 
@@ -640,15 +741,15 @@ fn set_enabled(cli: &Cli, domain: &str, on: bool) -> anyhow::Result<u8> {
     apply(cli, &mut conn, |tx| {
         repo::set_inbound_enabled(tx, domain, on)
     })?;
-    if !cli.json {
-        let d = domain.to_ascii_lowercase();
-        if on {
-            println!("{d} will accept mail once DNS validation passes.");
-        } else {
-            println!("{d} will refuse mail. Its DNS state is unchanged.");
-        }
-        note_reload(cli);
+    let d = domain.to_ascii_lowercase();
+    if cli.json {
+        json::ok(serde_json::json!({ "domain": d, "inbound_enabled": on }));
+    } else if on {
+        println!("{d} will accept mail once DNS validation passes.");
+    } else {
+        println!("{d} will refuse mail. Its DNS state is unchanged.");
     }
+    note_reload(cli);
     Ok(exit::OK)
 }
 
@@ -670,10 +771,7 @@ fn domains_list(cli: &Cli) -> anyhow::Result<u8> {
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::json!({ "format_version": 1, "domains": rows })
-        );
+        json::ok(serde_json::json!({ "domains": rows }));
         return Ok(exit::OK);
     }
 
@@ -729,14 +827,10 @@ fn alias(cli: &Cli, verb: &AliasVerb) -> anyhow::Result<u8> {
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "format_version": 1,
-                        "domain": domain.to_ascii_lowercase(),
-                        "aliases": rows,
-                    })
-                );
+                json::ok(serde_json::json!({
+                    "domain": domain.to_ascii_lowercase(),
+                    "aliases": rows,
+                }));
                 return Ok(exit::OK);
             }
 
@@ -799,16 +893,20 @@ fn alias(cli: &Cli, verb: &AliasVerb) -> anyhow::Result<u8> {
             })?;
 
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "format_version": 1,
-                        "domain": domain.to_ascii_lowercase(),
-                        "added": patterns,
-                        "reject": reject,
-                        "destinations": to,
-                    })
-                );
+                json::ok(serde_json::json!({
+                    "domain": domain.to_ascii_lowercase(),
+                    "added": patterns,
+                    "reject": reject,
+                    // Always an array, never null: an empty one means the alias
+                    // inherits, which `inherits` states outright so a consumer
+                    // does not have to infer it from a length.
+                    "destinations": destinations
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    "inherits": destinations.is_empty() && !reject,
+                    "reports": reports_json(&outcome.reports),
+                }));
             } else {
                 let d = domain.to_ascii_lowercase();
                 println!("Added to {d}:\n");
@@ -826,9 +924,9 @@ fn alias(cli: &Cli, verb: &AliasVerb) -> anyhow::Result<u8> {
                     };
                     println!("  {}@{d}  ->  {target}", p.to_ascii_lowercase());
                 }
-                print_reports(cli, &outcome.reports);
-                note_reload(cli);
             }
+            print_reports(cli, &outcome.reports);
+            note_reload(cli);
             Ok(exit::OK)
         }
 
@@ -843,18 +941,38 @@ fn alias(cli: &Cli, verb: &AliasVerb) -> anyhow::Result<u8> {
             if *all {
                 let existing = repo::list_aliases(&conn, domain)?;
                 if !yes && !cli.dry_run {
-                    println!(
-                        "This removes all {} aliases on {}.\n\nRe-run with --yes to confirm.",
-                        existing.len(),
-                        domain.to_ascii_lowercase()
-                    );
+                    if cli.json {
+                        json::fail(
+                            "confirmation_required",
+                            &format!(
+                                "removing all {} aliases on {}; re-run with --yes",
+                                existing.len(),
+                                domain.to_ascii_lowercase()
+                            ),
+                        );
+                    } else {
+                        println!(
+                            "This removes all {} aliases on {}.\n\nRe-run with --yes to confirm.",
+                            existing.len(),
+                            domain.to_ascii_lowercase()
+                        );
+                    }
                     return Ok(exit::USAGE);
                 }
                 let outcome = apply(cli, &mut conn, |tx| repo::remove_all_aliases(tx, domain))?;
-                if !cli.json {
+                if cli.json {
+                    json::ok(serde_json::json!({
+                        "domain": domain.to_ascii_lowercase(),
+                        "removed": outcome.value,
+                        // `null`, not omitted: `--all` names no patterns, and a
+                        // consumer must be able to tell "no count applies" from
+                        // "this build does not report one".
+                        "requested": serde_json::Value::Null,
+                    }));
+                } else {
                     println!("Removed {} aliases.", outcome.value);
-                    note_reload(cli);
                 }
+                note_reload(cli);
                 return Ok(exit::OK);
             }
 
@@ -876,13 +994,19 @@ fn alias(cli: &Cli, verb: &AliasVerb) -> anyhow::Result<u8> {
                 Ok(removed)
             })?;
 
-            if !cli.json {
+            if cli.json {
+                json::ok(serde_json::json!({
+                    "domain": domain.to_ascii_lowercase(),
+                    "removed": outcome.value,
+                    "requested": patterns.len(),
+                }));
+            } else {
                 println!("Removed {} of {}.", outcome.value, patterns.len());
                 if outcome.value < patterns.len() {
                     println!("  The rest did not exist.");
                 }
-                note_reload(cli);
             }
+            note_reload(cli);
             Ok(exit::OK)
         }
     }
@@ -899,31 +1023,47 @@ fn catchall(cli: &Cli, verb: &CatchallVerb) -> anyhow::Result<u8> {
                 repo::set_catchall(tx, domain, dest.as_ref())
             })?;
 
-            if !cli.json {
-                let d = domain.to_ascii_lowercase();
+            let d = domain.to_ascii_lowercase();
+            if cli.json {
+                json::ok(serde_json::json!({
+                    "domain": d,
+                    "catchall_enabled": true,
+                    // `null` means it inherits the domain default, which is a
+                    // real state and not a missing one.
+                    "destination": to,
+                    "reports": reports_json(&outcome.reports),
+                }));
+            } else {
                 match to {
                     Some(t) => println!("Catch-all enabled on {d}: -> {t}"),
                     None => println!("Catch-all enabled on {d}, forwarding to the domain default."),
                 }
-                println!(
+            }
+            note(
+                cli,
+                &format!(
                     "\nEvery address on {d} is now accepted at RCPT TO, so recipient rejection \
                      no longer applies and dictionary attacks get 250 rather than 550."
-                );
-                print_reports(cli, &outcome.reports);
-                note_reload(cli);
-            }
+                ),
+            );
+            print_reports(cli, &outcome.reports);
+            note_reload(cli);
             Ok(exit::OK)
         }
         CatchallVerb::Remove { domain } => {
             let mut conn = open_write(cli)?;
             apply(cli, &mut conn, |tx| repo::clear_catchall(tx, domain))?;
-            if !cli.json {
-                println!(
-                    "Catch-all removed from {}. Unmatched addresses are refused again.",
-                    domain.to_ascii_lowercase()
-                );
-                note_reload(cli);
+            let d = domain.to_ascii_lowercase();
+            if cli.json {
+                json::ok(serde_json::json!({
+                    "domain": d,
+                    "catchall_enabled": false,
+                    "destination": serde_json::Value::Null,
+                }));
+            } else {
+                println!("Catch-all removed from {d}. Unmatched addresses are refused again.");
             }
+            note_reload(cli);
             Ok(exit::OK)
         }
     }
@@ -947,10 +1087,7 @@ fn destination_list(cli: &Cli) -> anyhow::Result<u8> {
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::json!({ "format_version": 1, "destinations": rows })
-        );
+        json::ok(serde_json::json!({ "destinations": rows }));
         return Ok(exit::OK);
     }
 
@@ -1001,33 +1138,65 @@ fn destination(cli: &Cli, verb: &DestinationVerb) -> anyhow::Result<u8> {
     })?;
 
     if preview.value == 0 {
-        println!("Nothing forwards to {old}.");
+        if cli.json {
+            json::ok(serde_json::json!({
+                "old": old, "new": new, "domain": domain, "moved": 0, "applied": false,
+            }));
+        } else {
+            println!("Nothing forwards to {old}.");
+        }
         return Ok(exit::OK);
     }
 
     if !yes && !cli.dry_run {
-        println!(
-            "This repoints {} reference(s) from {old} to {new}{}.\n\nRe-run with --yes to confirm.",
-            preview.value,
-            match domain {
-                Some(d) => format!(" on {d}"),
-                None => String::new(),
-            }
-        );
+        if cli.json {
+            // The same shape as every other refused-pending-confirmation
+            // command. `--dry-run` is how a consumer gets the count as data;
+            // running without `--yes` is a refusal, and a refusal is an error
+            // envelope so a script cannot mistake it for the outcome.
+            json::fail(
+                "confirmation_required",
+                &format!(
+                    "this repoints {} reference(s) from {old} to {new}; re-run with --yes",
+                    preview.value
+                ),
+            );
+        } else {
+            println!(
+                "This repoints {} reference(s) from {old} to {new}{}.\n\nRe-run with --yes to confirm.",
+                preview.value,
+                match domain {
+                    Some(d) => format!(" on {d}"),
+                    None => String::new(),
+                }
+            );
+        }
         return Ok(exit::USAGE);
     }
     if cli.dry_run {
-        println!("Would repoint {} reference(s).", preview.value);
+        if cli.json {
+            json::ok(serde_json::json!({
+                "old": old, "new": new, "domain": domain,
+                "moved": preview.value, "applied": false,
+            }));
+        } else {
+            println!("Would repoint {} reference(s).", preview.value);
+        }
         return Ok(exit::OK);
     }
 
     let outcome = apply(cli, &mut conn, |tx| {
         repo::replace_destination(tx, &old_addr, &new_addr, domain.as_deref())
     })?;
-    if !cli.json {
+    if cli.json {
+        json::ok(serde_json::json!({
+            "old": old, "new": new, "domain": domain,
+            "moved": outcome.value, "applied": true,
+        }));
+    } else {
         println!("Repointed {} reference(s).", outcome.value);
-        note_reload(cli);
     }
+    note_reload(cli);
     Ok(exit::OK)
 }
 
@@ -1068,17 +1237,14 @@ fn route_inbound(cli: &Cli, address: &str) -> anyhow::Result<u8> {
             Decision::UnknownDomain => ("unknown_domain", None, None, Vec::new()),
             Decision::DomainNotAccepting => ("domain_not_accepting", None, None, Vec::new()),
         };
-        println!(
-            "{}",
-            serde_json::json!({
-                "format_version": 1,
-                "address": address,
-                "result": result,
-                "tier": tier,
-                "matched": matched,
-                "destinations": destinations,
-            })
-        );
+        json::ok(serde_json::json!({
+            "address": address,
+            "result": result,
+            "tier": tier,
+            "matched": matched,
+            "destinations": destinations,
+        }));
+        eprintln!("{ROUTE_CAVEAT}");
         return Ok(if decision.accepts() {
             exit::OK
         } else {
@@ -1130,11 +1296,7 @@ fn route_inbound(cli: &Cli, address: &str) -> anyhow::Result<u8> {
     // it does not yet, because the daemon does not route from this table. Said
     // here rather than only in a document, because this is where somebody
     // would rely on it.
-    eprintln!(
-        "\nNote: pigeond does not yet route from this table — acceptance still comes from \
-         PIGEON_ACCEPT and delivery from PIGEON_FORWARD_TO. This predicts the control plane, \
-         not the running daemon — that is Milestone 3. See docs/M1-FINDINGS.md."
-    );
+    eprintln!("{ROUTE_CAVEAT}");
 
     Ok(if decision.accepts() {
         exit::OK
@@ -1352,3 +1514,96 @@ fn nonce() -> String {
     rsa::rand_core::OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// The `--json` envelope. See the module documentation for the contract.
+mod json {
+    use serde_json::{Value, json};
+
+    /// Moves only when the *output* contract changes.
+    ///
+    /// Deliberately not the schema version. A storage migration that adds an
+    /// index changes nothing a consumer can observe, and a renamed field
+    /// changes everything while possibly needing no migration at all. Tying
+    /// them makes every internal change look breaking, and consumers learn to
+    /// ignore the signal.
+    pub const FORMAT_VERSION: u64 = 1;
+
+    /// Print exactly one JSON value to stdout, and nothing else.
+    ///
+    /// `error` is inserted as `null` here rather than at each call site, so a
+    /// command cannot forget it and produce a response a consumer must special
+    /// case.
+    pub fn ok(mut payload: Value) {
+        if let Some(map) = payload.as_object_mut() {
+            map.insert("format_version".into(), json!(FORMAT_VERSION));
+            map.insert("error".into(), Value::Null);
+        }
+        println!("{payload}");
+    }
+
+    /// Print the failure envelope. Still exactly one value, still on stdout.
+    pub fn fail(code: &str, message: &str) {
+        println!(
+            "{}",
+            json!({
+                "format_version": FORMAT_VERSION,
+                "error": { "code": code, "message": message },
+            })
+        );
+    }
+}
+
+/// A human-facing note.
+///
+/// stdout in human mode, **stderr** under `--json` — where it is still worth
+/// saying and must not land in the parse. Dropping it there would mean the
+/// caveat on `route inbound` disappears for exactly the consumers most likely
+/// to build something on the answer.
+fn note(cli: &Cli, text: &str) {
+    if cli.json {
+        eprintln!("{text}");
+    } else {
+        println!("{text}");
+    }
+}
+
+/// Non-fatal findings, as data rather than prose.
+///
+/// The human forms go to stderr under `--json`; a consumer that wants to act on
+/// a redundant alias should not have to parse an English sentence to find it.
+fn reports_json(reports: &[pigeon_route::Report]) -> Vec<serde_json::Value> {
+    use pigeon_route::Report;
+    reports
+        .iter()
+        .map(|r| match r {
+            Report::RedundantAgainstCatchAll { domain, pattern } => serde_json::json!({
+                "kind": "redundant_against_catchall",
+                "domain": domain,
+                "pattern": pattern,
+                "message": r.to_string(),
+            }),
+            Report::RedundantWildcards { domain, a, b } => serde_json::json!({
+                "kind": "redundant_wildcards",
+                "domain": domain,
+                "patterns": [a, b],
+                "message": r.to_string(),
+            }),
+            Report::ActiveButDisabled { domain } => serde_json::json!({
+                "kind": "active_but_disabled",
+                "domain": domain,
+                "message": r.to_string(),
+            }),
+        })
+        .collect()
+}
+
+/// Printed to stderr after every `route inbound`, in both output modes.
+///
+/// Milestone 1's exit criterion is that this command predicts the control
+/// plane, and Milestone 3's is that it predicts the daemon. Until then the
+/// difference has to be said where somebody would rely on it — which under
+/// `--json` means stderr, not silence.
+const ROUTE_CAVEAT: &str = "\nNote: pigeond does not yet route from this table — acceptance still comes \
+     from PIGEON_ACCEPT and delivery from PIGEON_FORWARD_TO. This predicts the \
+     control plane, not the running daemon — that is Milestone 3. See \
+     docs/M1-FINDINGS.md.";

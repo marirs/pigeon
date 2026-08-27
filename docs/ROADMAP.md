@@ -80,7 +80,7 @@ Deviations worth carrying forward:
 - [x] atomic routing snapshot
 - [ ] live config reload
 - [x] `pigeon route inbound`
-- [ ] `--json` on every read command
+- [x] `--json` on every read command
 - [ ] bulk import from an existing forwarding provider
 
 Route precedence:

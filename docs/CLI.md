@@ -661,7 +661,37 @@ Accepted by every command:
     --config     path to pigeon.toml
 ```
 
-`--json` output is a stable contract. It is the seam anything built on top of Pigeon consumes, and a process boundary keeps that integration free of any coupling to the database schema.
+`--json` output is a versioned API. It is the seam anything built on top of Pigeon consumes, and a process boundary keeps that integration free of any coupling to the database schema.
+
+Five rules, and they hold for failures as well as successes.
+
+**Exactly one JSON value on stdout.** Every invocation, including one that fails. Parse stdout unconditionally; you never have to decide whether there is anything there.
+
+**Nothing else on stdout.** Notes, warnings and progress go to stderr, where they cannot corrupt the parse. They are not suppressed — a `route inbound` caveat or a "restart the daemon" note is worth as much to a script's operator as to a person, so it moves rather than vanishing.
+
+**`format_version` on every response.** It starts at 1 and moves only when this contract changes. It is deliberately *not* the database schema version: a storage migration that adds an index changes nothing you can observe, and a renamed field changes everything while possibly needing no migration at all.
+
+**`error` is always present** — `null` on success, an object on failure:
+
+```json
+{ "format_version": 1, "error": { "code": "no_such_domain", "message": "no such domain: nope.test" } }
+```
+
+`code` is a stable identifier and is what you match on. `message` is for people and may be reworded at any time. The discriminator is this field rather than the exit code, so a consumer that only has stdout can still tell what happened.
+
+Current codes: `no_such_domain`, `domain_exists`, `alias_exists`, `invalid_address`, `invalid_configuration`, `reject_with_destinations`, `catchall_needs_destination`, `confirmation_required`, `schema_too_new`, `unreadable_configuration`, `database`, `dkim`, `configuration`, `usage`.
+
+`confirmation_required` is what a destructive command returns instead of prompting. There is nothing a script can do with a prompt except pass `--yes`, and an object saying "please confirm" invites being mistaken for the outcome. Use `--dry-run` when you want the preview as data.
+
+**Deterministic ordering.** Arrays are sorted by a stated key — domains and aliases by name, destinations by domain then local part. Object keys are emitted sorted. Two runs against an unchanged database produce byte-identical output.
+
+### `null` versus omitted
+
+A field a command can produce is **always present**. `null` means the field applies and has no value: a domain with no default destination, a route that matched no rule.
+
+A **missing key** therefore means exactly one thing — the build that produced the output did not have that field. That is what makes `format_version` useful rather than decorative: without the rule you cannot tell an absent value from an absent feature.
+
+Empty collections are `[]`, never `null`.
 
 ## Exit codes
 
