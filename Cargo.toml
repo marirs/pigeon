@@ -85,7 +85,10 @@ rustls-pki-types = "1"
 # `bundled` compiles SQLite from vendored C source with `cc`. That is a C
 # dependency, but a self-contained one: no system library to locate, no
 # pkg-config, no version skew across hosts.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+
+# Migration checksums (M1-SCHEMA.md I2). Pure Rust, RustCrypto.
+sha2 = "0.10"
 
 # Plumbing
 serde       = { version = "1", features = ["derive"] }

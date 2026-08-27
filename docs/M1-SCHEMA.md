@@ -282,11 +282,22 @@ expressed as column collations rather than as application discipline, and
 
 ### `schema_migration`
 
+**Created by the runner, not by a migration.** The runner has to read this
+table to discover whether migration 1 has run, so migration 1 cannot be what
+creates it — the first run fails with *table schema_migration already exists*
+either way round. It is the runner's own contract rather than part of the
+schema it manages, and it is created with `IF NOT EXISTS` outside the batch.
+
+It is documented here because an operator reading the database finds it beside
+everything else, and because its shape is as fixed as anything in a migration:
+changing it needs the same care, with none of the same machinery to help.
+
 ```sql
-CREATE TABLE schema_migration (
+-- crates/pigeon-db/src/migrate.rs, not migrations/0001_initial.sql
+CREATE TABLE IF NOT EXISTS schema_migration (
     version    INTEGER PRIMARY KEY,
     name       TEXT    NOT NULL,
-    checksum   TEXT    NOT NULL,   -- SHA-256 of the migration text; see I2
+    checksum   TEXT    NOT NULL,   -- SHA-256 of the migration bytes; see I2
     applied_at INTEGER NOT NULL
 ) STRICT;
 ```

@@ -27,6 +27,8 @@
 //! it is, for an operator to find. Configuration comes from the environment
 //! because the TOML loader and SQLite schema arrive in Milestone 1.
 
+mod startup;
+
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -647,9 +649,76 @@ async fn main() -> io::Result<()> {
         )
         .init();
 
-    let listen = env_or("PIGEON_LISTEN", "127.0.0.1:2525");
-    let hostname = env_or("PIGEON_HOSTNAME", "localhost");
-    let spool = PathBuf::from(env_or("PIGEON_SPOOL", "./spool"));
+    // Milestone 1 configuration when a file is named, Milestone 0 environment
+    // variables otherwise.
+    //
+    // Both paths exist on purpose and only for now. `startup::start` runs the
+    // whole ordered sequence — validate, migrate, cross-check, probe the spool —
+    // but routing still comes from `PIGEON_ACCEPT`, because the routing snapshot
+    // is what replaces it and the snapshot builder is not written. Wiring the
+    // config file to a routing table that does not exist would be pretending.
+    //
+    // The environment path goes away when the snapshot builder lands, and with
+    // it `PIGEON_ACCEPT` and `PIGEON_FORWARD_TO`.
+    let booted = match std::env::var("PIGEON_CONFIG") {
+        Ok(path) if !path.trim().is_empty() => {
+            let started = startup::start(Path::new(path.trim()), |dir| async move {
+                prepare_spool(&dir).await
+            })
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+            if started.migration.is_empty() {
+                tracing::info!(version = started.migration.to, "database schema up to date");
+            } else {
+                tracing::info!(
+                    from = started.migration.from,
+                    to = started.migration.to,
+                    applied = ?started.migration.versions,
+                    backup = ?started.migration.backup,
+                    "database migrated"
+                );
+            }
+            for w in &started.warnings {
+                tracing::warn!("{w}");
+            }
+
+            // Reported rather than used, because there is nothing yet to use it
+            // for: routing still comes from `PIGEON_ACCEPT`. Saying so plainly
+            // beats a daemon that reads a configured domain list and silently
+            // ignores it.
+            let domains: i64 = started
+                .db
+                .query_row("SELECT count(*) FROM domain", [], |r| r.get(0))
+                .unwrap_or(-1);
+            tracing::info!(
+                domains,
+                "control plane ready. Routing is not served from it yet: the routing \
+                 snapshot is Milestone 1 and mutating commands are blocked until it exists."
+            );
+
+            Some(started)
+        }
+        _ => {
+            tracing::warn!(
+                "PIGEON_CONFIG is unset: running on Milestone 0 environment configuration.                  No database, no routing table, no DNS validation."
+            );
+            None
+        }
+    };
+
+    let listen = match &booted {
+        Some(b) => b.config.config().smtp.inbound.listen.to_string(),
+        None => env_or("PIGEON_LISTEN", "127.0.0.1:2525"),
+    };
+    let hostname = match &booted {
+        Some(b) => b.config.config().hostname.clone(),
+        None => env_or("PIGEON_HOSTNAME", "localhost"),
+    };
+    let spool = match &booted {
+        Some(b) => b.config.config().spool.clone(),
+        None => PathBuf::from(env_or("PIGEON_SPOOL", "./spool")),
+    };
 
     // Case preserved. The local part belongs to the destination host and only
     // the domain may be folded, which `accepts_recipient` does at comparison
@@ -672,14 +741,19 @@ async fn main() -> io::Result<()> {
         }
     }
 
-    // An unusable spool is local, unambiguous misconfiguration, so it stops
-    // startup rather than being discovered on the first message.
-    prepare_spool(&spool).await.map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("spool directory {} is unusable: {e}", spool.display()),
-        )
-    })?;
+    // Already done inside `startup::start` on the config path, in the ordered
+    // position. Repeating it here would probe twice and, worse, would put step 6
+    // after step 8 for one of the two paths.
+    if booted.is_none() {
+        // An unusable spool is local, unambiguous misconfiguration, so it stops
+        // startup rather than being discovered on the first message.
+        prepare_spool(&spool).await.map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("spool directory {} is unusable: {e}", spool.display()),
+            )
+        })?;
+    }
     let sink_dir = spool.clone();
 
     let listener = TcpListener::bind(&listen)

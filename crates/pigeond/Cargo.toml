@@ -19,6 +19,8 @@ pigeon-route = { workspace = true }
 pigeon-smtp = { workspace = true }
 pigeon-spool = { workspace = true }
 pigeon-alert = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -21,4 +21,4 @@ pub mod domain;
 
 pub use address::{Address, AddressBuf, AddressError};
 pub use datetime::rfc5322_date;
-pub use domain::{DeliveryMode, DomainStatus, ForwardPolicy};
+pub use domain::{DeliveryMode, DomainGate, DomainStatus, ForwardPolicy};

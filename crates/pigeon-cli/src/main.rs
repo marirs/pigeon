@@ -53,6 +53,38 @@
 //! `--quiet` prints nothing on success and relies on the exit code, which is
 //! also stable — see `docs/CLI.md`.
 
-fn main() {
-    eprintln!("pigeon: not yet implemented");
+/// Mutating commands are blocked, deliberately and by design rather than by
+/// omission.
+///
+/// `M1-SCHEMA.md` S-2 makes routing-snapshot construction the enforcement point
+/// for every invariant SQLite cannot express: a reject alias carrying
+/// destinations, a catch-all with no reachable destination, an alias that
+/// forwards into a loop. The snapshot builder is not written.
+///
+/// So a write today would have nothing validating it. Shipping `domain add`
+/// first would mean building the thing that creates invalid rows before the
+/// thing that refuses them, and every row it created in the meantime would need
+/// re-validating by whatever came later.
+///
+/// The database and the migration runner are real: `pigeond` will create and
+/// migrate a database, validate its configuration and refuse to start on
+/// anything local that is wrong.
+fn main() -> std::process::ExitCode {
+    eprintln!(
+        "pigeon: not yet implemented.
+
+The control plane exists as far as storage: `pigeond` creates and migrates its
+database, validates configuration, and refuses to start on local
+misconfiguration.
+
+What is missing is the routing snapshot, which is where every rule the database
+cannot express is enforced — reject aliases, catch-all reachability, forwarding
+loops. Until it exists there are no commands that write, because a write with
+nothing validating it is the problem rather than progress.
+
+  Roadmap:  docs/ROADMAP.md
+  Schema:   docs/M1-SCHEMA.md"
+    );
+    // 1: command or configuration error (CLI.md, exit codes).
+    std::process::ExitCode::from(1)
 }

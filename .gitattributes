@@ -1,0 +1,13 @@
+# Migration checksums cover exact bytes (M1-SCHEMA.md, I2 and I10), so line
+# endings are part of the identity of a migration. Without this pin, a checkout
+# on a machine configured for CRLF rewrites every .sql file and the runner
+# aborts on the next start with "migration has been edited" — correctly, and
+# uselessly.
+#
+# Applies to every .sql file, not just migrations: a fixture that disagrees with
+# its migration about line endings is its own kind of afternoon.
+*.sql text eol=lf
+
+# Same reasoning, narrower blast radius: fuzz seeds are compared byte for byte
+# against inputs that once crashed a target.
+fuzz/seeds/** -text
