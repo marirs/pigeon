@@ -17,6 +17,8 @@ It is sequenced as a **vertical slice**: get one message from a real sender to a
 - [x] MX resolution for the destination
 - [x] relay bytes to the recipient's MX
 - [x] scriptable SMTP peer in `pigeon-testkit`
+- [x] fuzz targets for the command parser, both stream framers, the address
+      validator and the delivery client
 
 Exit criteria:
 

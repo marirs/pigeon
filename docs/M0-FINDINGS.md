@@ -575,6 +575,90 @@ the file that states the invariant.
 
 ---
 
+---
+
+# Fifth round: fuzzing
+
+Five targets over everything that consumes untrusted bytes. Two real bugs, both
+memory-safe, both returning successfully — a harness that only watched for
+crashes would have found neither.
+
+## 39. The command parser let a bare CR through into every value it returned
+
+**Severity: medium-high. Header injection.**
+
+**Found within seconds of the first target's first run.**
+
+`strip_terminator` removes only the *trailing* CRLF, so `EHLO mail.example.com\ri`
+parsed cleanly and produced a greeting holding a bare CR. The same held for
+`MAIL`/`RCPT` paths and their parameters. Those values are interpolated into the
+`Received:` header and into outbound `RCPT TO:` commands, where a lenient reader
+treats a CR as a line break.
+
+This is the third appearance of one mistake:
+
+- Finding 20a hardened `Address::parse` against exactly this, with a docstring
+  naming the hazard.
+- Finding 24a then observed that the EHLO greeting reaching the *same header*
+  was still unguarded, and added `sanitise_for_header`.
+- The parser itself was never touched, so every new consumer of a `Command`
+  inherits the obligation to remember.
+
+**Fixed at the parser.** A `Command` can no longer hold a control character at
+all; `sanitise_for_header` stays as the second layer. Sanitising at the point of
+use is a rule each future caller has to know, and finding 24a exists precisely
+because one did not.
+
+## 40. A receiving server could forge entries in Pigeon's log
+
+**Severity: medium.**
+
+The final reply text is captured into `Accepted::message`, which `pigeond`
+writes into a log line with `Display`. `read_reply` trims only the end of each
+line, so `250ME\r2` arrived with its CR intact.
+
+Whatever answers on port 25 therefore chooses what Pigeon's operator reads. In a
+terminal that is an overwritten line; in a file it is a second entry that never
+happened. For a forwarder the peer is usually the operator's own mailbox
+provider, which is what keeps this below high — but Milestone 7 delivers to
+arbitrary MX hosts, and the reply is attacker-chosen there.
+
+**Fixed:** reply text is sanitised as it is accumulated and bounded to 512
+bytes. Same root cause as 39 — only the trailing terminator was ever stripped.
+
+## 41. A wrong assertion, which is also a finding
+
+`line_reader`'s first version asserted that a framed line contains no LF. That
+is what `LineReader`'s docstring implied — "Frames CRLF-delimited command
+lines". The implementation splits on LF and keeps it, and always has.
+
+The code was right. The docstring had never described it. The assertion was
+written from the docstring rather than from the code, which is exactly how a
+reader who trusts a comment ends up reasoning from a guarantee that does not
+hold — the pattern this document named after round one and has now demonstrated
+in the other direction.
+
+The docstring now says what the framer does, and why leniency stops at the
+command layer: the *body* terminator requires full CRLF on both the reading and
+writing sides, because that is the boundary a smuggled envelope would cross.
+
+## What fuzzing showed
+
+Every finding above is in code that three rounds of human review had already
+read, twice under a specific instruction to look for this class of bug. What the
+reviewers could not do is enumerate the inputs.
+
+Worth noting what made the targets productive: none of them merely check for
+panics. The two strongest are differential — feed the same bytes in different
+chunk boundaries and require the same answer — which is the property an
+example-based test structurally cannot hold, because its author picks the
+splits they thought of. A terminator split across two reads is the bug class
+this codebase has already been bitten by twice.
+
+See `fuzz/README.md`.
+
+---
+
 ## What to carry into Milestone 1
 
 - `DataReader` still buffers whole messages in memory. At the 50 MB ceiling that is 50 MB per concurrent connection, and it needs to write through to the spool once the spool is real.
@@ -582,5 +666,5 @@ the file that states the invariant.
 - Forwarding still has no retry. The spool copy is the fallback, and it is a manual one.
 - `Address::parse` refuses address literals. Legal RFC 5321, unused by a forwarder, and now refused deliberately rather than by accident — revisit if a real destination needs one.
 - Stranded `.partial` files are counted at startup but never swept, because a sweep cannot be told apart from destroying a message another instance is writing.
-- The parsers have never been fuzzed. `command::parse`, `DataReader::feed` and the reply reader all consume hostile input under example-based tests only.
+- ~~The parsers have never been fuzzed.~~ Five targets now cover the command parser, both framers, the address validator and the delivery client — see round five. They are advisory in CI rather than a required gate, and no target has yet run for longer than a few minutes.
 - **Milestone 0's exit criterion is still unmet.** No message from a real sender has reached a real mailbox. Everything above was verified against this project's model of SMTP, not against SMTP.

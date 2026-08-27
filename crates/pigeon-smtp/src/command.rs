@@ -45,6 +45,13 @@ pub enum ParseError {
     TooLong,
     /// The line contained bytes outside ASCII.
     NotAscii,
+    /// The line carried a control character in its interior.
+    ///
+    /// Separate from [`ParseError::NotAscii`] because CR, LF and NUL *are*
+    /// ASCII, and they are the ones that matter: the framing layer strips only
+    /// the trailing terminator, so an interior CR survives into every value
+    /// this parser returns.
+    ControlCharacter,
     /// The verb is not one Pigeon implements.
     UnknownCommand,
     /// The verb is known but its arguments are malformed.
@@ -63,6 +70,7 @@ impl fmt::Display for ParseError {
             Self::Empty => "empty command",
             Self::TooLong => "command line too long",
             Self::NotAscii => "command contained non-ASCII bytes",
+            Self::ControlCharacter => "command contained a control character",
             Self::UnknownCommand => "unrecognised command",
             Self::Syntax => "syntax error in parameters",
             Self::MissingArgument => "command requires an argument",
@@ -114,6 +122,27 @@ pub fn parse(line: &[u8]) -> Result<Command<'_>, ParseError> {
     // index is a valid char boundary, so the slicing below cannot panic.
     if !line.is_ascii() {
         return Err(ParseError::NotAscii);
+    }
+
+    // No control characters anywhere in the line.
+    //
+    // `strip_terminator` removes only the *trailing* CRLF, so `EHLO a\rb`
+    // arrives here with a bare CR in the middle and every value this function
+    // returns is a borrow of it. Those values are interpolated into the
+    // `Received:` header and into outbound `RCPT TO:` commands, where a CR is a
+    // line break to any lenient parser — the header-injection primitive that
+    // `Address::parse` was hardened against in finding 20a and that the EHLO
+    // greeting kept, being hardened again at the header in finding 24a.
+    //
+    // Fixed here rather than at each consumer because that is what the previous
+    // two attempts got wrong: sanitising at the point of use is a rule every
+    // future caller has to remember, and `sanitise_for_header` was written
+    // precisely because one did not. A `Command` now cannot hold one at all,
+    // and the sanitiser stays as the second layer.
+    //
+    // Found by fuzzing, on the first run of the first target.
+    if line.iter().any(|b| b.is_ascii_control()) {
+        return Err(ParseError::ControlCharacter);
     }
     let text = std::str::from_utf8(line).map_err(|_| ParseError::NotAscii)?;
 
@@ -359,6 +388,37 @@ mod tests {
             Err(ParseError::NotAscii)
         );
         assert_eq!(parse(b"EHLO \xff\xfe\r\n"), Err(ParseError::NotAscii));
+    }
+
+    #[test]
+    fn interior_control_characters_are_refused() {
+        // `strip_terminator` removes only the trailing CRLF, so a bare CR in
+        // the middle of a line used to survive into the greeting, the path and
+        // the parameters — each of which is later written into a trace header
+        // or an outbound command, where a lenient reader treats it as a line
+        // break.
+        //
+        // Found by the first run of the first fuzz target, against a line the
+        // existing tests had no reason to contain.
+        assert_eq!(
+            parse(b"EHLO mail.example.com\ri\r\n"),
+            Err(ParseError::ControlCharacter)
+        );
+        assert_eq!(
+            parse(b"MAIL FROM:<a\rb@example.com>\r\n"),
+            Err(ParseError::ControlCharacter)
+        );
+        assert_eq!(
+            parse(b"RCPT TO:<a@example.com>\rNOOP\r\n"),
+            Err(ParseError::ControlCharacter)
+        );
+        assert_eq!(parse(b"NOOP\x00\r\n"), Err(ParseError::ControlCharacter));
+
+        // The trailing terminator itself is not an interior control character,
+        // and a line with no terminator at all is still fine.
+        assert!(parse(b"EHLO mail.example.com\r\n").is_ok());
+        assert!(parse(b"EHLO mail.example.com\n").is_ok());
+        assert!(parse(b"EHLO mail.example.com").is_ok());
     }
 
     #[test]

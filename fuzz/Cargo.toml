@@ -1,0 +1,56 @@
+# Fuzzing harness. Deliberately its own workspace, so `cargo build --workspace`
+# and every CI gate on stable ignore it — `libfuzzer-sys` needs nightly and a
+# sanitizer runtime, and making the stable gates depend on that would trade a
+# gate that always runs for one that sometimes can.
+[package]
+name = "pigeon-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+pigeon-smtp = { path = "../crates/pigeon-smtp" }
+pigeon-types = { path = "../crates/pigeon-types" }
+tokio = { version = "1", features = ["rt", "io-util", "time", "macros", "test-util"] }
+
+[[bin]]
+name = "command_parse"
+path = "fuzz_targets/command_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "data_reader"
+path = "fuzz_targets/data_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "line_reader"
+path = "fuzz_targets/line_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "address_parse"
+path = "fuzz_targets/address_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "delivery_client"
+path = "fuzz_targets/delivery_client.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

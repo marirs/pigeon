@@ -40,7 +40,22 @@ pub enum LineError {
     TooLong,
 }
 
-/// Frames CRLF-delimited command lines out of a byte stream.
+/// Frames command lines out of a byte stream.
+///
+/// Splits on LF and keeps it, so the trailing CR of a proper CRLF is carried
+/// into the line and removed by [`crate::command::parse`]. A bare LF therefore
+/// terminates a line here, which is deliberate: real clients send all three
+/// endings, and refusing to frame `QUIT\n` leaves the command sitting in the
+/// buffer until the command timeout rather than being answered.
+///
+/// Leniency stops at the command layer. The *body* terminator requires a full
+/// CRLF on both the reading and writing sides — see [`DataReader`] and the
+/// delivery client's dot-stuffing — because that is the boundary a smuggled
+/// envelope would cross, and where two systems disagreeing about what ends a
+/// line stops being a compatibility question.
+///
+/// The docstring here previously said "CRLF-delimited", which the code has
+/// never done.
 #[derive(Debug)]
 pub struct LineReader {
     buf: Vec<u8>,

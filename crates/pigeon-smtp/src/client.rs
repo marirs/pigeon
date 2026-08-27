@@ -265,6 +265,27 @@ where
     }
 }
 
+/// Longest reply text kept. A reply is a diagnostic, not a payload, and it is
+/// chosen entirely by the other end.
+const MAX_REPLY_TEXT: usize = 512;
+
+/// Append `fragment` to `text`, with anything that could break a log line or a
+/// downstream parser replaced.
+///
+/// Distinct from `server::sanitise_for_header`, which also removes characters
+/// structural to header syntax. Here the destination is a log field and an
+/// error message, so only control characters matter — replacing parentheses in
+/// a receiving server's diagnostic would make it harder to read for no gain.
+fn push_sanitised(text: &mut String, fragment: &str) {
+    for c in fragment.chars() {
+        if text.len() >= MAX_REPLY_TEXT {
+            text.push_str("...");
+            return;
+        }
+        text.push(if c.is_control() { '?' } else { c });
+    }
+}
+
 /// Read one reply, following continuation lines.
 async fn read_reply<S>(io: &mut BufReader<S>) -> Result<(u16, String), ClientError>
 where
@@ -311,7 +332,17 @@ where
         if !text.is_empty() {
             text.push(' ');
         }
-        text.push_str(trimmed[3..].trim_start_matches(['-', ' ']));
+        // Sanitised, not trusted. `trim_end_matches` removes only the trailing
+        // terminator, so a reply line like `250ME\r2` keeps its interior CR —
+        // and this text becomes `Accepted::message`, which `pigeond` writes
+        // into a log line with `Display`. A bare CR there forges log entries: a
+        // receiving server, or anything able to answer as one, chooses what
+        // Pigeon's operator reads.
+        //
+        // This is the third instance of "only the trailing terminator is
+        // stripped" in this codebase — see the EHLO greeting (finding 24a) and
+        // `Address::parse` (finding 20a). Found by fuzzing.
+        push_sanitised(&mut text, trimmed[3..].trim_start_matches(['-', ' ']));
 
         // A space after the code marks the last line; a hyphen means more.
         if trimmed.as_bytes().get(3).copied().unwrap_or(b' ') != b'-' {
@@ -472,6 +503,36 @@ mod tests {
         // so the terminator must not be written straight after one.
         assert_eq!(stuff(b"x\n").await, b"x\n\r\n.\r\n");
         assert_eq!(stuff(b"unix\nlines\n").await, b"unix\nlines\n\r\n.\r\n");
+    }
+
+    #[test]
+    fn reply_text_cannot_carry_a_line_break_into_a_log() {
+        // A receiving server chooses this string. With a bare CR in it, it also
+        // chooses what a terminal or a log file shows afterwards.
+        let mut text = String::new();
+        push_sanitised(&mut text, "ME\r2");
+        assert_eq!(text, "ME?2");
+
+        let mut text = String::new();
+        push_sanitised(&mut text, "queued\nFATAL: forged\r\n");
+        assert_eq!(text, "queued?FATAL: forged??");
+
+        // Ordinary diagnostics survive intact; they are what the field is for.
+        let mut text = String::new();
+        push_sanitised(&mut text, "Ok: queued as 2A3F1 (mx.example.net)");
+        assert_eq!(text, "Ok: queued as 2A3F1 (mx.example.net)");
+    }
+
+    #[test]
+    fn reply_text_is_bounded() {
+        let mut text = String::new();
+        push_sanitised(&mut text, &"a".repeat(4000));
+        assert!(
+            text.len() <= MAX_REPLY_TEXT + 3,
+            "reply text grew to {} bytes",
+            text.len()
+        );
+        assert!(text.ends_with("..."));
     }
 
     #[tokio::test]
