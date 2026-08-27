@@ -12,14 +12,17 @@
 //! The schema and the reasoning behind each constraint are in
 //! `docs/M1-SCHEMA.md`.
 //!
-//! # Repositories are not here yet, deliberately
+//! # Repositories write; they do not decide
 //!
-//! Mutating operations wait for the validated snapshot builder. `M1-SCHEMA.md`
-//! S-2 makes snapshot construction the enforcement point for every invariant
-//! SQLite cannot express — a reject alias with destinations, a routing loop —
-//! and a write that cannot be validated against a proposed snapshot has nothing
-//! validating it. Adding writes first would mean building the thing that
-//! creates invalid rows before the thing that refuses them.
+//! [`repo`] holds the mutations. None of them commits and none of them decides
+//! whether the result is a valid configuration — `M1-SCHEMA.md` S-2 makes
+//! `pigeon_route::Snapshot::build` the enforcement point, and it runs on the
+//! same transaction before it commits. `pigeon_route::mutate` is the wrapper
+//! that guarantees the order.
+//!
+//! What these functions do enforce is the shape of a row: parameterised queries
+//! only, addresses parsed before storage, case folded on exactly the halves
+//! Pigeon is authoritative for.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +31,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 pub mod migrate;
+pub mod repo;
 
 pub use migrate::{Applied, MIGRATIONS, Migration, migrate};
 
@@ -91,6 +95,28 @@ pub enum DbError {
 
     #[error("{0}")]
     Pragma(String),
+
+    #[error("no such domain: {0}")]
+    NoSuchDomain(String),
+
+    #[error("domain {0} already exists")]
+    DomainExists(String),
+
+    #[error("{domain} already has an alias {pattern:?}")]
+    AliasExists { domain: String, pattern: String },
+
+    #[error("a reject rule cannot have destinations: {0:?}")]
+    RejectWithDestinations(String),
+
+    #[error(
+        "{0} has no default destination, so a catch-all inheriting it would accept every \
+         address and route none. Give the catch-all its own destination, or set a domain \
+         default first."
+    )]
+    CatchAllNeedsDestination(String),
+
+    #[error("not a valid address: {0}")]
+    BadAddress(String),
 }
 
 /// How long to wait for another writer before giving up.

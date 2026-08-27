@@ -60,26 +60,26 @@ Deviations worth carrying forward:
 
 ## Milestone 1 — Control plane
 
-- [ ] SQLite schema and migration runner
-- [ ] configuration loader
-- [ ] domain add / remove / list / show
-- [ ] domain lifecycle states
+- [x] SQLite schema and migration runner
+- [x] configuration loader
+- [x] domain add / remove / list / show
+- [x] domain lifecycle states
 - [ ] DKIM keypair generation (RSA-2048 default)
 - [ ] DKIM TXT rendering
-- [ ] aliases and multiple destinations
-- [ ] per-domain default destination, inherited by aliases
-- [ ] bulk destination listing and retargeting
-- [ ] wildcard aliases
-- [ ] explicit reject rules
-- [ ] catch-all
-- [ ] redundant-alias detection against catch-all
-- [ ] plus-addressing
-- [ ] loop detection at configuration time
-- [ ] address normalisation
-- [ ] route precedence
-- [ ] atomic routing snapshot
+- [x] aliases and multiple destinations
+- [x] per-domain default destination, inherited by aliases
+- [x] bulk destination listing and retargeting
+- [x] wildcard aliases
+- [x] explicit reject rules
+- [x] catch-all
+- [x] redundant-alias detection against catch-all
+- [x] plus-addressing
+- [x] loop detection at configuration time
+- [x] address normalisation
+- [x] route precedence
+- [x] atomic routing snapshot
 - [ ] live config reload
-- [ ] `pigeon route inbound`
+- [x] `pigeon route inbound`
 - [ ] `--json` on every read command
 - [ ] bulk import from an existing forwarding provider
 
@@ -98,6 +98,51 @@ What stays in Milestone 5 is *checking* the published record against the local k
 Exit criteria:
 
 `pigeon route inbound user@example.com` exactly predicts runtime routing, and an existing set of domains and aliases can be imported in one command.
+
+### BLOCKER: this exit criterion cannot be met in Milestone 1
+
+**Milestone 1 must not be marked complete while this stands.**
+
+The control plane is built: the schema, the migration runner, the validated
+routing snapshot, the repositories, and the mutating commands. `pigeon route
+inbound` predicts what the snapshot answers, exactly, by calling the same
+function the daemon would.
+
+What it does not predict is **runtime** routing, because the daemon does not yet
+route from that table. Acceptance still comes from `PIGEON_ACCEPT` and delivery
+from `PIGEON_FORWARD_TO`. The CLI says so on every `route inbound`, and the
+daemon says so at startup, so nobody can rely on the prediction by accident —
+but a criterion that is signalled as unmet is still unmet.
+
+Wiring acceptance alone is not a partial fix, it is a worse state: mail would be
+accepted for an address on the strength of a rule and then delivered somewhere
+that rule does not name.
+
+Wiring both requires **whole-message fan-out**: one accepted message resolving
+to several destinations, each needing its own outcome. Finding 19 is the same
+gap from the delivery side — a single rejected recipient currently abandons the
+message for all of them — and the fix named there is one recipient per delivery,
+"which needs the Milestone 3 queue to make a partial outcome representable".
+
+So the criterion depends on Milestone 3 work and was mis-assigned here.
+
+**Proposed resolution, pending approval.** Move the runtime half to Milestone 3
+and replace this with a control-plane criterion Milestone 1 can actually meet:
+
+> `pigeon route inbound user@example.com` exactly predicts what the routing
+> snapshot answers; every mutating command is refused unless the configuration
+> it would produce builds and validates; and an existing set of domains and
+> aliases can be imported in one command.
+
+and add to Milestone 3:
+
+> The daemon accepts recipients and delivers from the routing snapshot, with a
+> per-destination outcome for every message, and `pigeon route inbound` exactly
+> predicts runtime routing.
+
+The alternative is to implement fan-out here without per-destination state,
+which means a retry cannot know which destinations already received a message.
+That trades a documented gap for silent duplicates.
 
 ---
 

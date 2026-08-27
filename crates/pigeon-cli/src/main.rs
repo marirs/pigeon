@@ -38,10 +38,16 @@
 //!
 //! # Where commands run
 //!
-//! Read commands open SQLite directly. Mutating commands go through the
-//! daemon's Unix socket while it is running, so there is only ever one writer
-//! and changes are validated against live state before they commit. Offline
-//! mutation is permitted only when the daemon is stopped.
+//! Read commands open SQLite read-only. Mutating commands open it for writing
+//! and go through `pigeon_route::mutate`, which applies the change, builds and
+//! validates the prospective snapshot *inside the same transaction*, rolls back
+//! if it will not serve, commits, and only then publishes.
+//!
+//! The daemon's Unix socket is not built yet, so mutation is offline-only: a
+//! change made while the daemon is running is in the database but not in the
+//! daemon's routing table until it restarts. `BEGIN IMMEDIATE` means the two
+//! cannot corrupt each other, and the CLI says so rather than leaving it to be
+//! discovered.
 //!
 //! # The `--json` contract
 //!
@@ -53,38 +59,1144 @@
 //! `--quiet` prints nothing on success and relies on the exit code, which is
 //! also stable — see `docs/CLI.md`.
 
-/// Mutating commands are blocked, deliberately and by design rather than by
-/// omission.
-///
-/// `M1-SCHEMA.md` S-2 makes routing-snapshot construction the enforcement point
-/// for every invariant SQLite cannot express: a reject alias carrying
-/// destinations, a catch-all with no reachable destination, an alias that
-/// forwards into a loop. The snapshot builder is not written.
-///
-/// So a write today would have nothing validating it. Shipping `domain add`
-/// first would mean building the thing that creates invalid rows before the
-/// thing that refuses them, and every row it created in the meantime would need
-/// re-validating by whatever came later.
-///
-/// The database and the migration runner are real: `pigeond` will create and
-/// migrate a database, validate its configuration and refuse to start on
-/// anything local that is wrong.
-fn main() -> std::process::ExitCode {
-    eprintln!(
-        "pigeon: not yet implemented.
+use std::path::PathBuf;
+use std::process::ExitCode;
 
-The control plane exists as far as storage: `pigeond` creates and migrates its
-database, validates configuration, and refuses to start on local
-misconfiguration.
+use clap::{Parser, Subcommand};
+use pigeon_db::repo::{self, Address, AliasKind};
 
-What is missing is the routing snapshot, which is where every rule the database
-cannot express is enforced — reject aliases, catch-all reachability, forwarding
-loops. Until it exists there are no commands that write, because a write with
-nothing validating it is the problem rather than progress.
+/// Exit codes, stable across releases so scripts can branch on them.
+/// See `docs/CLI.md`.
+mod exit {
+    use std::process::ExitCode;
+    pub const OK: u8 = 0;
+    /// Command or configuration error.
+    pub const USAGE: u8 = 1;
+    /// Database failure.
+    pub const DATABASE: u8 = 4;
 
-  Roadmap:  docs/ROADMAP.md
-  Schema:   docs/M1-SCHEMA.md"
+    pub fn code(n: u8) -> ExitCode {
+        ExitCode::from(n)
+    }
+}
+
+#[derive(Parser)]
+#[command(
+    name = "pigeon",
+    about = "Self-hosted email forwarding.",
+    long_about = None,
+    disable_help_subcommand = true
+)]
+struct Cli {
+    /// Path to pigeon.toml.
+    #[arg(long, global = true, env = "PIGEON_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Act on this database directly, bypassing the configuration file.
+    #[arg(long, global = true, env = "PIGEON_DB")]
+    db: Option<PathBuf>,
+
+    /// Machine-readable output.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Show what would change, then stop.
+    #[arg(long, global = true)]
+    dry_run: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Add and configure a domain.
+    Domain {
+        #[command(subcommand)]
+        verb: Option<DomainVerb>,
+    },
+    /// Act on every domain at once.
+    Domains {
+        #[command(subcommand)]
+        verb: Option<DomainsVerb>,
+    },
+    /// Forward an address to a mailbox.
+    Alias {
+        #[command(subcommand)]
+        verb: Option<AliasVerb>,
+    },
+    /// Forward everything unmatched.
+    Catchall {
+        #[command(subcommand)]
+        verb: Option<CatchallVerb>,
+    },
+    /// Where your mail lands, across all domains.
+    Destination {
+        #[command(subcommand)]
+        verb: Option<DestinationVerb>,
+    },
+    /// Trace where an address would go.
+    Route {
+        #[command(subcommand)]
+        verb: Option<RouteVerb>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DomainVerb {
+    /// Add a domain.
+    Add {
+        domain: String,
+        /// Where this domain's mail goes by default; aliases inherit it.
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Delete a domain and everything under it.
+    Remove {
+        domain: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Status, destination and alias count.
+    Show { domain: String },
+    /// Set where this domain's mail goes by default.
+    Forward { domain: String, address: String },
+    /// Allow this domain to receive mail.
+    Enable { domain: String },
+    /// Stop this domain receiving mail.
+    Disable { domain: String },
+}
+
+#[derive(Subcommand)]
+enum DomainsVerb {
+    /// Every domain, with its status.
+    List,
+}
+
+#[derive(Subcommand)]
+enum AliasVerb {
+    /// Forwarding rules on a domain.
+    List { domain: String },
+    /// Add one or more aliases.
+    Add {
+        domain: String,
+        /// Comma-separated.
+        names: String,
+        /// Comma-separated. Omit to inherit the domain default.
+        #[arg(long)]
+        to: Option<String>,
+        /// Refuse this address instead of forwarding it.
+        #[arg(long)]
+        reject: bool,
+    },
+    /// Remove one or more aliases.
+    Remove {
+        domain: String,
+        names: Option<String>,
+        /// Remove every alias on the domain.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatchallVerb {
+    /// Forward everything unmatched.
+    Add {
+        domain: String,
+        /// Omit to inherit the domain default.
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Stop forwarding unmatched addresses.
+    Remove { domain: String },
+}
+
+#[derive(Subcommand)]
+enum DestinationVerb {
+    /// Every mailbox, and how much routes to it.
+    List,
+    /// Repoint every use of one mailbox at another.
+    Replace {
+        old: String,
+        new: String,
+        /// Narrow to one domain.
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RouteVerb {
+    /// Trace an inbound address.
+    Inbound { address: String },
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(&cli) {
+        Ok(code) => exit::code(code),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            exit::code(classify(&e))
+        }
+    }
+}
+
+/// Map a failure onto the documented exit codes.
+fn classify(e: &anyhow::Error) -> u8 {
+    if e.downcast_ref::<pigeon_db::DbError>().is_some()
+        || e.downcast_ref::<pigeon_route::MutationError>().is_some()
+    {
+        return exit::DATABASE;
+    }
+    exit::USAGE
+}
+
+/// Where the database lives.
+///
+/// `--db` wins, then the configuration file, then the documented default. The
+/// direct path exists because a control-plane command should not require a
+/// fully validated daemon configuration — the database is the only thing it
+/// touches.
+fn database_path(cli: &Cli) -> anyhow::Result<PathBuf> {
+    if let Some(p) = &cli.db {
+        return Ok(p.clone());
+    }
+    if let Some(p) = &cli.config {
+        let config = pigeon_config::Config::load(p)?;
+        return Ok(config.database);
+    }
+    Ok(PathBuf::from("/var/lib/pigeon/pigeon.db"))
+}
+
+fn open_read(cli: &Cli) -> anyhow::Result<rusqlite::Connection> {
+    let path = database_path(cli)?;
+    if !path.exists() {
+        anyhow::bail!(
+            "no database at {}\n\n  Start the daemon once to create it, or point at \
+             another with --db.",
+            path.display()
+        );
+    }
+    Ok(pigeon_db::open_read_only(&path)?)
+}
+
+fn open_write(cli: &Cli) -> anyhow::Result<rusqlite::Connection> {
+    let path = database_path(cli)?;
+    if !path.exists() {
+        anyhow::bail!(
+            "no database at {}\n\n  Start the daemon once to create it, or point at \
+             another with --db.",
+            path.display()
+        );
+    }
+    let conn = pigeon_db::open(&path)?;
+    let version = pigeon_db::schema_version(&conn)?;
+    let known = pigeon_db::MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
+    if version != known {
+        // Only the daemon migrates (`M1-SCHEMA.md` I7). A CLI meeting a schema
+        // it does not know must not write against it.
+        anyhow::bail!(
+            "database is at schema version {version}, this build knows {known}\n\n  \
+             Start pigeond to migrate it. Only the daemon migrates."
+        );
+    }
+    Ok(conn)
+}
+
+/// Apply a mutation under the contract, or preview it.
+///
+/// The router here is local and thrown away: nothing in this process serves
+/// mail. It exists because `mutate` publishes as its last step, and a mutation
+/// path that skipped publication would be a second, subtly different contract.
+/// What the daemon needs is the committed rows, which it reads at startup.
+fn apply<T>(
+    cli: &Cli,
+    conn: &mut rusqlite::Connection,
+    f: impl FnOnce(&rusqlite::Connection) -> Result<T, pigeon_db::DbError>,
+) -> anyhow::Result<pigeon_route::Outcome<T>> {
+    if cli.dry_run {
+        return Ok(pigeon_route::preview(conn, f)?);
+    }
+    let router = pigeon_route::Router::default();
+    Ok(pigeon_route::mutate(conn, &router, f)?)
+}
+
+/// Say what the change means for a daemon that is already running.
+///
+/// The Unix socket that would tell it is Milestone 1 work that is not done, so
+/// this is the honest version: the rows are committed and the running daemon
+/// has not read them.
+fn note_reload(cli: &Cli) {
+    if !cli.json && !cli.dry_run {
+        println!("\nA running pigeond will not see this until it restarts.");
+    }
+}
+
+fn addresses(raw: &str) -> anyhow::Result<Vec<Address>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Address::parse(s).map_err(Into::into))
+        .collect()
+}
+
+fn names(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn print_reports(cli: &Cli, reports: &[pigeon_route::Report]) {
+    if cli.json {
+        return;
+    }
+    for r in reports {
+        println!("\nNote: {r}");
+    }
+}
+
+fn run(cli: &Cli) -> anyhow::Result<u8> {
+    let Some(command) = &cli.command else {
+        // A bare `pigeon` is someone asking what they can do, not a usage error.
+        print_overview();
+        return Ok(exit::OK);
+    };
+
+    match command {
+        Command::Domain { verb } => match verb {
+            None => {
+                print_help("domain");
+                Ok(exit::OK)
+            }
+            Some(v) => domain(cli, v),
+        },
+        Command::Domains { verb } => match verb {
+            None | Some(DomainsVerb::List) => domains_list(cli),
+        },
+        Command::Alias { verb } => match verb {
+            None => {
+                print_help("alias");
+                Ok(exit::OK)
+            }
+            Some(v) => alias(cli, v),
+        },
+        Command::Catchall { verb } => match verb {
+            None => {
+                print_help("catchall");
+                Ok(exit::OK)
+            }
+            Some(v) => catchall(cli, v),
+        },
+        Command::Destination { verb } => match verb {
+            None | Some(DestinationVerb::List) => destination_list(cli),
+            Some(v) => destination(cli, v),
+        },
+        Command::Route { verb } => match verb {
+            None => {
+                print_help("route");
+                Ok(exit::OK)
+            }
+            Some(RouteVerb::Inbound { address }) => route_inbound(cli, address),
+        },
+    }
+}
+
+// ------------------------------------------------------------------ domains
+
+fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
+    match verb {
+        DomainVerb::Add { domain, to } => {
+            let mut conn = open_write(cli)?;
+            let default = to.as_deref().map(Address::parse).transpose()?;
+            let outcome = apply(cli, &mut conn, |tx| {
+                repo::add_domain(tx, domain, default.as_ref()).map(|_| ())
+            })?;
+
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "format_version": 1,
+                        "domain": domain.to_ascii_lowercase(),
+                        "status": "new",
+                        "default_destination": to,
+                    })
+                );
+            } else {
+                println!("Added {}.", domain.to_ascii_lowercase());
+                match to {
+                    Some(t) => {
+                        println!("  Mail for it forwards to {t} unless an alias says otherwise.")
+                    }
+                    None => println!(
+                        "  It has no default destination yet, so aliases will each need --to.\n  \
+                         Set one with:  pigeon domain forward {domain} you@example.net"
+                    ),
+                }
+                println!(
+                    "\nIt will not carry mail until DNS validation moves it to ACTIVE, \
+                     which is Milestone 5."
+                );
+                print_reports(cli, &outcome.reports);
+                note_reload(cli);
+            }
+            Ok(exit::OK)
+        }
+
+        DomainVerb::Remove { domain, yes } => {
+            let mut conn = open_write(cli)?;
+            let impact = repo::removal_impact(&conn, domain)?;
+
+            if !yes && !cli.dry_run {
+                // The heaviest prompt in Pigeon, because two of these lines are
+                // irreversible in ways that are not obvious while typing.
+                println!("This permanently deletes:\n");
+                println!("  {} aliases", impact.aliases);
+                if let Some(c) = &impact.catchall {
+                    println!("  catch-all -> {c}");
+                }
+                if impact.sender_identities > 0 {
+                    println!("  {} sender identities", impact.sender_identities);
+                }
+                for s in &impact.dkim_selectors {
+                    println!("  DKIM key   {s}._domainkey.{domain}");
+                }
+                if !impact.dkim_selectors.is_empty() {
+                    println!(
+                        "\nThe DKIM key cannot be regenerated. Re-adding {domain} later creates a \
+                         new key and requires publishing a new DNS record."
+                    );
+                }
+                println!("\nRe-run with --yes to confirm.");
+                return Ok(exit::USAGE);
+            }
+
+            apply(cli, &mut conn, |tx| repo::remove_domain(tx, domain))?;
+            if !cli.json {
+                println!("Removed {}.", domain.to_ascii_lowercase());
+                note_reload(cli);
+            }
+            Ok(exit::OK)
+        }
+
+        DomainVerb::Show { domain } => {
+            let conn = open_read(cli)?;
+            let all = repo::list_domains(&conn)?;
+            let Some(d) = all.iter().find(|d| d.name == domain.to_ascii_lowercase()) else {
+                return Err(pigeon_db::DbError::NoSuchDomain(domain.clone()).into());
+            };
+            let aliases = repo::list_aliases(&conn, domain)?;
+
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "format_version": 1,
+                        "domain": d.name,
+                        "status": d.status,
+                        "inbound_enabled": d.inbound_enabled,
+                        "outbound_enabled": d.outbound_enabled,
+                        "default_destination": d.default_destination,
+                        "catchall": d.catchall,
+                        "aliases": aliases.len(),
+                    })
+                );
+            } else {
+                println!("{}\n", d.name);
+                println!("  Status     {}", d.status);
+                println!(
+                    "  Inbound    {}",
+                    if d.inbound_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                println!(
+                    "  Outbound   {}",
+                    if d.outbound_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                println!(
+                    "  Default    {}",
+                    d.default_destination.as_deref().unwrap_or("(none)")
+                );
+                println!("  Catch-all  {}", if d.catchall { "on" } else { "off" });
+                println!("  Aliases    {}", aliases.len());
+
+                if d.status == "active" && !d.inbound_enabled {
+                    println!(
+                        "\nIt passes every check and is switched off, so it refuses mail.\n  \
+                         pigeon domain enable {}",
+                        d.name
+                    );
+                }
+            }
+            Ok(exit::OK)
+        }
+
+        DomainVerb::Forward { domain, address } => {
+            let mut conn = open_write(cli)?;
+            let to = Address::parse(address)?;
+            let outcome = apply(cli, &mut conn, |tx| {
+                repo::set_default_destination(tx, domain, Some(&to))
+            })?;
+            if !cli.json {
+                println!(
+                    "{} now forwards to {address} by default.",
+                    domain.to_ascii_lowercase()
+                );
+                println!("  Aliases with their own destination are unchanged.");
+                print_reports(cli, &outcome.reports);
+                note_reload(cli);
+            }
+            Ok(exit::OK)
+        }
+
+        DomainVerb::Enable { domain } => set_enabled(cli, domain, true),
+        DomainVerb::Disable { domain } => set_enabled(cli, domain, false),
+    }
+}
+
+fn set_enabled(cli: &Cli, domain: &str, on: bool) -> anyhow::Result<u8> {
+    let mut conn = open_write(cli)?;
+    apply(cli, &mut conn, |tx| {
+        repo::set_inbound_enabled(tx, domain, on)
+    })?;
+    if !cli.json {
+        let d = domain.to_ascii_lowercase();
+        if on {
+            println!("{d} will accept mail once DNS validation passes.");
+        } else {
+            println!("{d} will refuse mail. Its DNS state is unchanged.");
+        }
+        note_reload(cli);
+    }
+    Ok(exit::OK)
+}
+
+fn domains_list(cli: &Cli) -> anyhow::Result<u8> {
+    let conn = open_read(cli)?;
+    let domains = repo::list_domains(&conn)?;
+
+    if cli.json {
+        let rows: Vec<_> = domains
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "domain": d.name,
+                    "status": d.status,
+                    "inbound_enabled": d.inbound_enabled,
+                    "aliases": d.aliases,
+                    "catchall": d.catchall,
+                    "default_destination": d.default_destination,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "format_version": 1, "domains": rows })
+        );
+        return Ok(exit::OK);
+    }
+
+    if domains.is_empty() {
+        println!("No domains yet.\n\n  pigeon domain add example.com --to you@example.net");
+        return Ok(exit::OK);
+    }
+
+    println!(
+        "{:<28} {:<12} {:>8}  {:<9} DEFAULT",
+        "DOMAIN", "STATUS", "ALIASES", "CATCH-ALL"
     );
-    // 1: command or configuration error (CLI.md, exit codes).
-    std::process::ExitCode::from(1)
+    for d in &domains {
+        let status = if d.inbound_enabled {
+            d.status.clone()
+        } else {
+            format!("{} (off)", d.status)
+        };
+        println!(
+            "{:<28} {:<12} {:>8}  {:<9} {}",
+            d.name,
+            status,
+            d.aliases,
+            if d.catchall { "yes" } else { "no" },
+            d.default_destination.as_deref().unwrap_or("-")
+        );
+    }
+    Ok(exit::OK)
+}
+
+// ------------------------------------------------------------------ aliases
+
+fn alias(cli: &Cli, verb: &AliasVerb) -> anyhow::Result<u8> {
+    match verb {
+        AliasVerb::List { domain } => {
+            let conn = open_read(cli)?;
+            let aliases = repo::list_aliases(&conn, domain)?;
+            let summary = repo::list_domains(&conn)?;
+            let d = summary
+                .iter()
+                .find(|d| d.name == domain.to_ascii_lowercase());
+            let default = d.and_then(|d| d.default_destination.clone());
+
+            if cli.json {
+                let rows: Vec<_> = aliases
+                    .iter()
+                    .map(|a| {
+                        serde_json::json!({
+                            "pattern": a.pattern,
+                            "reject": a.reject,
+                            "inherits": !a.reject && a.destinations.is_empty(),
+                            "destinations": a.destinations,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "format_version": 1,
+                        "domain": domain.to_ascii_lowercase(),
+                        "aliases": rows,
+                    })
+                );
+                return Ok(exit::OK);
+            }
+
+            if aliases.is_empty() {
+                println!("No aliases on {}.", domain.to_ascii_lowercase());
+                return Ok(exit::OK);
+            }
+
+            println!("{:<24} DESTINATION", "ALIAS");
+            for a in &aliases {
+                let to = if a.reject {
+                    "—                        REJECT".to_string()
+                } else if a.destinations.is_empty() {
+                    match &default {
+                        Some(d) => format!("{d}  (domain default)"),
+                        // Refused by the snapshot, so it cannot be live — but it
+                        // can be seen through a read command on a database the
+                        // daemon has not accepted.
+                        None => "(inherits, and the domain has no default)".to_string(),
+                    }
+                } else {
+                    a.destinations.join(", ")
+                };
+                println!("{:<24} {}", a.pattern, to);
+            }
+            Ok(exit::OK)
+        }
+
+        AliasVerb::Add {
+            domain,
+            names: raw,
+            to,
+            reject,
+        } => {
+            let mut conn = open_write(cli)?;
+            let patterns = names(raw);
+            if patterns.is_empty() {
+                anyhow::bail!("no alias names given");
+            }
+            let destinations = match to {
+                Some(t) => addresses(t)?,
+                None => Vec::new(),
+            };
+            if *reject && !destinations.is_empty() {
+                anyhow::bail!(
+                    "--reject and --to cannot be used together: a reject rule refuses an address rather than forwarding it"
+                );
+            }
+            let kind = if *reject {
+                AliasKind::Reject
+            } else {
+                AliasKind::Forward
+            };
+
+            let outcome = apply(cli, &mut conn, |tx| {
+                for p in &patterns {
+                    repo::add_alias(tx, domain, p, kind, &destinations)?;
+                }
+                Ok(())
+            })?;
+
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "format_version": 1,
+                        "domain": domain.to_ascii_lowercase(),
+                        "added": patterns,
+                        "reject": reject,
+                        "destinations": to,
+                    })
+                );
+            } else {
+                let d = domain.to_ascii_lowercase();
+                println!("Added to {d}:\n");
+                for p in &patterns {
+                    let target = if *reject {
+                        "REJECT".to_string()
+                    } else if destinations.is_empty() {
+                        "domain default".to_string()
+                    } else {
+                        destinations
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    println!("  {}@{d}  ->  {target}", p.to_ascii_lowercase());
+                }
+                print_reports(cli, &outcome.reports);
+                note_reload(cli);
+            }
+            Ok(exit::OK)
+        }
+
+        AliasVerb::Remove {
+            domain,
+            names: raw,
+            all,
+            yes,
+        } => {
+            let mut conn = open_write(cli)?;
+
+            if *all {
+                let existing = repo::list_aliases(&conn, domain)?;
+                if !yes && !cli.dry_run {
+                    println!(
+                        "This removes all {} aliases on {}.\n\nRe-run with --yes to confirm.",
+                        existing.len(),
+                        domain.to_ascii_lowercase()
+                    );
+                    return Ok(exit::USAGE);
+                }
+                let outcome = apply(cli, &mut conn, |tx| repo::remove_all_aliases(tx, domain))?;
+                if !cli.json {
+                    println!("Removed {} aliases.", outcome.value);
+                    note_reload(cli);
+                }
+                return Ok(exit::OK);
+            }
+
+            let Some(raw) = raw else {
+                anyhow::bail!(
+                    "name the aliases to remove, or pass --all\n\n  \
+                     --all is a flag rather than '*' or the word 'all' because both are \
+                     real alias names."
+                );
+            };
+            let patterns = names(raw);
+            let outcome = apply(cli, &mut conn, |tx| {
+                let mut removed = 0;
+                for p in &patterns {
+                    if repo::remove_alias(tx, domain, p)? {
+                        removed += 1;
+                    }
+                }
+                Ok(removed)
+            })?;
+
+            if !cli.json {
+                println!("Removed {} of {}.", outcome.value, patterns.len());
+                if outcome.value < patterns.len() {
+                    println!("  The rest did not exist.");
+                }
+                note_reload(cli);
+            }
+            Ok(exit::OK)
+        }
+    }
+}
+
+// --------------------------------------------------------------- catch-all
+
+fn catchall(cli: &Cli, verb: &CatchallVerb) -> anyhow::Result<u8> {
+    match verb {
+        CatchallVerb::Add { domain, to } => {
+            let mut conn = open_write(cli)?;
+            let dest = to.as_deref().map(Address::parse).transpose()?;
+            let outcome = apply(cli, &mut conn, |tx| {
+                repo::set_catchall(tx, domain, dest.as_ref())
+            })?;
+
+            if !cli.json {
+                let d = domain.to_ascii_lowercase();
+                match to {
+                    Some(t) => println!("Catch-all enabled on {d}: -> {t}"),
+                    None => println!("Catch-all enabled on {d}, forwarding to the domain default."),
+                }
+                println!(
+                    "\nEvery address on {d} is now accepted at RCPT TO, so recipient rejection \
+                     no longer applies and dictionary attacks get 250 rather than 550."
+                );
+                print_reports(cli, &outcome.reports);
+                note_reload(cli);
+            }
+            Ok(exit::OK)
+        }
+        CatchallVerb::Remove { domain } => {
+            let mut conn = open_write(cli)?;
+            apply(cli, &mut conn, |tx| repo::clear_catchall(tx, domain))?;
+            if !cli.json {
+                println!(
+                    "Catch-all removed from {}. Unmatched addresses are refused again.",
+                    domain.to_ascii_lowercase()
+                );
+                note_reload(cli);
+            }
+            Ok(exit::OK)
+        }
+    }
+}
+
+// ------------------------------------------------------------ destinations
+
+fn destination_list(cli: &Cli) -> anyhow::Result<u8> {
+    let conn = open_read(cli)?;
+    let all = repo::list_destinations(&conn)?;
+
+    if cli.json {
+        let rows: Vec<_> = all
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "destination": d.address.to_string(),
+                    "aliases": d.aliases,
+                    "domains": d.domains,
+                    "default_for": d.default_for,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "format_version": 1, "destinations": rows })
+        );
+        return Ok(exit::OK);
+    }
+
+    if all.is_empty() {
+        println!("Nothing forwards anywhere yet.");
+        return Ok(exit::OK);
+    }
+
+    println!(
+        "{:<32} {:>8} {:>9} {:>12}",
+        "DESTINATION", "ALIASES", "DOMAINS", "DEFAULT FOR"
+    );
+    for d in &all {
+        println!(
+            "{:<32} {:>8} {:>9} {:>12}",
+            d.address.to_string(),
+            d.aliases,
+            d.domains,
+            if d.default_for == 0 {
+                "-".to_string()
+            } else {
+                d.default_for.to_string()
+            }
+        );
+    }
+    Ok(exit::OK)
+}
+
+fn destination(cli: &Cli, verb: &DestinationVerb) -> anyhow::Result<u8> {
+    let DestinationVerb::Replace {
+        old,
+        new,
+        domain,
+        yes,
+    } = verb
+    else {
+        return destination_list(cli);
+    };
+
+    let mut conn = open_write(cli)?;
+    let old_addr = Address::parse(old)?;
+    let new_addr = Address::parse(new)?;
+
+    // Preview first, always. This runs the real mutation and rolls it back, so
+    // the count is of what would actually move rather than of a model of it.
+    let preview = pigeon_route::preview(&mut conn, |tx| {
+        repo::replace_destination(tx, &old_addr, &new_addr, domain.as_deref())
+    })?;
+
+    if preview.value == 0 {
+        println!("Nothing forwards to {old}.");
+        return Ok(exit::OK);
+    }
+
+    if !yes && !cli.dry_run {
+        println!(
+            "This repoints {} reference(s) from {old} to {new}{}.\n\nRe-run with --yes to confirm.",
+            preview.value,
+            match domain {
+                Some(d) => format!(" on {d}"),
+                None => String::new(),
+            }
+        );
+        return Ok(exit::USAGE);
+    }
+    if cli.dry_run {
+        println!("Would repoint {} reference(s).", preview.value);
+        return Ok(exit::OK);
+    }
+
+    let outcome = apply(cli, &mut conn, |tx| {
+        repo::replace_destination(tx, &old_addr, &new_addr, domain.as_deref())
+    })?;
+    if !cli.json {
+        println!("Repointed {} reference(s).", outcome.value);
+        note_reload(cli);
+    }
+    Ok(exit::OK)
+}
+
+// ------------------------------------------------------------------- route
+
+fn route_inbound(cli: &Cli, address: &str) -> anyhow::Result<u8> {
+    use pigeon_route::{Decision, Snapshot};
+
+    let conn = open_read(cli)?;
+    let built = Snapshot::build(pigeon_route::load(&conn)?)
+        .map_err(pigeon_route::MutationError::Invalid)?;
+    let parsed = pigeon_types::Address::parse(address)
+        .map_err(|e| anyhow::anyhow!("{address:?} is not a valid address: {e}"))?;
+
+    // The same function the daemon calls. A second implementation here is how a
+    // prediction and the behaviour it predicts drift apart.
+    let decision = built.snapshot.resolve(&parsed);
+
+    if cli.json {
+        let (result, tier, matched, destinations) = match &decision {
+            Decision::Forward {
+                tier,
+                matched,
+                destinations,
+            } => (
+                "accept",
+                Some(format!("{tier:?}")),
+                Some(matched.to_string()),
+                destinations.iter().map(ToString::to_string).collect(),
+            ),
+            Decision::Reject { tier, matched } => (
+                "reject",
+                Some(format!("{tier:?}")),
+                Some(matched.to_string()),
+                Vec::new(),
+            ),
+            Decision::NoRoute => ("reject", None, None, Vec::new()),
+            Decision::UnknownDomain => ("unknown_domain", None, None, Vec::new()),
+            Decision::DomainNotAccepting => ("domain_not_accepting", None, None, Vec::new()),
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "format_version": 1,
+                "address": address,
+                "result": result,
+                "tier": tier,
+                "matched": matched,
+                "destinations": destinations,
+            })
+        );
+        return Ok(if decision.accepts() {
+            exit::OK
+        } else {
+            exit::USAGE
+        });
+    }
+
+    println!("{address}");
+    println!("      |");
+    println!("{}", parsed.domain());
+    match &decision {
+        Decision::Forward {
+            tier,
+            matched,
+            destinations,
+        } => {
+            println!("      |");
+            println!("{}", describe(*tier, matched));
+            println!("      |");
+            for d in *destinations {
+                println!("{d}");
+            }
+            println!("\nACCEPT");
+        }
+        Decision::Reject { tier, matched } => {
+            println!("      |");
+            println!("{}", describe(*tier, matched));
+            println!("\nREJECT\n\nReason:\n  the rule refuses this address");
+        }
+        Decision::NoRoute => {
+            println!("\nREJECT\n\nReason:\n  no alias matched\n  catch-all disabled");
+        }
+        Decision::UnknownDomain => {
+            println!(
+                "\nREJECT\n\nReason:\n  this Pigeon does not carry {}",
+                parsed.domain()
+            );
+        }
+        Decision::DomainNotAccepting => {
+            println!(
+                "\nREJECT\n\nReason:\n  {} is not accepting mail: it has not passed DNS \
+                 validation, or it is switched off",
+                parsed.domain()
+            );
+        }
+    }
+
+    // The M1 exit criterion is that this exactly predicts runtime routing, and
+    // it does not yet, because the daemon does not route from this table. Said
+    // here rather than only in a document, because this is where somebody
+    // would rely on it.
+    eprintln!(
+        "\nNote: pigeond does not yet route from this table — acceptance still comes from \
+         PIGEON_ACCEPT and delivery from PIGEON_FORWARD_TO. This predicts the control plane, \
+         not the running daemon. See docs/ROADMAP.md."
+    );
+
+    Ok(if decision.accepts() {
+        exit::OK
+    } else {
+        exit::USAGE
+    })
+}
+
+fn describe(tier: pigeon_route::Tier, matched: &str) -> String {
+    use pigeon_route::Tier;
+    match tier {
+        Tier::ExactFull | Tier::ExactBase => format!("alias: {matched}"),
+        Tier::Wildcard => format!("wildcard: {matched}"),
+        Tier::CatchAll => "catch-all".to_string(),
+    }
+}
+
+// -------------------------------------------------------------------- help
+
+fn print_overview() {
+    println!(
+        r#"Pigeon — self-hosted email forwarding.
+
+USAGE
+  pigeon <command> [options]
+
+SETUP
+  domain      add and configure a domain
+  alias       forward an address to a mailbox
+  catchall    forward everything else
+  destination where your mail lands, across all domains
+
+INSPECT
+  route       trace where an address would go
+  domains     act on every domain at once
+
+  pigeon <command> --help   for detail on any of these
+
+Getting started:
+
+  pigeon domain add example.com --to you@example.net
+  pigeon alias add example.com hello,hi,support
+  pigeon route inbound hello@example.com"#
+    );
+}
+
+fn print_help(noun: &str) {
+    match noun {
+        "domain" => println!(
+            r#"Add and configure a domain.
+
+USAGE
+  pigeon domain <verb> <domain> [arguments]
+
+VERBS
+  add        add a domain
+  remove     delete a domain and everything under it
+  show       status, destination and alias count
+  forward    set where this domain's mail goes by default
+  enable     allow this domain to receive mail
+  disable    stop this domain receiving mail
+
+EXAMPLES
+  pigeon domain add example.com --to me@example.net
+  pigeon domain show example.com
+  pigeon domain forward example.com new@example.net
+  pigeon domain disable example.com
+
+SEE ALSO
+  pigeon domains     act on every domain
+  pigeon alias       forwarding rules for a domain"#
+        ),
+        "alias" => println!(
+            r#"Forward an address to a mailbox.
+
+USAGE
+  pigeon alias <verb> <domain> [names] [options]
+
+VERBS
+  list       forwarding rules on a domain
+  add        add one or more aliases
+  remove     remove one or more aliases
+
+Names are comma-separated, so several aliases are one command. Omit --to
+and the alias inherits the domain default, which is what makes changing
+that default move all of them at once.
+
+Patterns take at most one '*', and the most specific rule wins:
+
+  exact alias  ->  wildcard  ->  catch-all  ->  reject unknown
+
+EXAMPLES
+  pigeon alias add example.com hello,hi,support
+  pigeon alias add example.com billing --to finance@example.net
+  pigeon alias add example.com 'shop-*'
+  pigeon alias add example.com postmaster-old --reject
+  pigeon alias remove example.com hello
+  pigeon alias remove example.com --all"#
+        ),
+        "catchall" => println!(
+            r#"Forward everything no alias claims.
+
+USAGE
+  pigeon catchall <verb> <domain> [options]
+
+VERBS
+  add        forward unmatched addresses
+  remove     stop forwarding them
+
+Catch-all is never enabled implicitly. With it on, every address on the
+domain is accepted at RCPT TO, so recipient rejection stops applying and
+dictionary attacks receive 250 rather than 550.
+
+EXAMPLES
+  pigeon catchall add example.com
+  pigeon catchall add example.com --to me@example.net
+  pigeon catchall remove example.com"#
+        ),
+        "route" => println!(
+            r#"Trace where an address would go, without sending anything.
+
+USAGE
+  pigeon route inbound <address>
+
+EXAMPLES
+  pigeon route inbound hello@example.com
+  pigeon route inbound unknown@example.com --json"#
+        ),
+        _ => print_overview(),
+    }
 }

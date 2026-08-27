@@ -10,11 +10,15 @@ authors.workspace      = true
 publish.workspace      = true
 
 [dependencies]
+clap = { workspace = true }
 pigeon-types = { workspace = true }
+pigeon-route = { workspace = true }
+rusqlite = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
 pigeon-config = { workspace = true }
 pigeon-db = { workspace = true }
 pigeon-dns = { workspace = true }
-pigeon-route = { workspace = true }
 
 [[bin]]
 name = "pigeon"
