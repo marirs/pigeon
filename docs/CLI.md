@@ -499,8 +499,14 @@ Catching this at configuration time matters because the runtime symptom is nothi
 Precedence, highest first:
 
 ```text
-reject  →  exact alias  →  wildcard (longest match)  →  catch-all  →  reject unknown
+exact alias  →  wildcard (most literal characters)  →  catch-all  →  reject unknown
 ```
+
+The most specific matching rule wins, and whether that rule forwards or rejects
+is then its own business. So a reject rule refuses everything that no *more
+specific* rule claims — `hell*` set to reject does not disable an explicit
+`hello` alias. An address that must never be accepted under any circumstances is
+written as an exact reject, which nothing outranks.
 
 Plus-addressing is on by default per domain. `hello+github@example.com` matches the `hello` alias and the tag survives into the forwarded message.
 

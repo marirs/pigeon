@@ -83,16 +83,21 @@ Loads an immutable routing snapshot from SQLite.
 For inbound recipients:
 
 ```text
-explicit reject
-    ↓
 exact alias
     ↓
-wildcard alias (longest match wins)
+wildcard alias (most literal characters wins)
     ↓
 catch-all
     ↓
 unknown recipient reject
 ```
+
+The most specific matching rule wins, and that rule's kind — forward or reject —
+decides the outcome. Reject is not a tier above the others: one pattern has
+exactly one rule, so no two rules of equal specificity can both match, and a
+wildcard reject must not silently disable an address the operator named
+explicitly. An address that must never be accepted is written as an exact rule,
+which wins here. See `M1-SNAPSHOT.md` §2.
 
 For outbound submission:
 

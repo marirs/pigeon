@@ -50,7 +50,8 @@ and domains are stored and received as A-labels (C6).
 
 ## 2. Precedence
 
-The documented chain is:
+The chain as originally documented, now corrected in `ARCHITECTURE.md` §2.3 and
+`CLI.md` following review:
 
 ```text
 reject  →  exact alias  →  wildcard (longest match)  →  catch-all  →  reject unknown
@@ -85,24 +86,49 @@ anyway.
 This narrows what `reject` guarantees, so it must be said in the CLI: a reject
 rule refuses everything no *more specific* rule claims.
 
-**`ARCHITECTURE.md` §2.3 and `CLI.md` both need the diagram corrected.**
+**Approved in review. Both diagrams are corrected, and `CLI.md` now states the
+narrowed guarantee: a reject rule refuses everything no more specific rule
+claims.**
 
 ### Ties inside the wildcard tier
 
 "Longest match" is not a total order — `a*c` and `ab*` both match `abc` and are
-both three characters. An undefined tie means the same configuration can route
-differently between runs, which is the worst possible failure to debug.
+both three characters.
 
-Total order, applied in sequence:
+**A deterministic tie-break makes an ambiguous configuration repeatable, not
+correct.** Picking one bytewise still means the operator wrote two rules, one of
+them silently never applies, and nothing said so. So determinism is the fallback
+and not the answer:
 
-1. longer pattern wins
-2. then more literal (non-`*`) characters wins
-3. then bytewise smaller pattern wins
+- **Two equal-precedence wildcards that overlap and route differently block
+  publication** (§7). The configuration has no right answer and Pigeon does not
+  invent one.
+- **Two that overlap and route identically are reported as redundant**, in the
+  same spirit as a redundant alias against a catch-all: a fact about the
+  configuration rather than an error.
 
-The third rule is arbitrary and exists only to be total. It is documented as
-arbitrary so nobody later reasons from it. Validation *reports* overlapping
-wildcards of equal precedence as an ambiguity worth resolving, without blocking
-(§7).
+Overlap between two one-star patterns `p₁*s₁` and `p₂*s₂` is exact and cheap to
+decide: they overlap when one prefix is a prefix of the other *and* one suffix
+is a suffix of the other. The `*` absorbs any length, so whenever both ends are
+compatible a witness exists — `p_longer` + filler + `s_longer`. No search, no
+approximation.
+
+Only equal precedence matters. `shop-*` and `shop-old-*` overlap too, and that
+is exactly what the precedence order is for.
+
+Where the order is still needed — ranking non-overlapping candidates against one
+address:
+
+1. more literal (non-`*`) characters wins
+2. then bytewise smaller pattern wins
+
+The first draft ranked by pattern length and *then* literal count. With exactly
+one `*` those are the same number: literal count is always length minus one, so
+the second criterion could never break a tie the first had not already broken.
+Two rules where one was unreachable.
+
+The bytewise rule is arbitrary and exists only to make the order total for the
+cases §7 permits. It is documented as arbitrary so nobody later reasons from it.
 
 ---
 
@@ -115,9 +141,9 @@ catastrophic backtracking.
 **Exactly one `*`, matching zero or more characters, anywhere in the pattern.
 No `?`. No character classes. No escape.**
 
-One `*` is not a stylistic limit; it is what makes the matcher structurally
-incapable of backtracking. A pattern splits once into prefix and suffix, and a
-candidate matches when:
+One `*` is a deliberately smaller grammar, chosen for the matcher and the
+precedence order rather than for safety. A pattern splits once into prefix and
+suffix, and a candidate matches when:
 
 ```text
 candidate.len() >= prefix.len() + suffix.len()
@@ -125,9 +151,17 @@ candidate.len() >= prefix.len() + suffix.len()
     && candidate.ends_with(suffix)
 ```
 
-That is linear with no branch on input shape. With two `*` it becomes a search
-with backtracking — bounded for globs, but bounded by an argument rather than by
-construction, and this is a path reachable by any anonymous sender.
+Ten lines, no state, and — the part that actually decides it — an overlap test
+between two patterns that is exact rather than approximate (§2). With several
+stars, deciding whether two patterns can ever match the same address stops being
+a prefix-and-suffix comparison, and the ambiguity rule in §7 becomes something
+Pigeon can only guess at.
+
+An earlier draft justified this as preventing catastrophic backtracking. That
+was wrong and worth recording as wrong: a multi-star glob matcher runs linearly
+with a two-pointer scan and needs no backtracking at all. The argument sounded
+like a security property, which is the most expensive kind of comment to leave
+standing — the next reader takes it as checked.
 
 Consequences, both accepted:
 
@@ -149,45 +183,55 @@ local part.
 
 ## 4. Plus-address stripping order
 
-The order is load-bearing, and the obvious one is wrong.
+The order is load-bearing, and every obvious version of it is wrong in a
+different way.
 
 Stripping before matching means `hello+github@` can never have its own alias.
-Matching the full local part first means that on a catch-all domain, every
-tagged address hits the catch-all before the alias it belongs to — because
-catch-all matches everything, and it would be reached on the first pass.
+Matching the full local part first, all the way down, means that on a catch-all
+domain every tagged address hits the catch-all before the alias it belongs to —
+catch-all matches everything, so it is reached on the first pass.
 
-So neither "strip first" nor "full first" works alone:
+An intermediate draft gave the full local part one chance at the exact tier and
+then used the base for everything after. That fixed both of the above and broke
+something else: **`hello+*` could never match `hello+github`.** The wildcard tier
+only ever saw `hello`, which does not start with `hello+`, so a wildcard written
+specifically for tagged addresses matched nothing at all. Verified before
+correcting it — the pattern's prefix is six characters and the key it was tested
+against was five.
+
+The order that holds all three:
 
 ```text
-1. exact alias for the FULL local part            -> if it matches, done
-2. if plus_addressing and the local has a tag, strip it
-3. exact alias  ->  wildcard, longest  ->  catch-all   on the resulting key
-4. reject unknown
+1. exact alias, FULL local part
+2. exact alias, BASE local part        (only if a tag was stripped)
+3. wildcards matching EITHER form, ranked once by §2 precedence
+4. catch-all
+5. reject unknown
 ```
 
-The full local part gets exactly one chance, at the exact tier. Everything after
-that uses the base. That gives both properties: a dedicated alias for a tagged
-address is possible, and a tagged address on a catch-all domain still reaches
-the alias its base names.
+Both exact lookups precede every wildcard, so exact-over-wildcard survives. Both
+forms are offered to the wildcard tier, so a tagged wildcard works. Catch-all is
+not reached until both forms have been considered everywhere else, so tagged
+mail on a catch-all domain still finds its alias.
 
-When nothing is stripped — no tag, or `plus_addressing` off — step 1 and step 3's
-exact lookup are the same lookup and happen once. The two steps are written
-separately because they answer different questions, not because the work is
-done twice.
+Step 3 ranks the union: every wildcard that matches the full form *or* the base
+form competes in one ordering, and the §2 comparison decides. Ranking the two
+forms separately would make "the full form is tried first" a hidden fourth
+precedence rule.
 
-Details that follow from `Address::local_without_tag`, which already exists:
+Details, all from `Address::local_without_tag`, which already exists:
 
 - The split is on the **first** `+`, so `hello+a+b` has base `hello`.
 - A leading `+` is a real local part, not an empty base: `+tag@` has base
   `+tag` and is unchanged. Already tested in `pigeon-types`.
 - `hello+@` has base `hello`.
-- `plus_addressing` is per domain and defaults on.
+- `plus_addressing` is per domain and defaults on. With it off, or with no `+`
+  present, there is no base form and steps 1 and 3 see only the full local part.
 
-**Routing uses the base; delivery keeps the original.** The tag survives into
+**Routing uses these forms; delivery keeps the original.** The tag survives into
 the forwarded message so the destination mailbox can still filter on it
-(README). The snapshot therefore returns the *rule that matched*, never a
-rewritten address — anything that rewrote the recipient here would silently
-delete the tag.
+(README). The snapshot returns the *rule that matched*, never a rewritten
+address — anything rewriting the recipient here would silently delete the tag.
 
 ---
 
@@ -223,33 +267,50 @@ for `domain forward`'s preview, not a property the snapshot needs to carry.
 Ruled in review: in memory, against the post-mutation snapshot, built but not
 installed, before the write commits.
 
-The walk is over concrete addresses, which is what makes it terminate:
+The walk is over concrete addresses, which is what makes it terminate.
+Destinations are fixed addresses rather than functions of the input, so every
+step resolves a concrete address and the reachable set is finite. Wildcard and
+catch-all chains need no pattern intersection: a wildcard is only ever asked
+whether it matches a concrete address, which it answers exactly.
+
+**Depth-first, with a path-local set — not a global one.**
 
 ```text
-for each destination D in the proposed snapshot:
-    while D's domain is managed here:
-        resolve D through the snapshot          (D is concrete; wildcards match it)
-        if the resolved rule is a reject or no rule matches: stop, no loop
-        if (domain, local) already visited on this walk: LOOP
-        follow each destination of the matched rule
+visit(node, on_path, finished):
+    if node in on_path:   LOOP, and on_path is the cycle to report
+    if node in finished:  return            -- already proved acyclic
+    on_path.insert(node)
+    for each destination D of the rule matching node:
+        if D's domain is managed here: visit(D, on_path, finished)
+    on_path.remove(node)
+    finished.insert(node)
 ```
 
-Destinations are fixed addresses rather than functions of the input, so every
-step resolves a concrete address and the set of reachable addresses is finite.
-Wildcard and catch-all chains are covered without pattern intersection: a
-wildcard is only ever asked whether it matches a concrete address, which it can
-answer exactly. `a-*@x → a-1@y` and `a-*@y → a-1@x` is found on the third step.
+Two sets, doing different jobs. `on_path` is the recursion stack and is what
+detects a cycle. `finished` is memoisation and only ever prevents repeated work.
 
-Two decisions inside it:
+A single global visited set would be wrong, not merely slow: a diamond —
+`a → b`, `a → c`, `b → d`, `c → d` — reaches `d` twice by different routes with
+no cycle anywhere. A global set reports the second arrival as a loop and refuses
+a configuration that is perfectly valid. Fanning one alias out to several
+destinations is an advertised feature (`alias add example.com security --to
+a@…,b@…`), so diamonds are ordinary rather than exotic. There is a test for
+exactly this shape (§9).
+
+Fan-out is explicit above: a rule has a *list* of destinations and every one is
+followed.
+
+Two further decisions:
 
 - **Enablement is ignored.** A loop through a domain that is currently disabled
-  or DNS-gated is still a loop, and it will start looping the moment the domain
-  comes back — at which point nobody is looking for a configuration change,
-  because there was not one. Loops are a structural property of the
-  configuration, not of its current runtime state.
-- **A hop limit backstops the visited set.** The visited set is the real
-  mechanism; the limit exists because a bug in it should end a build rather
-  than a process.
+  or DNS-gated is still a loop, and it starts looping the moment the domain
+  returns — at which point nobody is looking for a configuration change, because
+  there was not one. Loops are structural.
+- **The backstop is derived, not fixed.** A constant hop limit rejects a valid
+  deep configuration, which is a bug that looks like a policy. The bound is the
+  number of concrete nodes in the graph: with a correct `on_path` set, no walk
+  can visit more nodes than exist without repeating one. Exceeding it therefore
+  proves an implementation error rather than an operator error, and says so.
 
 Delivery-time loop detection stays as the backstop for chains that leave and
 re-enter through systems Pigeon cannot see — the `Received:` hop count, already
@@ -273,14 +334,19 @@ Blocking:
 | Catch-all enabled with no effective destination | Accepts every address on the domain and routes none |
 | Routing loop | The answer does not terminate |
 | Destination that fails `Address::parse` | Not a deliverable address |
-| Pattern that fails the §3 grammar | No defined match |
+| Wildcard pattern that fails the §3 grammar | No defined match |
+| Exact pattern that is not a valid local part | Cannot be the left side of an address, so no message can ever match it |
+| Managed domain name that is not a valid normalised A-label | Cannot be compared against an incoming domain that always is |
+| Two equal-precedence wildcards that overlap and route differently | §2 — there is no right answer and Pigeon must not invent one |
 | `domain.status` the binary does not recognise | `DomainStatus::from_stored` returns `None`; guessing would either gate a live domain or ungate a broken one |
 
 Non-blocking, reported:
 
 - An alias whose destinations equal the catch-all's — redundant, and meaningful
   again the moment the catch-all destination changes (`CLI.md`).
-- Wildcards that overlap at equal precedence (§2).
+- Two equal-precedence wildcards that overlap and route *identically* —
+  redundant rather than ambiguous. One of them never applies, and which one is
+  arbitrary, but nothing routes anywhere unexpected.
 - A domain that is `active` with `inbound_enabled = 0` — deliberate, and worth
   saying out loud because it looks like a fault.
 
@@ -307,12 +373,23 @@ A reader clones the `Arc` out under the read lock and then works on its own
 handle. The critical section is one atomic increment, so contention is not a
 consideration at this scale and `arc-swap` is not worth a dependency.
 
-**A session pins its `Arc` for the whole transaction, and that is correctness
-rather than performance.** `RCPT TO` accepts a recipient against the routing
-table; the forwarding decision uses it again later. If a reload landed in
-between, a message could be accepted under one configuration and delivered
-under another — which for a recipient that was removed means accepting mail and
-then having nowhere to put it, and Pigeon keeps no copy.
+**The `Arc` is pinned per mail transaction, not per connection.**
+
+A transaction is `MAIL FROM` through the end of `DATA`, or through `RSET` —
+which is also exactly the span over which a routing decision has to stay
+consistent. `RCPT TO` accepts a recipient against the routing table and the
+forwarding decision uses it again later; if a reload landed in between, a
+message could be accepted under one configuration and delivered under another,
+which for a removed recipient means accepting mail with nowhere to put it, and
+Pigeon keeps no copy.
+
+Pinning for the *connection* would be a different and worse thing. The session
+cap is an hour and a client may send many messages inside it, so a connection
+opened before a reload would keep routing against a configuration the operator
+has already replaced — indefinitely, from their point of view, with no way to
+tell which connections are stale. The snapshot is therefore taken at `MAIL FROM`
+and released at the end of that transaction; the next `MAIL FROM` on the same
+connection takes a fresh one.
 
 Publication order for a mutation:
 
@@ -354,6 +431,12 @@ Every mutation below must turn at least one test red:
 | Two `*` permitted in a pattern | §3 no-backtracking |
 | Tag stripped before the exact-full lookup | §4 — a tagged address loses its own alias |
 | Full local matched against catch-all before the base | §4 — tagged mail hits catch-all on a catch-all domain |
+| Wildcard tier shown only the base form | §4 — `hello+*` never matches `hello+github`, the bug review caught |
+| Ambiguous equal-precedence wildcards published instead of blocked | §2, §7 — a rule the operator wrote never applies and nothing says so |
+| Loop detection using one global visited set | §6 — a valid diamond is refused as a loop |
+| Backstop made a fixed constant | §6 — a deep but acyclic configuration is refused |
+| Exact pattern accepted without local-part validation | §7 |
+| Managed domain accepted without A-label validation | §7 |
 | Inheritance resolved to the wrong domain's default | §5 |
 | Loop detection stops at depth 1 | §6 — two-hop cycle |
 | Loop detection skips disabled domains | §6 |
@@ -379,6 +462,9 @@ addresses, invariants that must hold whatever the shape:
 - if any rule matches, the result is never `reject unknown`
 - resolving the same address twice gives the same answer
 - a domain with `accepts_inbound() == false` never resolves anything
+- a configuration that builds has no equal-precedence wildcard ambiguity, and
+  one that has any does not build
+- every accepted configuration is acyclic, and a diamond is accepted
 
 ---
 
