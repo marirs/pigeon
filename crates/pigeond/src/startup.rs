@@ -11,23 +11,27 @@
 //! 4  run migrations
 //! 5  cross-check config against schema
 //! 6  prepare the spool
-//! 7  build the routing snapshot     <- not yet; see below
+//! 7  build the routing snapshot
 //! 8  bind listeners
 //! 9  serve
 //! ```
 //!
-//! Steps 1 to 6 live here. Binding and serving belong to the caller, because
+//! Steps 1 to 7 live here. Binding and serving belong to the caller, because
 //! this function's contract is "everything that can refuse to start has
 //! refused" and a bound socket is not part of that.
 //!
-//! # Step 7 does not exist yet
+//! # Step 7 is where the routing rules are enforced
 //!
-//! The routing snapshot is the enforcement point for every invariant SQLite
-//! cannot express (`M1-SCHEMA.md` S-2), and it is not written. Until it is,
-//! there are no repositories and no mutating commands — a write that cannot be
-//! validated against a proposed snapshot has nothing validating it, so building
-//! the thing that creates invalid rows before the thing that refuses them would
-//! be the wrong order.
+//! `Snapshot::build` is the enforcement point for every invariant SQLite cannot
+//! express (`M1-SCHEMA.md` S-2): a reject rule that also forwards, an alias
+//! inheriting a default that does not exist, ambiguous wildcards, a forwarding
+//! loop. A configuration that fails it is not published, and at startup that
+//! aborts — it is local and unambiguous.
+//!
+//! Its non-fatal findings are reported rather than swallowed. An alias made
+//! redundant by a catch-all still routes correctly; a domain that passes every
+//! DNS check and is switched off refuses mail on purpose and looks exactly like
+//! a fault.
 //!
 //! # Two kinds of failure
 //!
@@ -39,6 +43,7 @@ use std::path::{Path, PathBuf};
 
 use pigeon_config::{Checked, Config, ConfigError};
 use pigeon_db::{Applied, DbError};
+use pigeon_route::Snapshot;
 use rusqlite::Connection;
 
 /// Everything steps 1 to 6 produced.
@@ -46,6 +51,8 @@ pub struct Started {
     pub config: Checked,
     pub db: Connection,
     pub migration: Applied,
+    /// The validated routing table. Nothing else can produce one.
+    pub snapshot: Snapshot,
     /// Non-fatal findings, in the order they were made.
     ///
     /// Remote state only. Anything local that is wrong is an error, not an
@@ -85,6 +92,16 @@ pub enum StartupError {
     )]
     AlertIdentityIsManaged { identity: String, domain: String },
 
+    #[error("cannot read the routing configuration: {0}")]
+    Load(#[from] pigeon_route::LoadError),
+
+    #[error(
+        "the routing configuration is not usable: {0}\n\nNothing was published. \
+         Mail is not being accepted, because a routing table that cannot answer \
+         correctly is worse than one that is missing."
+    )]
+    Routing(#[from] pigeon_route::BuildError),
+
     #[error("spool {path} is unusable: {source}")]
     Spool {
         path: PathBuf,
@@ -122,8 +139,8 @@ where
     check_alert_identity(&db, &config)?;
     warn_about_hostname(&config.hostname, &mut warnings);
 
-    // 6. Last, because a spool probe is the most expensive check and there is
-    // no point paying for it if the database was going to refuse anyway.
+    // 6. Before the snapshot, because a spool probe is cheap next to reading
+    // and validating every routing rule, and both abort.
     prepare_spool(config.spool.clone())
         .await
         .map_err(|source| StartupError::Spool {
@@ -131,10 +148,18 @@ where
             source,
         })?;
 
+    // 7. The enforcement boundary. Loading transcribes rows and decides
+    // nothing; `build` is where every rule about a valid configuration lives.
+    let built = Snapshot::build(pigeon_route::load(&db)?)?;
+    for report in &built.reports {
+        warnings.push(report.to_string());
+    }
+
     Ok(Started {
         config: checked,
         db,
         migration,
+        snapshot: built.snapshot,
         warnings,
     })
 }

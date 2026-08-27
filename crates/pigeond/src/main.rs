@@ -683,18 +683,27 @@ async fn main() -> io::Result<()> {
                 tracing::warn!("{w}");
             }
 
-            // Reported rather than used, because there is nothing yet to use it
-            // for: routing still comes from `PIGEON_ACCEPT`. Saying so plainly
-            // beats a daemon that reads a configured domain list and silently
-            // ignores it.
-            let domains: i64 = started
-                .db
-                .query_row("SELECT count(*) FROM domain", [], |r| r.get(0))
-                .unwrap_or(-1);
+            // The routing table is built and validated — every rule in it has
+            // passed the checks SQLite cannot make — but it is not yet what
+            // decides where mail goes. Acceptance still comes from
+            // `PIGEON_ACCEPT` and delivery from `PIGEON_FORWARD_TO`.
+            //
+            // Wiring acceptance to the snapshot while delivery still goes to
+            // one hardcoded address would accept mail for `hello@example.com`
+            // on the strength of a rule and then ignore where that rule points.
+            // Connecting both means fanning one message out to several
+            // destinations with per-recipient outcomes, which needs the
+            // Milestone 3 queue — finding 19 is the same gap seen from the
+            // delivery side.
+            //
+            // So it is reported rather than half-used, and the log says which.
+            let domains = started.snapshot.domain_names().count();
+            let schema = pigeon_db::schema_version(&started.db).unwrap_or(0);
+            tracing::info!(schema, "control plane open");
             tracing::info!(
                 domains,
-                "control plane ready. Routing is not served from it yet: the routing \
-                 snapshot is Milestone 1 and mutating commands are blocked until it exists."
+                "routing table built and validated. It is not serving yet: acceptance \
+                 still comes from PIGEON_ACCEPT and delivery from PIGEON_FORWARD_TO."
             );
 
             Some(started)

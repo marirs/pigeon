@@ -7,8 +7,14 @@
 //! Precedence, highest first:
 //!
 //! ```text
-//! reject rule  ->  exact alias  ->  wildcard (longest match)  ->  catch-all  ->  reject
+//! exact alias  ->  wildcard (most literal characters)  ->  catch-all  ->  reject
 //! ```
+//!
+//! The most specific matching rule wins and that rule decides whether mail is
+//! forwarded or refused. Reject is not a tier above the others: one pattern has
+//! exactly one rule, so no two rules of equal specificity can both match, and a
+//! wildcard reject must not silently disable an address the operator named.
+//! See `docs/M1-SNAPSHOT.md` §2.
 //!
 //! Plus-addressing is stripped before matching when the domain enables it, so
 //! `hello+github@example.com` resolves through the `hello` alias.
@@ -48,4 +54,16 @@
 
 #![forbid(unsafe_code)]
 
-// M1: snapshot build, precedence resolution, glob wildcard matching.
+pub mod fold;
+pub mod load;
+pub mod pattern;
+pub mod router;
+pub mod snapshot;
+
+pub use load::{LoadError, load};
+pub use pattern::{PatternError, Wildcard};
+pub use router::Router;
+pub use snapshot::{
+    AliasInput, BuildError, Built, CatchAllInput, Decision, Destination, DomainInput, Report, Rule,
+    Snapshot, Tier,
+};

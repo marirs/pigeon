@@ -838,7 +838,10 @@ dependencies = [
 name = "pigeon-route"
 version = "0.0.1"
 dependencies = [
+ "pigeon-db",
  "pigeon-types",
+ "rusqlite",
+ "thiserror",
 ]
 
 [[package]]

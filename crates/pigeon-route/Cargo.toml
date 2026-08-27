@@ -11,3 +11,11 @@ publish.workspace      = true
 
 [dependencies]
 pigeon-types = { workspace = true }
+pigeon-db = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pigeon-types = { workspace = true }
+pigeon-db = { workspace = true }
+rusqlite = { workspace = true }

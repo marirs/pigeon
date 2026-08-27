@@ -1,6 +1,7 @@
 # Milestone 1 — the routing snapshot
 
-Design for review. **No implementation until this is settled.**
+**Implemented.** `crates/pigeon-route`, reviewed and approved as designed below,
+with the review's corrections applied before any of it was written.
 
 The snapshot is Milestone 1's enforcement boundary. `M1-SCHEMA.md` S-2 makes
 snapshot construction — not the repository layer, and not `pigeon check` — the
@@ -501,3 +502,55 @@ Lookup returns a `Decision<'_>` borrowing into the snapshot: the matched rule,
 which tier matched, and the destinations. The tier is part of the return because
 `pigeon route inbound` prints it, and a second code path that recomputes it
 would be a second implementation of §2.
+
+---
+
+## 11. As built
+
+Implemented in `pigeon-route` after review. Where the code and this document
+differ, the code is wrong.
+
+| Design | Where |
+|---|---|
+| §1 folding | `fold.rs` — fixed buffers sized by `Address::parse`'s own limits |
+| §2, §3 patterns and ordering | `pattern.rs` — `Wildcard::precedence`, `overlaps` |
+| §2, §4, §5, §7 | `snapshot.rs` — `Snapshot::build`, `Snapshot::resolve` |
+| §6 loops | `snapshot.rs` — `walk`, DFS with `on_path` and `finished` |
+| §8 publication | `router.rs` — `Router::for_transaction`, `publish` |
+| Reading rows | `load.rs` — transcribes and decides nothing |
+
+### Every mutation in §9 was executed
+
+Each was applied to the source and the suite re-run. All twelve turned a test
+red:
+
+| Mutation | Caught by |
+|---|---|
+| Exact tier skipped | `an_exact_alias_beats_a_wildcard` |
+| Wildcard ordering reversed | `the_most_literal_wildcard_wins` |
+| Wildcard tier shown only the base | `a_tagged_wildcard_matches_the_full_local_part` |
+| Tag stripped before the exact-full lookup | `a_tagged_address_can_have_its_own_alias` |
+| One global visited set | `a_valid_diamond_is_not_a_loop` |
+| Ambiguity reported instead of blocked | `ambiguous_equal_precedence_wildcards_block_publication` |
+| Case folding dropped | `lookup_folds_case_on_both_halves` |
+| Reject treated as forward | `a_wildcard_reject_does_not_disable_a_more_specific_exact_alias` |
+| Loop detection respecting enablement | `a_loop_through_a_disabled_domain_still_blocks_publication` |
+| Two stars permitted | `more_than_one_star_blocks_publication` |
+| Exact patterns unvalidated | `a_malformed_exact_alias_blocks_publication` |
+| Domain A-label check dropped | `a_malformed_managed_domain_blocks_publication` |
+
+One mutation appeared not to be caught and was mine rather than the suite's:
+`Ok(()).and(Err(e))` still returns `Err(e)`, so it changed nothing. Re-run
+properly, it was caught. Worth recording, because a mutation that does not
+mutate reads exactly like a test that does not test.
+
+### What is built and not yet serving
+
+The routing table is loaded, validated and reported at startup. It does **not**
+yet decide acceptance or delivery: those still come from `PIGEON_ACCEPT` and
+`PIGEON_FORWARD_TO`.
+
+Wiring acceptance alone would accept mail for an address on the strength of a
+rule and then ignore where that rule points. Connecting both means fanning one
+message out to several destinations with per-recipient outcomes, which needs the
+Milestone 3 queue — finding 19 is the same gap seen from the delivery side.
