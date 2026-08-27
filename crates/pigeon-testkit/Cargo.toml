@@ -9,4 +9,4 @@ repository.workspace   = true
 authors.workspace      = true
 
 [dependencies]
-pigeon-types = { workspace = true }
+tokio = { workspace = true }

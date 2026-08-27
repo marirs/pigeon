@@ -16,7 +16,9 @@
 #![forbid(unsafe_code)]
 
 pub mod address;
+pub mod datetime;
 pub mod domain;
 
 pub use address::{Address, AddressBuf, AddressError};
+pub use datetime::rfc5322_date;
 pub use domain::{DeliveryMode, DomainStatus, ForwardPolicy};

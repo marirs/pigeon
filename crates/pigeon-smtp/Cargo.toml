@@ -10,3 +10,9 @@ authors.workspace      = true
 
 [dependencies]
 pigeon-types = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time", "test-util"] }
+pigeon-testkit = { workspace = true }

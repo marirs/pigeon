@@ -41,22 +41,17 @@ pub enum DeliveryMode {
 }
 
 /// How much of the original message is preserved when forwarding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ForwardPolicy {
     /// Relay the body byte for byte so the original DKIM signature survives,
     /// rewriting only the envelope sender via SRS and adding an ARC seal.
     /// This is the default and the only policy that preserves DMARC alignment
     /// on the original `From:` domain.
+    #[default]
     Preserve,
     /// Replace the `From:` header with a Pigeon-owned address and set
     /// `Reply-To:` to the original sender. Always delivers, but the message no
     /// longer appears to come from its author. Per-domain escape hatch for
     /// destinations that reject forwarded mail regardless.
     RewriteFrom,
-}
-
-impl Default for ForwardPolicy {
-    fn default() -> Self {
-        Self::Preserve
-    }
 }
