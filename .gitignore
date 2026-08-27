@@ -5,3 +5,6 @@ target/
 node_modules/
 Thumbs.db
 .DS_Store
+
+*.db
+data/
