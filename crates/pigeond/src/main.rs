@@ -67,6 +67,8 @@ struct SpoolSink {
     /// reasonable while there is no real routing table.
     accept: Arc<HashSet<String>>,
     counter: Arc<AtomicU64>,
+    /// Distinguishes identifiers from different runs of the process.
+    boot: u32,
     /// Absent means spool and stop, which is useful for testing the receiver
     /// without sending anything onward.
     forwarding: Option<Forwarding>,
@@ -103,13 +105,24 @@ impl MessageSink for SpoolSink {
                     let rotation = self.counter.load(Ordering::Relaxed);
                     let id2 = id.clone();
                     let dir = Arc::clone(&self.dir);
+
+                    // Acquired *before* spawning. Taking it inside the task
+                    // bounds concurrent connections but not the number of
+                    // pending tasks — each of which pins a whole message in
+                    // memory. A sender looping 50 MB messages would grow the
+                    // process without limit while 32 permits trickled through.
+                    // Waiting here pushes backpressure into the SMTP session,
+                    // which is what the inbound side already does.
+                    let permit = match Arc::clone(&f.limit).acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            tracing::error!(%id, "delivery limiter closed; message left in spool");
+                            return Ok(id);
+                        }
+                    };
+
                     tokio::spawn(async move {
-                        // Bounded, so a burst of accepted mail cannot open an
-                        // unbounded number of outbound connections.
-                        let _permit = match f.limit.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => return,
-                        };
+                        let _permit = permit;
 
                         match forward(&f, rotation, &envelope, &received, &body).await {
                             Ok(remote) => {
@@ -148,13 +161,20 @@ impl MessageSink for SpoolSink {
 }
 
 impl SpoolSink {
+    /// A spool identifier that will not collide with one from a previous run.
+    ///
+    /// The counter restarts at zero on every boot, so `secs-000000` is handed
+    /// out again within any second the process starts in — and because failed
+    /// messages are retained deliberately, a collision would overwrite mail
+    /// that was already acknowledged. `boot` distinguishes runs; `create_new`
+    /// in `write_durably` refuses to clobber if one slips through anyway.
     fn next_id(&self) -> String {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("{secs:010}-{n:06}")
+        format!("{secs:010}-{boot:08x}-{n:06}", boot = self.boot)
     }
 
     /// Write the message so that it survives a crash.
@@ -188,6 +208,18 @@ impl SpoolSink {
         write_durably(&self.dir, &format!("{id}.eml"), &[received.as_bytes(), body]).await?;
         sync_dir(&self.dir).await
     }
+}
+
+/// Count messages left in the spool from an earlier run.
+async fn count_spooled(dir: &Path) -> io::Result<usize> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    let mut n = 0;
+    while let Some(e) = entries.next_entry().await? {
+        if e.file_name().to_string_lossy().ends_with(".eml") {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Remove a spooled message once it is safely somewhere else.
@@ -286,7 +318,14 @@ async fn write_durably(dir: &Path, name: &str, parts: &[&[u8]]) -> io::Result<()
     let tmp = dir.join(format!(".{name}.partial"));
     let final_path = dir.join(name);
 
-    let mut f = tokio::fs::File::create(&tmp).await?;
+    // `create_new` rather than `create`: truncating an existing file here would
+    // destroy a message that was already acknowledged and is still waiting for
+    // a delivery that failed.
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .await?;
     for part in parts {
         f.write_all(part).await?;
     }
@@ -332,6 +371,7 @@ async fn main() -> io::Result<()> {
     tokio::fs::create_dir_all(&spool).await.map_err(|e| {
         io::Error::new(e.kind(), format!("spool directory {} is unusable: {e}", spool.display()))
     })?;
+    let sink_dir = spool.clone();
 
     let listener = TcpListener::bind(&listen).await.map_err(|e| {
         io::Error::new(e.kind(), format!("cannot bind {listen}: {e}"))
@@ -356,13 +396,26 @@ async fn main() -> io::Result<()> {
     // startup. A resolver that later fails to answer is not, and must not.
     let forwarding = match std::env::var("PIGEON_FORWARD_TO") {
         Ok(destination) if !destination.trim().is_empty() => {
+            let destination = destination.trim().to_string();
+
+            // Local, unambiguous misconfiguration, so it stops startup — the
+            // policy this module opens by stating. Checked here rather than
+            // per-message because the alternative is a daemon that starts
+            // cleanly, answers 250 to everything, and fails every delivery.
+            if pigeon_types::Address::parse(&destination).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("PIGEON_FORWARD_TO is not a valid address: {destination:?}"),
+                ));
+            }
+
             let resolver = SystemResolver::from_system()
                 .map_err(|e| io::Error::other(format!("cannot build resolver: {e}")))?;
             tracing::info!(%destination, "forwarding enabled");
             Some(Forwarding {
                 resolver: Arc::new(resolver),
                 ehlo_name: hostname.clone(),
-                destination: destination.trim().to_string(),
+                destination,
                 limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
             })
         }
@@ -372,10 +425,26 @@ async fn main() -> io::Result<()> {
         }
     };
 
+    // Anything already in the spool was accepted by a previous run and never
+    // delivered. Nothing rescans it yet, so the least Pigeon can do is refuse
+    // to let it pass unnoticed — an operator who is never told has no way to
+    // discover it except by looking.
+    match count_spooled(&sink_dir).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            stranded = n,
+            path = %sink_dir.display(),
+            "spool is not empty: these messages were acknowledged but never delivered, \
+             and nothing will retry them. Inspect and resend or remove them."
+        ),
+        Err(e) => tracing::warn!(error = %e, "could not read the spool directory"),
+    }
+
     let sink = SpoolSink {
-        dir: Arc::new(spool),
+        dir: Arc::new(sink_dir),
         accept: Arc::new(accept),
         counter: Arc::new(AtomicU64::new(0)),
+        boot: std::process::id(),
         forwarding,
     };
 

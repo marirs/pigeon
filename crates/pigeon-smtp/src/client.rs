@@ -44,6 +44,18 @@ const DATA_ACK_TIMEOUT: Duration = Duration::from_secs(600);
 /// Sending the body. A peer that stops reading must not block us indefinitely.
 const BODY_WRITE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Saying goodbye. Short, because the message is already accepted and the
+/// reply is discarded.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on one delivery attempt, whatever the individual phases do.
+///
+/// The per-phase timeouts are generous and they compose: a hundred recipients
+/// at five minutes each, plus the other phases, sums to roughly nine hours. A
+/// slow-but-not-silent peer could hold a delivery slot for most of a day
+/// without ever tripping a phase timeout.
+const TOTAL_DELIVERY_BUDGET: Duration = Duration::from_secs(1800);
+
 #[derive(Debug)]
 pub enum ClientError {
     Io(io::Error),
@@ -120,6 +132,26 @@ pub async fn deliver<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    match tokio::time::timeout(
+        TOTAL_DELIVERY_BUDGET,
+        deliver_inner(stream, ehlo_name, envelope, parts),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(ClientError::Timeout("overall delivery budget exhausted")),
+    }
+}
+
+async fn deliver_inner<S>(
+    stream: S,
+    ehlo_name: &str,
+    envelope: &Envelope,
+    parts: &[&[u8]],
+) -> Result<Accepted, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut io = BufReader::new(stream);
 
     let (code, msg) = read_reply_within(&mut io, COMMAND_TIMEOUT, "waiting for greeting").await?;
@@ -143,15 +175,32 @@ where
         return Err(ClientError::from_code(code, msg));
     }
 
-    // Every recipient in the envelope is offered, and all must be accepted.
-    // Partial acceptance is treated as failure of the whole delivery, because
-    // succeeding for some and failing for others would leave the caller to
-    // track which — and there is nowhere to record that yet. Splitting one
-    // recipient per delivery belongs with the per-recipient queue in Milestone
-    // 3, which is what makes partial outcomes representable.
+    // Every recipient is offered and all must be accepted; a refusal abandons
+    // the delivery before DATA, so nothing is sent to anyone.
+    //
+    // That is a real cost — a 550 on the seventh of ten recipients denies the
+    // other nine — and it is why the failure is reported as *transient* even
+    // when the remote said 5xx. Permanent would instruct the caller to give
+    // up, and with no retained copy the nine would be lost with no bounce. A
+    // retry sends to all ten again, which is duplication rather than loss, and
+    // duplication is the recoverable failure.
+    //
+    // Splitting one recipient per delivery is what actually fixes this, and it
+    // belongs with the per-recipient queue in Milestone 3 — the thing that
+    // makes a partial outcome representable at all.
     for rcpt in &envelope.recipients {
         let (code, msg) = command(&mut io, &format!("RCPT TO:<{rcpt}>\r\n")).await?;
         if !(200..300).contains(&code) {
+            if envelope.recipients.len() > 1 {
+                return Err(ClientError::Transient {
+                    code,
+                    message: format!(
+                        "{msg} (recipient <{rcpt}> refused; \
+                         {} others in this envelope were not attempted)",
+                        envelope.recipients.len() - 1
+                    ),
+                });
+            }
             return Err(ClientError::from_code(code, msg));
         }
     }
@@ -178,8 +227,10 @@ where
     }
 
     // The message is already accepted; a failure saying goodbye is not a
-    // delivery failure and must not cause a retry.
-    let _ = command(&mut io, "QUIT\r\n").await;
+    // delivery failure and must not cause a retry. Given a short leash of its
+    // own rather than the full command timeout — waiting five minutes for a
+    // reply whose content is discarded holds the delivery slot for nothing.
+    let _ = tokio::time::timeout(QUIT_TIMEOUT, command(&mut io, "QUIT\r\n")).await;
 
     Ok(Accepted { code, message })
 }
@@ -295,6 +346,11 @@ async fn write_dot_stuffed<W>(w: &mut W, parts: &[&[u8]]) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    // A line starts only after CRLF, matching what the receiving side treats
+    // as a line start. Counting a bare LF here would stuff a dot the receiver
+    // does not unstuff, adding one character to every affected line of every
+    // Unix-generated message — silent, permanent body corruption.
+    let mut prev: Option<u8> = None;
     let mut at_line_start = true;
     let mut last: Option<u8> = None;
 
@@ -311,7 +367,8 @@ where
                 w.write_all(b".").await?;
                 start = i + 1;
             }
-            at_line_start = part[i] == b'\n';
+            at_line_start = part[i] == b'\n' && prev == Some(b'\r');
+            prev = Some(part[i]);
         }
         w.write_all(&part[start..]).await?;
         if let Some(&b) = part.last() {
@@ -405,6 +462,11 @@ mod tests {
     #[tokio::test]
     async fn stuffing_round_trips_through_the_reader() {
         // Whatever this writes, the receiving codec must recover exactly.
+        //
+        // The bare-LF cases are the ones that matter: the writer once treated
+        // a lone `\n` as a line start while the reader requires CRLF, so a dot
+        // was stuffed that the receiver never removed. Every affected line of
+        // every Unix-generated message gained a character, silently.
         use crate::codec::DataReader;
         for original in [
             &b"plain\r\n"[..],
@@ -413,6 +475,9 @@ mod tests {
             b".\r\n",
             b"a\r\n.\r\nb\r\n",
             b"mixed 1.0\r\n.dot\r\n",
+            b"a\n.b\r\n",
+            b"unix\nlines\n.dotted\r\n",
+            b"\n.\n\r\n",
         ] {
             let wire = stuff(original).await;
             let mut r = DataReader::new(1 << 20);

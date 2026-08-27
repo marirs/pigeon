@@ -40,6 +40,42 @@ pub trait MessageSink: Clone + Send + Sync + 'static {
     fn deliver(&self, message: Message) -> impl Future<Output = Result<String, DataError>> + Send;
 }
 
+/// How long a single reply may take to write before the peer is assumed dead.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Trace headers tolerated before a message is treated as looping.
+///
+/// RFC 5321 §6.3 suggests counting `Received:` lines with a threshold around
+/// this. Configuration-time loop detection covers cycles among domains Pigeon
+/// manages; this covers the ones it cannot see, where a message leaves through
+/// somebody else's forwarder and comes back.
+pub const MAX_HOPS: usize = 100;
+
+/// Count `Received:` headers at the top of a message.
+///
+/// Only the leading header block is examined, and scanning stops at the blank
+/// line that ends it — a body mentioning `Received:` at the start of a line
+/// must not be able to make a message look like it is looping.
+fn count_hops(body: &[u8]) -> usize {
+    let mut hops = 0;
+    let mut at_line_start = true;
+    let mut i = 0;
+
+    while i < body.len() {
+        if at_line_start {
+            if body[i..].starts_with(b"\r\n") || body[i] == b'\n' {
+                break; // end of the header block
+            }
+            if body[i..].len() >= 9 && body[i..i + 9].eq_ignore_ascii_case(b"Received:") {
+                hops += 1;
+            }
+        }
+        at_line_start = body[i] == b'\n';
+        i += 1;
+    }
+    hops
+}
+
 /// Build the `Received:` header for a message.
 ///
 /// RFC 5321 §4.4 requires one on everything relayed. It is also the only loop
@@ -93,7 +129,13 @@ pub struct ServerConfig {
     /// cap in place, enough such clients close the server to everyone else —
     /// the cap becomes the means of denial rather than the defence against it.
     pub max_session: Duration,
-    /// Advertise STARTTLS. False until the TLS layer exists.
+    /// Advertise STARTTLS.
+    ///
+    /// Must stay false: there is no TLS implementation yet, and [`serve`]
+    /// refuses to start if this is set. Advertising it would have the server
+    /// answer `220 Ready to start TLS` and then keep reading plaintext, so the
+    /// client's handshake would be parsed as SMTP commands — a downgrade that
+    /// looks like a working encrypted session from the outside.
     pub tls_available: bool,
 }
 
@@ -120,6 +162,19 @@ pub async fn serve<S: MessageSink>(
     config: ServerConfig,
     sink: S,
 ) -> io::Result<()> {
+    // Refused rather than tolerated. A previous comment here claimed that
+    // adding TLS would be "a compile error rather than a silent no-op"; it was
+    // not, and setting this flag produced a server that advertised STARTTLS,
+    // accepted it, and then read the handshake as plaintext commands. Failing
+    // at startup is the only version of that promise the code can keep.
+    if config.tls_available {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tls_available is set but no TLS implementation exists; \
+             the server would advertise STARTTLS and then read plaintext",
+        ));
+    }
+
     let config = Arc::new(config);
     let limit = Arc::new(Semaphore::new(config.max_connections));
 
@@ -307,16 +362,26 @@ async fn step<S: MessageSink>(
     // Recipient validation happens here rather than inside the session so the
     // state machine stays free of routing. Refusing at RCPT TO is the last
     // moment a message can be declined without Pigeon owning the bounce.
-    // Only when RCPT is actually in sequence. Otherwise a mistimed RCPT would
-    // be answered 550 "no such user" when the real fault is 503 "bad sequence",
-    // which sends the operator looking for a routing problem that isn't there.
+    // Consult routing only for a RCPT that is both in sequence and
+    // syntactically valid. Skipping either check answers 550 "no such user"
+    // when the real fault is 503 "bad sequence" or 501 "syntax error", which
+    // sends the operator hunting a routing problem that does not exist.
+    //
+    // The refusal goes through the session rather than straight to the socket,
+    // so it counts against the error budget: otherwise probing an address list
+    // costs an attacker nothing and a directory harvest runs until the session
+    // lifetime expires.
     if let command::Command::Rcpt { path, .. } = cmd
         && matches!(session.state(), State::Mail | State::Rcpt)
+        && pigeon_types::Address::parse(path).is_ok()
         && !sink.accepts_recipient(path)
     {
         tracing::debug!(recipient = %path, "recipient refused");
-        write_reply(stream, &reply::no_such_user()).await?;
-        return Ok(Step::Continue);
+        let action = session.recipient_refused();
+        return match emit(stream, action).await? {
+            Flow::Continue => Ok(Step::Continue),
+            Flow::Stop => Ok(Step::Close),
+        };
     }
 
     let action = session.advance(cmd);
@@ -343,8 +408,15 @@ async fn finish_data<S: MessageSink>(
     let too_large = reader.is_too_large();
     let body = reader.into_body();
 
+    // The trace stack is the only loop guard that reaches beyond systems
+    // Pigeon can see. Refusing permanently is deliberate: a looping message
+    // will loop again on retry, and each pass costs another delivery.
+    let hops = count_hops(&body);
     let outcome = if too_large {
         Err(DataError::TooLarge)
+    } else if hops >= MAX_HOPS {
+        tracing::warn!(%peer, hops, "refusing message: too many trace hops, likely a loop");
+        Err(DataError::TooManyHops)
     } else {
         sink.deliver(Message { envelope, received, body }).await
     };
@@ -375,7 +447,57 @@ async fn emit(stream: &mut TcpStream, action: Action) -> io::Result<Flow> {
     }
 }
 
+/// Write a reply, bounded in time.
+///
+/// A client that pipelines commands and then stops reading will fill the
+/// kernel send buffer and park `write_all` forever. Because the session
+/// lifetime is only checked at the top of the read loop, control never returns
+/// there — so an unbounded write defeats both the session cap and the
+/// connection cap at once, and it is cheap to arrange: one 8 KB read of
+/// pipelined `EHLO` produces roughly 100 KB of replies.
 async fn write_reply(stream: &mut TcpStream, r: &Reply) -> io::Result<()> {
-    stream.write_all(r.to_wire().as_bytes()).await?;
-    stream.flush().await
+    let wire = r.to_wire();
+    match tokio::time::timeout(WRITE_TIMEOUT, async {
+        stream.write_all(wire.as_bytes()).await?;
+        stream.flush().await
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "peer stopped reading")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_leading_trace_headers() {
+        assert_eq!(count_hops(b"Subject: hi\r\n\r\nbody\r\n"), 0);
+        assert_eq!(count_hops(b"Received: a\r\nSubject: hi\r\n\r\nbody\r\n"), 1);
+        assert_eq!(count_hops(b"Received: a\r\nReceived: b\r\n\r\nbody\r\n"), 2);
+        // Case-insensitive, as header names are.
+        assert_eq!(count_hops(b"RECEIVED: a\r\nreceived: b\r\n\r\nx\r\n"), 2);
+    }
+
+    #[test]
+    fn stops_counting_at_the_body() {
+        // Otherwise a message quoting trace headers in its body could be made
+        // to look like it is looping, and would be refused permanently.
+        let msg = b"Received: real\r\n\r\nReceived: a\r\nReceived: b\r\nReceived: c\r\n";
+        assert_eq!(count_hops(msg), 1);
+    }
+
+    #[test]
+    fn tolerates_bare_lf_headers() {
+        assert_eq!(count_hops(b"Received: a\nReceived: b\n\nbody\n"), 2);
+    }
+
+    #[test]
+    fn ignores_continuation_lines() {
+        // A folded header continues with whitespace and is not a new hop.
+        let msg = b"Received: from a\r\n\tby b\r\n\tfor <c>\r\nReceived: second\r\n\r\nx";
+        assert_eq!(count_hops(msg), 2);
+    }
 }

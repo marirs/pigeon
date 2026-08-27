@@ -26,8 +26,19 @@ impl MxRecord {
     /// `MX 0 .` is a domain stating that it accepts no mail at all. It is a
     /// deliberate declaration, not a misconfiguration, so mail for it fails
     /// permanently rather than being retried for days.
+    /// Only the root exchange counts, and the preference does not.
+    ///
+    /// `MX 0 .` is the specified form, but a root exchange at any preference is
+    /// still a domain stating it takes no mail, and reading `MX 10 .` as a
+    /// deliverable host would be worse than honouring the obvious intent.
+    ///
+    /// An *empty* exchange is deliberately not treated as null. It is a
+    /// malformed record rather than a declaration, and calling it a refusal
+    /// would turn a syntax problem into a permanent bounce — the direction
+    /// that loses mail. It falls through to `normalise`, which rejects it, and
+    /// the domain ends up with no usable host instead.
     fn is_null(&self) -> bool {
-        self.preference == 0 && matches!(self.exchange.trim(), "." | "")
+        self.exchange.trim() == "."
     }
 }
 
@@ -58,10 +69,12 @@ impl std::error::Error for MxError {}
 /// stable order. Always trying the first host in DNS order would send an
 /// entire queue at one member of a balanced pool.
 pub fn order_hosts(records: &[MxRecord], rotation: u64) -> Result<Vec<String>, MxError> {
-    // A null MX is only meaningful as the entire answer. Alongside real
-    // exchanges it is a misconfiguration, and refusing the mail over it would
-    // be a worse error than ignoring it.
-    if records.len() == 1 && records[0].is_null() {
+    // A null MX is only meaningful as the *entire* answer, so the test is that
+    // every record is null — not that there is exactly one. Two null records,
+    // or a null beside an unusable one, is still a domain refusing mail.
+    // Alongside a real exchange it is a misconfiguration, and refusing over it
+    // would be the worse error.
+    if !records.is_empty() && records.iter().all(|r| r.is_null()) {
         return Err(MxError::NullMx);
     }
 
@@ -179,6 +192,21 @@ mod tests {
         // RFC 7505: the domain is stating it accepts no mail. Retrying for
         // five days would be wrong.
         assert_eq!(order_hosts(&[MxRecord::new(0, ".")], 0), Err(MxError::NullMx));
+        // A root exchange at any preference means the same thing.
+        assert_eq!(order_hosts(&[MxRecord::new(10, ".")], 0), Err(MxError::NullMx));
+        // The test is that *every* record is null, not that there is one.
+        assert_eq!(
+            order_hosts(&[MxRecord::new(0, "."), MxRecord::new(10, ".")], 0),
+            Err(MxError::NullMx)
+        );
+    }
+
+    #[test]
+    fn an_empty_exchange_is_malformed_not_a_refusal() {
+        // Permanent refusal is the lossy direction, so a syntax problem must
+        // not be read as a deliberate declaration.
+        assert_eq!(order_hosts(&[MxRecord::new(10, "")], 0), Err(MxError::NoUsableHost));
+        assert_eq!(order_hosts(&[MxRecord::new(0, "   ")], 0), Err(MxError::NoUsableHost));
     }
 
     #[test]

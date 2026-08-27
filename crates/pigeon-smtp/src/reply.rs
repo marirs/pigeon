@@ -133,6 +133,14 @@ pub fn message_too_large() -> Reply {
     Reply::line(552, "Message exceeds maximum size")
 }
 
+/// Too many trace headers: the message appears to be looping.
+///
+/// Permanent, because a message going round in circles will do so again on
+/// every retry, and each pass costs another delivery attempt.
+pub fn too_many_hops() -> Reply {
+    Reply::line(554, "Too many hops, message appears to be looping")
+}
+
 pub fn tls_required() -> Reply {
     Reply::line(530, "Must issue a STARTTLS command first")
 }

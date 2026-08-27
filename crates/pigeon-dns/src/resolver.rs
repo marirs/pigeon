@@ -88,17 +88,11 @@ impl MxLookup for SystemResolver {
             format!("{domain}.")
         };
 
-        let answer = self.inner.mx_lookup(fqdn.as_str()).await.map_err(|e| {
-            let text = e.to_string();
-            // Classified on the error text because the resolver's error kinds
-            // are not part of its stable surface. Getting this wrong is safe
-            // in one direction only, so anything unrecognised stays transient.
-            if text.contains("no record") || text.contains("NXDomain") {
-                LookupError::NoSuchDomain(domain.to_string())
-            } else {
-                LookupError::Resolver(text)
-            }
-        })?;
+        let answer = self
+            .inner
+            .mx_lookup(fqdn.as_str())
+            .await
+            .map_err(|e| classify(e, domain))?;
 
         // `Lookup` carries raw records rather than a typed MX view, so the
         // answer section is filtered by rdata. Anything that is not an MX —
@@ -120,6 +114,50 @@ impl MxLookup for SystemResolver {
         }
         Ok(records)
     }
+}
+
+/// Turn a resolver error into a Pigeon one.
+///
+/// The distinction that matters is NXDOMAIN versus NODATA, and it cannot be
+/// read from the error text: hickory reports both as `NoRecordsFound`, whose
+/// `Display` is "no records found for {query}" either way. Matching on that
+/// string made every MX-less domain look non-existent, which is permanent —
+/// so the implicit-MX fallback below could never fire, and mail to any domain
+/// with an A record but no MX was refused for good.
+///
+/// The response code carried on the error says which it actually was.
+fn classify<E: std::error::Error + 'static>(e: E, domain: &str) -> LookupError {
+    use hickory_resolver::net::DnsError;
+    use hickory_resolver::proto::op::ResponseCode;
+
+    // Walked rather than matched directly: the resolver wraps the semantic DNS
+    // error in a transport error, and the wrapping is not part of its stable
+    // surface. Downcasting along the chain finds it however it is nested.
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(err) = current {
+        if let Some(dns) = err.downcast_ref::<DnsError>() {
+            return match dns {
+                // The distinction the whole function exists for. Both arrive as
+                // NoRecordsFound and both stringify identically, so only the
+                // response code separates "this name does not exist" from
+                // "this name exists and publishes no MX".
+                DnsError::NoRecordsFound(no) => match no.response_code {
+                    ResponseCode::NXDomain => LookupError::NoSuchDomain(domain.to_string()),
+                    _ => LookupError::NoRecords(domain.to_string()),
+                },
+                DnsError::ResponseCode(ResponseCode::NXDomain) => {
+                    LookupError::NoSuchDomain(domain.to_string())
+                }
+                _ => LookupError::Resolver(e.to_string()),
+            };
+        }
+        current = err.source();
+    }
+
+    // Anything unrecognised stays transient. The two mistakes are not
+    // symmetric: retrying a dead domain wastes queue time, while treating a
+    // resolver fault as permanent bounces mail that would have delivered.
+    LookupError::Resolver(e.to_string())
 }
 
 /// A resolver with canned answers, for tests.

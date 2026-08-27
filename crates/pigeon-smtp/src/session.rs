@@ -182,7 +182,7 @@ impl Session {
         let action = match cmd {
             Command::Ehlo(name) => self.greet(name, true),
             Command::Helo(name) => self.greet(name, false),
-            Command::Mail { path, .. } => self.mail(path),
+            Command::Mail { path, params } => self.mail(path, params),
             Command::Rcpt { path, .. } => self.rcpt(path),
             Command::Data => self.data(),
             Command::Rset => {
@@ -229,6 +229,7 @@ impl Session {
         Action::Reply(match outcome {
             Ok(id) => reply::queued(&id),
             Err(DataError::TooLarge) => reply::message_too_large(),
+            Err(DataError::TooManyHops) => reply::too_many_hops(),
             Err(DataError::Temporary) => reply::temporary_failure(),
         })
     }
@@ -260,7 +261,7 @@ impl Session {
         Action::Reply(reply::ehlo_ok_owned(&self.hostname, ext))
     }
 
-    fn mail(&mut self, path: &str) -> Action {
+    fn mail(&mut self, path: &str, params: &str) -> Action {
         if self.state != State::Ready {
             return self.protocol_error(reply::bad_sequence());
         }
@@ -268,6 +269,17 @@ impl Session {
         if !path.is_empty() && Address::parse(path).is_err() {
             return self.protocol_error(reply::syntax_error());
         }
+
+        // Honour the declared size. Advertising SIZE and then ignoring the
+        // parameter makes the advertisement a lie: the sender is told it can
+        // check in advance, transmits the whole body on that basis, and is
+        // refused at the end anyway — having occupied memory for the duration.
+        if let Some(declared) = declared_size(params)
+            && declared > self.max_message_size
+        {
+            return self.protocol_error(reply::message_too_large());
+        }
+
         self.envelope.sender = path.to_owned();
         self.state = State::Mail;
         Action::Reply(reply::ok())
@@ -279,15 +291,26 @@ impl Session {
         }
         // Parsed here so that malformed addresses are refused at the door
         // rather than travelling into routing as though they were recipients.
-        if Address::parse(path).is_err() {
+        let Ok(parsed) = Address::parse(path) else {
             return self.protocol_error(reply::syntax_error());
-        }
+        };
 
         // A repeat is accepted, as the specification requires, but recorded
         // once. Without this, a hundred identical RCPT commands produce a
-        // hundred deliveries of one message to one mailbox — an amplification
-        // vector any anonymous sender can reach.
-        if self.envelope.recipients.iter().any(|r| r.eq_ignore_ascii_case(path)) {
+        // hundred deliveries of one message to one mailbox, and consume the
+        // recipient budget while doing it.
+        //
+        // Comparison folds the domain only. Folding the local part as well
+        // would merge `Bob@x` into `bob@x`, answer 250, and then silently drop
+        // one of them — see `Address::same_mailbox`.
+        let duplicate = self
+            .envelope
+            .recipients
+            .iter()
+            .filter_map(|r| Address::parse(r).ok())
+            .any(|existing| existing.same_mailbox(&parsed));
+
+        if duplicate {
             self.state = State::Rcpt;
             return Action::Reply(reply::ok());
         }
@@ -300,6 +323,15 @@ impl Session {
         self.envelope.recipients.push(path.to_owned());
         self.state = State::Rcpt;
         Action::Reply(reply::ok())
+    }
+
+    /// Record that a recipient was refused by routing.
+    ///
+    /// Counted against the error budget so that walking an address list is not
+    /// free. Without this, refusals cost an attacker nothing and a directory
+    /// harvest is bounded only by the session lifetime.
+    pub fn recipient_refused(&mut self) -> Action {
+        self.protocol_error(reply::no_such_user())
     }
 
     fn data(&mut self) -> Action {
@@ -340,11 +372,22 @@ impl Session {
     }
 }
 
+/// Read a `SIZE=` value from ESMTP parameters, if present and well formed.
+fn declared_size(params: &str) -> Option<usize> {
+    params.split_whitespace().find_map(|p| {
+        // Parameter keywords are case-insensitive (RFC 1869 §4).
+        let rest = (p.len() > 5 && p[..5].eq_ignore_ascii_case("SIZE=")).then(|| &p[5..])?;
+        rest.parse().ok()
+    })
+}
+
 /// Why a body could not be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataError {
     TooLarge,
     Temporary,
+    /// The trace header stack suggests the message is going round in circles.
+    TooManyHops,
 }
 
 #[cfg(test)]
@@ -555,8 +598,56 @@ mod tests {
         run(&mut s, b"MAIL FROM:<a@b.com>\r\n");
         assert_eq!(code(&run(&mut s, b"RCPT TO:<dup@example.net>\r\n")), 250);
         assert_eq!(code(&run(&mut s, b"RCPT TO:<dup@example.net>\r\n")), 250);
-        assert_eq!(code(&run(&mut s, b"RCPT TO:<DUP@EXAMPLE.NET>\r\n")), 250);
+        // Domain case folds; the local part does not.
+        assert_eq!(code(&run(&mut s, b"RCPT TO:<dup@EXAMPLE.NET>\r\n")), 250);
         assert_eq!(s.envelope().recipients.len(), 1);
+    }
+
+    #[test]
+    fn local_part_case_makes_a_distinct_recipient() {
+        // RFC 5321 §2.4: only the destination host may interpret a local part.
+        // Folding it here would answer 250 for `Dup@` and then silently drop
+        // it — and with no retained copy and no bounce, that mail is simply
+        // gone. An earlier version of this test asserted the opposite.
+        let mut s = session();
+        run(&mut s, b"EHLO c\r\n");
+        run(&mut s, b"MAIL FROM:<a@b.com>\r\n");
+        assert_eq!(code(&run(&mut s, b"RCPT TO:<dup@example.net>\r\n")), 250);
+        assert_eq!(code(&run(&mut s, b"RCPT TO:<Dup@example.net>\r\n")), 250);
+        assert_eq!(
+            s.envelope().recipients,
+            vec!["dup@example.net", "Dup@example.net"],
+            "merged two distinct mailboxes"
+        );
+    }
+
+    #[test]
+    fn oversized_declaration_is_refused_before_the_body() {
+        // Advertising SIZE and ignoring the parameter makes the advertisement
+        // a lie, and costs the sender a full transmission to discover it.
+        let mut s = Session::new("mx1.example.net", false, 1000);
+        run(&mut s, b"EHLO c\r\n");
+        assert_eq!(code(&run(&mut s, b"MAIL FROM:<a@b.com> SIZE=999999\r\n")), 552);
+        assert_eq!(code(&run(&mut s, b"MAIL FROM:<a@b.com> SIZE=500\r\n")), 250);
+        // Keywords are case-insensitive.
+        run(&mut s, b"RSET\r\n");
+        assert_eq!(code(&run(&mut s, b"MAIL FROM:<a@b.com> size=999999\r\n")), 552);
+    }
+
+    #[test]
+    fn refused_recipients_cost_the_error_budget() {
+        // Otherwise probing an address list is free and a directory harvest is
+        // bounded only by the session lifetime.
+        let mut s = session();
+        run(&mut s, b"EHLO c\r\n");
+        run(&mut s, b"MAIL FROM:<a@b.com>\r\n");
+        let mut last = None;
+        for _ in 0..MAX_ERRORS {
+            last = Some(s.recipient_refused());
+        }
+        let last = last.unwrap();
+        assert!(matches!(last, Action::Close(_)), "harvesting was never cut off");
+        assert_eq!(code(&last), 421);
     }
 
     #[test]
