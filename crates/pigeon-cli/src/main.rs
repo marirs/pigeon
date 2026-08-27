@@ -1067,7 +1067,7 @@ fn route_inbound(cli: &Cli, address: &str) -> anyhow::Result<u8> {
     eprintln!(
         "\nNote: pigeond does not yet route from this table — acceptance still comes from \
          PIGEON_ACCEPT and delivery from PIGEON_FORWARD_TO. This predicts the control plane, \
-         not the running daemon. See docs/ROADMAP.md."
+         not the running daemon — that is Milestone 3. See docs/M1-FINDINGS.md."
     );
 
     Ok(if decision.accepts() {

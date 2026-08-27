@@ -16,13 +16,32 @@
 //! wildcard reject must not silently disable an address the operator named.
 //! See `docs/M1-SNAPSHOT.md` §2.
 //!
-//! Plus-addressing is stripped before matching when the domain enables it, so
-//! `hello+github@example.com` resolves through the `hello` alias.
+//! Plus-addressing is **not** simply stripped before matching. Stripping first
+//! would make `hello+github@` unable to have an alias of its own; matching the
+//! full local part all the way down would send every tagged address to the
+//! catch-all before the alias its base names. So both forms are used, in this
+//! order:
 //!
-//! An alias with no destination is a reject rule. A domain carries a default
-//! destination that its aliases inherit unless given their own, so the common
-//! case — many addresses across many domains landing in one mailbox — stores
-//! and states that mailbox once.
+//! ```text
+//! 1. exact alias, full local part
+//! 2. exact alias, base local part          (only when a tag was stripped)
+//! 3. wildcards matching either form, ranked once by precedence
+//! 4. catch-all
+//! 5. reject unknown
+//! ```
+//!
+//! Both exact lookups precede every wildcard, so exact still beats wildcard.
+//! Both forms reach the wildcard tier, so `hello+*` matches `hello+github` —
+//! which an earlier design could not, because the wildcard tier only ever saw
+//! the base. See `docs/M1-SNAPSHOT.md` §4.
+//!
+//! An alias with no destination **inherits the domain default**; the absence is
+//! the encoding, and it is what `pigeon domain forward` moves. A reject rule is
+//! a separate kind, and also carries no destinations — which is why the two are
+//! distinguished by a column rather than by counting rows. A domain carries a
+//! default destination that its aliases inherit unless given their own, so the
+//! common case — many addresses across many domains landing in one mailbox —
+//! stores and states that mailbox once.
 //!
 //! Catch-all and aliases coexist rather than excluding each other. Catch-all
 //! takes the long tail; aliases carry the addresses that route elsewhere, fan

@@ -86,8 +86,14 @@ Deviations worth carrying forward:
 Route precedence:
 
 ```text
-reject rule  →  exact alias  →  wildcard (longest match)  →  catch-all  →  reject unknown
+exact alias  →  wildcard (most literal characters)  →  catch-all  →  reject unknown
 ```
+
+The most specific matching rule wins, and that rule's kind — forward or reject —
+decides the result. Reject is not a tier: one pattern has exactly one rule, so
+no two rules of equal specificity can both match, and a wildcard reject must not
+silently disable an address the operator named explicitly. See
+`M1-SNAPSHOT.md` §2.
 
 The outbound tables — sender identities, principals, grants — are created here even though nothing uses them until Milestone 7. Retrofitting the identity model later is far more disruptive than carrying unused tables.
 
@@ -97,52 +103,14 @@ What stays in Milestone 5 is *checking* the published record against the local k
 
 Exit criteria:
 
-`pigeon route inbound user@example.com` exactly predicts runtime routing, and an existing set of domains and aliases can be imported in one command.
+`pigeon route inbound user@example.com` exactly predicts what the routing
+snapshot answers; every mutating command is refused unless the configuration it
+would produce builds and validates; and an existing set of domains and aliases
+can be imported in one command.
 
-### BLOCKER: this exit criterion cannot be met in Milestone 1
-
-**Milestone 1 must not be marked complete while this stands.**
-
-The control plane is built: the schema, the migration runner, the validated
-routing snapshot, the repositories, and the mutating commands. `pigeon route
-inbound` predicts what the snapshot answers, exactly, by calling the same
-function the daemon would.
-
-What it does not predict is **runtime** routing, because the daemon does not yet
-route from that table. Acceptance still comes from `PIGEON_ACCEPT` and delivery
-from `PIGEON_FORWARD_TO`. The CLI says so on every `route inbound`, and the
-daemon says so at startup, so nobody can rely on the prediction by accident —
-but a criterion that is signalled as unmet is still unmet.
-
-Wiring acceptance alone is not a partial fix, it is a worse state: mail would be
-accepted for an address on the strength of a rule and then delivered somewhere
-that rule does not name.
-
-Wiring both requires **whole-message fan-out**: one accepted message resolving
-to several destinations, each needing its own outcome. Finding 19 is the same
-gap from the delivery side — a single rejected recipient currently abandons the
-message for all of them — and the fix named there is one recipient per delivery,
-"which needs the Milestone 3 queue to make a partial outcome representable".
-
-So the criterion depends on Milestone 3 work and was mis-assigned here.
-
-**Proposed resolution, pending approval.** Move the runtime half to Milestone 3
-and replace this with a control-plane criterion Milestone 1 can actually meet:
-
-> `pigeon route inbound user@example.com` exactly predicts what the routing
-> snapshot answers; every mutating command is refused unless the configuration
-> it would produce builds and validates; and an existing set of domains and
-> aliases can be imported in one command.
-
-and add to Milestone 3:
-
-> The daemon accepts recipients and delivers from the routing snapshot, with a
-> per-destination outcome for every message, and `pigeon route inbound` exactly
-> predicts runtime routing.
-
-The alternative is to implement fan-out here without per-destination state,
-which means a retry cannot know which destinations already received a message.
-That trades a documented gap for silent duplicates.
+The runtime half of this — the daemon serving that snapshot — moved to Milestone
+3, where the durable per-destination state it needs lives. See the note there,
+and `M1-FINDINGS.md` for why.
 
 ---
 
@@ -193,9 +161,25 @@ Forwarded mail is accepted with passing authentication by every major receiving 
 - [ ] malformed message handling
 - [ ] graceful shutdown
 
+- [ ] the daemon's RCPT accept/reject decision and resolved destination set come
+      from the routing snapshot, replacing `PIGEON_ACCEPT` and
+      `PIGEON_FORWARD_TO`
+
 Exit criteria:
 
 Killing the process mid-delivery loses no accepted mail, and transient destination failures resolve themselves without intervention.
+
+The daemon's `RCPT` accept/reject decision and resolved destination set come
+from the routing snapshot. Each resolved destination has independently
+retryable queue state, and `pigeon route inbound` predicts that decision and
+destination set exactly.
+
+This arrived from Milestone 1, which could not meet it: fan-out belongs here
+because safe retries require independently durable destination state. Note what
+it does *and does not* claim — the CLI predicts the routing decision and the
+destinations it resolves to. It cannot predict DNS or a remote server's answer,
+and "runtime routing" and "per-destination outcome" were both ambiguous about
+that.
 
 ---
 

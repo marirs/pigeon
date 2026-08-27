@@ -43,15 +43,27 @@ impl Router {
         Arc::clone(&self.current.read().expect("router lock poisoned"))
     }
 
-    /// Install a validated snapshot.
+    /// Install a snapshot. **Crate-private, and deliberately.**
     ///
-    /// Only ever called with something [`Snapshot::build`] returned, which is
-    /// what makes the type the evidence: there is no way to publish an
-    /// unvalidated table because there is no way to obtain one.
+    /// An earlier version of this was public, with a comment claiming there was
+    /// "no way to publish an unvalidated table because there is no way to
+    /// obtain one". That was false: [`Snapshot`] is `Default` and `Clone`, so
+    /// any caller could construct one and publish it — before a commit, or
+    /// without one at all, which is exactly the ordering [`crate::mutate`]
+    /// exists to prevent.
+    ///
+    /// The guarantee is visibility, not the type. `mutate` is the only caller,
+    /// and it calls this after the commit. Code outside the crate that wants a
+    /// table published goes through `mutate`, and therefore through the
+    /// validation and the transaction.
+    ///
+    /// [`Router::new`] stays public and takes any snapshot, which is not the
+    /// same hole: it seeds a router that is not yet serving, and there is no
+    /// commit for it to run ahead of.
     ///
     /// A single pointer store, so a reader sees the old table or the new one
     /// and never a partial one.
-    pub fn publish(&self, snapshot: Snapshot) {
+    pub(crate) fn publish(&self, snapshot: Snapshot) {
         *self.current.write().expect("router lock poisoned") = Arc::new(snapshot);
     }
 }

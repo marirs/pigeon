@@ -179,9 +179,11 @@ fn a_loop_introduced_by_a_mutation_is_refused_before_it_commits() {
 fn a_rejected_mutation_does_not_publish() {
     // Step 5 is after step 4. A published table that a failed commit means
     // nobody asked for is worse than a stale one.
-    let (_t, mut conn, router) = ready("nopublish");
+    let (_t, mut conn, _seed) = ready("nopublish");
     repo::set_default_destination(&conn, "example.com", None).unwrap();
-    router.publish(
+    // Seeded rather than published: `publish` is crate-private so that `mutate`
+    // is the only thing that can replace a live table.
+    let router = Router::new(
         Snapshot::build(pigeon_route::load(&conn).unwrap())
             .unwrap()
             .snapshot,

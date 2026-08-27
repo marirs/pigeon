@@ -552,5 +552,6 @@ yet decide acceptance or delivery: those still come from `PIGEON_ACCEPT` and
 
 Wiring acceptance alone would accept mail for an address on the strength of a
 rule and then ignore where that rule points. Connecting both means fanning one
-message out to several destinations with per-recipient outcomes, which needs the
-Milestone 3 queue — finding 19 is the same gap seen from the delivery side.
+message out to several destinations, each needing independently durable state so
+a retry knows which already received it — which is Milestone 3. That criterion
+formally moved there; the reasoning is in `M1-FINDINGS.md` §1.
