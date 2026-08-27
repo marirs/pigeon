@@ -63,7 +63,7 @@ pub struct Started {
 #[derive(Debug, thiserror::Error)]
 pub enum StartupError {
     #[error("configuration: {0}")]
-    Config(#[from] ConfigError),
+    Config(#[from] Box<ConfigError>),
 
     #[error("database: {0}")]
     Db(#[from] DbError),
@@ -86,8 +86,12 @@ pub enum StartupError {
     DkimKeyUnreadable {
         domain: String,
         selector: String,
+        // Boxed. Unboxed it makes `StartupError` large enough to trip
+        // `clippy::result_large_err`, which every `Result` in the startup chain
+        // then carries — and it did so on x86_64 while passing on aarch64,
+        // because the threshold is a byte count and the layout is not the same.
         #[source]
-        source: pigeon_auth::DkimError,
+        source: Box<pigeon_auth::DkimError>,
     },
 
     #[error(
@@ -107,7 +111,7 @@ pub enum StartupError {
         domain: String,
         selector: String,
         #[source]
-        source: pigeon_config::ValidationError,
+        source: Box<pigeon_config::ValidationError>,
     },
 
     #[error(
@@ -149,7 +153,7 @@ where
 {
     // 1 and 2. Parsing and validation are separate inside `pigeon-config`, so a
     // TOML syntax error reads differently from an unwritable directory.
-    let checked = Config::load_and_validate(config_path)?;
+    let checked = Config::load_and_validate(config_path).map_err(Box::new)?;
     let config = checked.config().clone();
 
     // 3. Pragmas — WAL, foreign keys, busy timeout — are set by `open`.
@@ -215,7 +219,7 @@ fn check_dkim_keys(db: &Connection, checked: &Checked) -> Result<(), StartupErro
             .map_err(|source| StartupError::DkimKeyUnusable {
                 domain: key.domain.clone(),
                 selector: key.selector.clone(),
-                source,
+                source: Box::new(source),
             })?;
 
         require_private_key_mode(&path, &key)?;
@@ -224,7 +228,7 @@ fn check_dkim_keys(db: &Connection, checked: &Checked) -> Result<(), StartupErro
             StartupError::DkimKeyUnreadable {
                 domain: key.domain.clone(),
                 selector: key.selector.clone(),
-                source,
+                source: Box::new(source),
             }
         })?;
 
@@ -254,10 +258,10 @@ fn require_private_key_mode(
         let meta = std::fs::metadata(path).map_err(|source| StartupError::DkimKeyUnreadable {
             domain: key.domain.clone(),
             selector: key.selector.clone(),
-            source: pigeon_auth::DkimError::Io {
+            source: Box::new(pigeon_auth::DkimError::Io {
                 path: path.display().to_string(),
                 source,
-            },
+            }),
         })?;
         let mode = meta.permissions().mode() & 0o777;
         // "No bits beyond 0600", not equality: an operator who made it 0400 has
@@ -409,6 +413,16 @@ listen = "127.0.0.1:0"
             ran.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
+    }
+
+    #[test]
+    fn the_startup_error_stays_small() {
+        // `clippy::result_large_err` trips at 128 bytes, and every `Result` in
+        // the startup chain carries this type. It is a byte count against a
+        // layout, so it passed on aarch64 and failed on x86_64 in CI — asserted
+        // here so the next growth is caught by a test rather than by a runner.
+        let size = std::mem::size_of::<StartupError>();
+        assert!(size <= 128, "StartupError is {size} bytes; box a variant");
     }
 
     #[tokio::test]
