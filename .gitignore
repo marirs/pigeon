@@ -8,5 +8,5 @@ Thumbs.db
 
 *.db
 data/
-
+spool/
 Cargo.lock
