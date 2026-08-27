@@ -1,12 +1,23 @@
-.*
-!.gitignore
-
+# Build output
 target/
-node_modules/
-Thumbs.db
-.DS_Store
 
-*.db
-data/
+# Runtime state. The spool holds accepted mail; it is never source.
 spool/
-Cargo.lock
+*.db
+*.db-wal
+*.db-shm
+
+# Tooling caches
+.wrangler/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+node_modules/
+.idea/
+.vscode/
+
+# NOTE: do not reintroduce a blanket `.*` rule here.
+# It silently excluded .github/, so CI was never committed and never ran —
+# the fmt, clippy, test, OpenSSL and MSRV gates all existed only locally.
+# List dotfiles individually instead.
