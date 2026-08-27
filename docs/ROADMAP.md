@@ -8,15 +8,15 @@ It is sequenced as a **vertical slice**: get one message from a real sender to a
 
 ## Milestone 0 — End-to-end skeleton
 
-- [ ] Cargo workspace, CI, formatting, linting, dependency audit
-- [ ] release profile
-- [ ] structured logging
-- [ ] SMTP listener on TCP/25
-- [ ] EHLO / MAIL FROM / RCPT TO / DATA / QUIT
-- [ ] hardcoded in-memory route
-- [ ] MX resolution for the destination
-- [ ] relay bytes to the recipient's MX
-- [ ] scriptable SMTP peer in `pigeon-testkit`
+- [x] Cargo workspace, CI, formatting, linting, dependency audit
+- [x] release profile
+- [x] structured logging
+- [x] SMTP listener on TCP/25
+- [x] EHLO / MAIL FROM / RCPT TO / DATA / QUIT
+- [x] hardcoded in-memory route
+- [x] MX resolution for the destination
+- [x] relay bytes to the recipient's MX
+- [x] scriptable SMTP peer in `pigeon-testkit`
 
 Exit criteria:
 
@@ -26,14 +26,44 @@ Expect this to deliver to a permissive destination and be rejected by a strict o
 
 **Confirm outbound TCP/25 is permitted on the host before starting.** Everything downstream assumes it.
 
+### What actually shipped
+
+The protocol core, codecs, delivery client and MX ordering are pure — no I/O, no runtime — and carry roughly 90 tests that need neither a network nor a fixture server. That was not tidiness for its own sake: the cases that matter are the ones a live connection cannot be made to produce on demand, such as an end-of-data marker split across two reads.
+
+Two harnesses, because they catch different things. Integration tests run against the real server on an ephemeral port, which is where the pipelining bugs live — those only appear when a genuine client writes a whole transaction in one packet. `pigeon-testkit` provides the opposite: a scripted peer that misbehaves on purpose, for testing the delivery client against servers that reject `EHLO`, answer 4xx, hang up mid-reply, or emit nonsense.
+
+The peer deliberately does not depend on `pigeon-smtp`. It scans for the end-of-data marker itself, so a codec looking for the wrong bytes cannot agree with itself and pass.
+
+It carries a hostile client too, for the opposite direction. The server's connection cap, command and data timeouts, and survival of an abrupt mid-body disconnect had never been exercised — defensive code that has never defended anything is worse than none, because the configuration field invites you to rely on it. The cap and the command timeout only work as a pair: without the timeout, slowloris turns the cap from a defence into the mechanism of denial.
+
+**Relay refusal is partially covered already.** The half of the matrix needing authenticated submission waits for Milestone 7, but *unauthenticated sender, remote recipient* is live code today and is tested — including `victim@example.net.attacker.test`, the suffix trick that defeats naive domain matching. There is a paired test asserting local recipients are still accepted, since refusing everything would pass the first one perfectly.
+
+Two boxes stay unchecked on purpose. DKIM and ARC fixtures, and malformed-DNS generators, would be written against APIs that do not exist yet — that is not coverage, it is rework scheduled early.
+
+The peer found two bugs on first use:
+
+- **`deliver()` had no timeouts at all.** A peer that accepted a connection and then went silent would hold a delivery task open forever: no error, no retry, a message that simply stopped moving. Every read is now bounded, as is the body write, since a peer that stops reading blocks `write_all` once socket buffers fill.
+- **Invalid UTF-8 in a reply was reported as an I/O error**, which reads as a broken socket when the truth is a peer not speaking SMTP — and sends whoever reads the log to investigate the network instead of the remote server.
+
+Deviations worth carrying forward:
+
+- **MSRV is 1.88**, set by `hickory-resolver` 0.26 rather than by choice.
+- **A twelfth crate, `pigeon-alert`**, arrived early; its design is in `ALERTING.md` and its implementation belongs to Milestone 5.
+- **`DataReader` buffers the whole body in memory.** At the 50 MB ceiling that is 50 MB per concurrent connection — a denial of service, not a tuning question. Milestone 3 must make it write through to the spool.
+- **The resolver classifies errors by matching their text**, because hickory's error kinds are not a stable surface. It fails safe in one direction only and should be tightened once the real error type can be inspected.
+- **Forwarding does not retry.** A failure logs and leaves the message in the spool. This is the gap Milestone 3 closes.
+- **The envelope sender passes through unchanged**, so SPF fails at the receiver. This is expected, and it is exactly what Milestone 2 exists to fix.
+
 ---
 
 ## Milestone 1 — Control plane
 
 - [ ] SQLite schema and migration runner
 - [ ] configuration loader
-- [ ] domain add / remove / list / info
+- [ ] domain add / remove / list / show
 - [ ] domain lifecycle states
+- [ ] DKIM keypair generation (RSA-2048 default)
+- [ ] DKIM TXT rendering
 - [ ] aliases and multiple destinations
 - [ ] per-domain default destination, inherited by aliases
 - [ ] bulk destination listing and retargeting
@@ -59,6 +89,10 @@ reject rule  →  exact alias  →  wildcard (longest match)  →  catch-all  �
 
 The outbound tables — sender identities, principals, grants — are created here even though nothing uses them until Milestone 7. Retrofitting the identity model later is far more disruptive than carrying unused tables.
 
+DKIM key generation sits here rather than with the rest of the DNS work in Milestone 5, for two reasons. `pigeon domain add` is specified to generate the key and print the record as part of adding a domain, so the key is part of the domain's creation rather than of validating it later. And Milestone 2 cannot seal an ARC set without a private key to sign with — leaving generation in Milestone 5 would have made the go/no-go milestone depend on one three steps further out.
+
+What stays in Milestone 5 is *checking* the published record against the local key, which is validation and belongs with the other validators.
+
 Exit criteria:
 
 `pigeon route inbound user@example.com` exactly predicts runtime routing, and an existing set of domains and aliases can be imported in one command.
@@ -81,6 +115,8 @@ Exit criteria:
 - [ ] forwarding trace headers
 
 **This is the go/no-go milestone.** Everything before it is plumbing and everything after it is hardening. If forwarded mail does not land with `dmarc=pass`, nothing else matters.
+
+It depends on Milestone 1 for more than configuration: ARC sealing needs a private key, and a domain that can actually receive mail is what makes the result testable against a real mailbox rather than a fixture.
 
 Exit criteria:
 
@@ -139,9 +175,8 @@ Rejection happens during the SMTP conversation. Accepting and then discarding is
 - [ ] PTR validation
 - [ ] hostname consistency
 - [ ] SPF validation
-- [ ] DKIM key generation (RSA-2048 default)
 - [ ] optional ed25519 second selector
-- [ ] DKIM TXT rendering
+- [ ] DKIM selector validation against the published record
 - [ ] DMARC validation
 - [ ] TLS validation
 - [ ] finding severities: FATAL / ERROR / WARNING / INFO
@@ -203,7 +238,9 @@ Backup deserves specific attention. DKIM private keys are the only state that ca
 - [ ] per-domain outbound mode
 - [ ] outbound queue and bounce processing
 - [ ] per-principal and per-domain rate limits
-- [ ] anti-open-relay integration suite
+- [ ] anti-open-relay integration suite — the unauthenticated half landed in
+      Milestone 0; what remains is every combination involving an authenticated
+      principal, which needs the submission listener to exist first
 - [ ] optional CLI send for diagnostics
 
 Sequenced after forwarding because it is the larger and more security-critical body of work, and because forwarding is what breaks first in production.

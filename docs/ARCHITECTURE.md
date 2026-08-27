@@ -251,6 +251,25 @@ Message bytes are copied as few times as possible.
 
 Where a value must cross a task boundary or outlive its buffer, a refcounted handle is preferred over a borrow — lifetimes across `await` points cost more in complexity than they return in performance.
 
+One copy of the body is unavoidable and should be understood rather than chased. Removing dot-stuffing deletes bytes from the stream, so the result is not a subslice of the input and cannot alias it. The goal is that it happens exactly once, after which the body is refcounted for the rest of its life.
+
+Envelopes are the other deliberate exception: a sender and its recipients outlive the command lines they were parsed from, so they are owned. That is a few small allocations per transaction, not per byte.
+
+### 3.4 Dependency policy
+
+Pigeon does not link OpenSSL. CI fails the build if `openssl-sys` enters the dependency graph, directly or transitively, and `deny.toml` bans it declaratively.
+
+The objection is not to C code. It is to *system-library coupling*: locating a shared object at build time, matching its version across build and deployment hosts, and inheriting a distribution's patch schedule. Two dependencies do contain C, and neither has those properties:
+
+| Dependency | Why C | Why acceptable |
+|---|---|---|
+| SQLite via `rusqlite` with `bundled` | SQLite is written in C | Vendored source compiled with `cc`. No system library, no pkg-config, no version skew. |
+| TLS crypto via `ring` | C and assembly from BoringSSL | Vendored. Chosen over rustls 0.23's default `aws-lc-rs`, which additionally requires cmake. |
+
+rustls itself, `mail-auth`, `mail-parser`, `hickory-resolver` and the async stack are pure Rust. The pure-Rust rustls crypto provider exists but is explicitly not audited for production, which is not a trade worth making for a mail server's transport security.
+
+If either C dependency later becomes avoidable without giving something up — a mature pure-Rust SQLite, or an audited pure-Rust crypto provider — the ban list makes the switch a one-line change rather than an archaeology exercise.
+
 ### 3.3 Runtime
 
 Initial implementation:
