@@ -64,8 +64,8 @@ Deviations worth carrying forward:
 - [x] configuration loader
 - [x] domain add / remove / list / show
 - [x] domain lifecycle states
-- [ ] DKIM keypair generation (RSA-2048 default)
-- [ ] DKIM TXT rendering
+- [x] DKIM keypair generation (RSA-2048 default)
+- [x] DKIM TXT rendering
 - [x] aliases and multiple destinations
 - [x] per-domain default destination, inherited by aliases
 - [x] bulk destination listing and retargeting

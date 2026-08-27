@@ -641,7 +641,21 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // `Display`, not `Debug`. Returning `Result` from `main` prints the
+            // debug form, which renders a multi-line explanation as one line of
+            // escaped `\n` — and every startup error here is a paragraph
+            // telling an operator what to do about it.
+            eprintln!("pigeond: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -666,7 +680,7 @@ async fn main() -> io::Result<()> {
                 prepare_spool(&dir).await
             })
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
 
             if started.migration.is_empty() {
                 tracing::info!(version = started.migration.to, "database schema up to date");

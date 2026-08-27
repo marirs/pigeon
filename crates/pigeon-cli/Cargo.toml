@@ -18,6 +18,7 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 pigeon-config = { workspace = true }
 pigeon-db = { workspace = true }
+pigeon-auth = { workspace = true }
 pigeon-dns = { workspace = true }
 
 [[bin]]

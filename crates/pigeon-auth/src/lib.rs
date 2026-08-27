@@ -24,4 +24,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dkim;
+
+pub use dkim::{DkimError, KeyPair};
+
 // M2: SRS0/SRS1 encode+decode with replay window, DKIM verify/sign, ARC seal.

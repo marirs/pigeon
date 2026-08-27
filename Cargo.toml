@@ -55,6 +55,12 @@ bytes       = "1"
 
 # Mail
 # Both are pure Rust and use RustCrypto primitives rather than a C backend.
+# RSA key generation only. `ring` cannot generate RSA keys — mail-auth carries
+# the same TODO — and every other option is a banned TLS backend.
+#
+# default-features off keeps the PKCS#1v1.5 *decryption* paths out of the build
+# along with everything else we do not use.
+rsa         = { version = "0.9", default-features = false, features = ["std", "getrandom", "pem"] }
 mail-auth   = "0.7"
 mail-parser = "0.11"
 

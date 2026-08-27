@@ -162,10 +162,73 @@ the same week as the code they misdescribe.
 
 ---
 
-## What to carry into the rest of Milestone 1
+## 5. The `rsa` dependency, and the exception it needed
 
-- DKIM keypair generation and TXT rendering, which also completes the startup
-  key verification above.
+DKIM key generation needs an RSA implementation. `ring` cannot generate RSA keys
+— mail-auth carries the same TODO for the same reason — and every other option
+is a TLS backend `deny.toml` bans.
+
+`mail-auth` was probed first, since it is already a declared dependency and has
+a `generate` feature. It brings six advisories:
+
+| Advisory | Crate | Arrives via |
+|---|---|---|
+| RUSTSEC-2026-0118, -0119 | `hickory-proto 0.25` | mail-auth's own resolver — a **second** DNS stack, older than the one Pigeon already has |
+| RUSTSEC-2026-0194, -0195 | `quick-xml` | the `report` feature, on by default |
+| RUSTSEC-2023-0071 | `rsa` | the `generate` feature |
+| RUSTSEC-2025-0134 | `rustls-pemfile` | unmaintained, on by default |
+
+Milestone 1 does not need any of that. It needs key generation, which is `rsa`
+alone: one advisory, no second resolver, no XML parser. mail-auth is deferred to
+Milestone 2 where signing and verification actually happen, and the duplicate
+DNS stack is a decision to make then rather than a consequence to inherit now.
+
+**RUSTSEC-2023-0071 is ignored, narrowly and with the argument written down.**
+The Marvin attack is a timing sidechannel in RSA *decryption*: it needs an
+oracle that decrypts attacker-chosen ciphertexts while the attacker measures how
+long each takes. Pigeon never decrypts. `rsa` generates a keypair in
+`pigeon domain add`, which takes no input from anyone and runs once per domain.
+
+That is an argument about what the code does, so **CI checks the code**: a
+grep for decryption calls, in the same shape as the existing OpenSSL assertion.
+A decryption call would make the exception false without changing the dependency
+graph, and nothing else would notice.
+
+The exception is scoped to Milestone 2. Signing is a private key operation over
+content somebody else wrote, which is a different argument that has not been
+made — and it must use `ring`.
+
+## 6. The deliberate refusal, closed
+
+`check_dkim_keys` refused to start rather than claim a check it could not make.
+It now makes the check: the public key is derived from the private key on disk
+and compared against the one stored beside it.
+
+An existence check is not the property. A key file replaced during a botched
+rotation, or restored from a backup taken before the last one, exists and passes
+every permission check — and then signs every message with a key whose public
+half is not the one in DNS. Every signature verifies as `dkim=fail`, at the
+receiver, silently, while the daemon reports a clean start.
+
+Verified against a real daemon: a domain added, its key swapped for another
+valid one, and startup refused with the file named.
+
+Two things fixed while doing it:
+
+- **Every active key is checked, not the first.** A host carrying forty domains
+  that stops at the first good one has verified one fortieth of its signing.
+- **`pigeond` printed errors with `Debug`.** Returning `Result` from `main` does
+  that, which renders a multi-line explanation as one line of escaped `\n`.
+  Every startup error here is a paragraph telling an operator what to do, so it
+  now prints with `Display`.
+
+Five mutations, all caught: removing the comparison, checking only the first
+key, dropping the permission check, deriving the public key from the wrong
+private key, and rendering a record with an empty `p=` tag.
+
+---
+
+## What to carry into the rest of Milestone 1
 - Live configuration reload, so a mutation reaches a running daemon without a
   restart. Until it exists, the CLI says so after every change.
 - `--json` on every read command; several have it, not all.

@@ -13,6 +13,32 @@ all-features = true
 version = 2
 yanked = "deny"
 
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack: potential key recovery through timing
+    # sidechannels" in `rsa`. No fixed version exists; upstream has not shipped
+    # a constant-time implementation.
+    #
+    # The attack is against RSA *decryption*: it needs an oracle that decrypts
+    # attacker-chosen ciphertexts while the attacker measures how long each one
+    # takes. Pigeon never decrypts anything. `rsa` is used for one thing —
+    # generating a DKIM keypair in `pigeon domain add` — which takes no input
+    # from anyone and runs once per domain.
+    #
+    # `ring` cannot generate RSA keys, which is why this is here at all;
+    # mail-auth carries the same TODO for the same reason. Every other option is
+    # a TLS backend this workspace bans.
+    #
+    # CI asserts the narrow use, so this stays an argument about what the code
+    # does rather than about what it intends: see the "no RSA decryption" step
+    # in .github/workflows/ci.yml.
+    #
+    # REVISIT AT MILESTONE 2, when DKIM *signing* arrives. Signing is a private
+    # key operation over attacker-influenceable content, and it must use `ring`
+    # rather than this crate. If signing ever needs `rsa`, this exception is no
+    # longer the same argument and has to be made again from scratch.
+    { id = "RUSTSEC-2023-0071", reason = "rsa is used only to generate keys; Pigeon never decrypts" },
+]
+
 [licenses]
 version = 2
 # Apache-2.0 project. These are the licences it can carry without conflict.

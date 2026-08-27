@@ -59,6 +59,21 @@ jobs:
           fi
           echo "No OpenSSL in the dependency graph."
 
+      # The `rsa` advisory exception in deny.toml rests on Pigeon never
+      # decrypting. That is an argument about the code, so the code is checked:
+      # a decryption call would make the exception false without changing the
+      # dependency graph, and nothing else would notice.
+      - name: Assert no RSA decryption
+        run: |
+          if grep -rnE '\b(decrypt|decrypt_blinded|Pkcs1v15Encrypt|Oaep)\b' crates/ --include='*.rs'; then
+            echo "::error::RSA decryption reached the source tree."
+            echo
+            echo "deny.toml ignores RUSTSEC-2023-0071 on the grounds that Pigeon"
+            echo "only ever generates keys and never decrypts. That is no longer true."
+            exit 1
+          fi
+          echo "No RSA decryption in the source tree."
+
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

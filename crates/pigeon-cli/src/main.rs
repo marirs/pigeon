@@ -416,33 +416,74 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
         DomainVerb::Add { domain, to } => {
             let mut conn = open_write(cli)?;
             let default = to.as_deref().map(Address::parse).transpose()?;
+            let keys_root = keys_root(cli)?;
+            let name = domain.to_ascii_lowercase();
+
+            // Generated before the transaction opens: it takes a second or two,
+            // and holding the write lock through that would block every other
+            // command for no reason.
+            let pair = pigeon_auth::KeyPair::generate(pigeon_auth::dkim::DEFAULT_BITS)?;
+            let selector = pigeon_auth::dkim::DEFAULT_SELECTOR;
+            let key_file = format!("{name}.key");
+
             let outcome = apply(cli, &mut conn, |tx| {
-                repo::add_domain(tx, domain, default.as_ref()).map(|_| ())
+                repo::add_domain(tx, domain, default.as_ref())?;
+                repo::add_dkim_key(tx, domain, selector, pair.public_base64(), &key_file)?;
+                Ok(())
             })?;
+
+            // Written only after the row committed. The other order leaves a key
+            // file for a domain that does not exist, which the next `domain add`
+            // for the same name would refuse to overwrite — and that file is the
+            // one piece of state no backup of the database restores.
+            if !cli.dry_run {
+                write_private_key(&keys_root.join(&key_file), pair.private_pem())?;
+            }
 
             if cli.json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "format_version": 1,
-                        "domain": domain.to_ascii_lowercase(),
+                        "domain": name,
                         "status": "new",
                         "default_destination": to,
+                        "dkim": {
+                            "selector": selector,
+                            "record_name": pigeon_auth::dkim::record_name(selector, &name),
+                            "record_value": pair.txt_record(),
+                            "private_key": keys_root.join(&key_file).display().to_string(),
+                        },
                     })
                 );
             } else {
-                println!("Added {}.", domain.to_ascii_lowercase());
+                println!("Adding {name}...\n");
+                println!("  Domain created");
+                println!("  DKIM key generated\n");
                 match to {
-                    Some(t) => {
-                        println!("  Mail for it forwards to {t} unless an alias says otherwise.")
-                    }
+                    Some(t) => println!("Mail forwards to {t} unless an alias says otherwise.\n"),
                     None => println!(
-                        "  It has no default destination yet, so aliases will each need --to.\n  \
-                         Set one with:  pigeon domain forward {domain} you@example.net"
+                        "It has no default destination yet, so aliases will each need --to.\n  \
+                         Set one with:  pigeon domain forward {name} you@example.net\n"
                     ),
                 }
+
+                println!("Publish this record:\n");
+                println!("  Type:  TXT");
                 println!(
-                    "\nIt will not carry mail until DNS validation moves it to ACTIVE, \
+                    "  Name:  {}",
+                    pigeon_auth::dkim::record_name(selector, &name)
+                );
+                println!("  Value: {}\n", pair.txt_record());
+
+                println!(
+                    "The private key is at {}. It never leaves this host and cannot be\n\
+                     regenerated — losing it means publishing a new record by hand. Back it up.\n",
+                    keys_root.join(&key_file).display()
+                );
+
+                println!(
+                    "{name} will not carry mail until DNS validation moves it to ACTIVE, \
                      which is Milestone 5."
                 );
                 print_reports(cli, &outcome.reports);
@@ -1199,4 +1240,69 @@ EXAMPLES
         ),
         _ => print_overview(),
     }
+}
+
+/// Where DKIM private keys live.
+///
+/// Required for `domain add`, which is why this is separate from
+/// [`database_path`]: a command that generates a key has to know the one
+/// directory it is allowed to put it in, and `--db` alone does not say.
+fn keys_root(cli: &Cli) -> anyhow::Result<PathBuf> {
+    if let Some(p) = &cli.config {
+        return Ok(pigeon_config::Config::load(p)?.keys);
+    }
+    if let Some(db) = &cli.db {
+        // Beside the database, which is where the documented layout puts it.
+        // Guessing is acceptable here only because the alternative is refusing
+        // to work at all without a full daemon configuration.
+        let guess = db
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("keys");
+        if guess.is_dir() {
+            return Ok(guess);
+        }
+        anyhow::bail!(
+            "no keys directory at {}\n\n  \
+             A DKIM private key needs somewhere to live that the daemon will look in.\n  \
+             Create it (mode 0700), or pass --config so the configured path is used.",
+            guess.display()
+        );
+    }
+    Ok(PathBuf::from("/var/lib/pigeon/keys"))
+}
+
+/// Write a private key so that only this account can read it.
+///
+/// `create_new`, so an existing key is never overwritten: it is the one piece
+/// of state no backup of the database restores, and silently replacing it makes
+/// every signature the old key made unverifiable.
+fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut f = options.open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!(
+                "a DKIM private key already exists at {}\n\n  \
+                 It was not replaced. Overwriting it would make every signature the old \n  \
+                 key made unverifiable, and no backup of the database restores it.",
+                path.display()
+            )
+        } else {
+            anyhow::anyhow!("cannot write {}: {e}", path.display())
+        }
+    })?;
+    f.write_all(pem.as_bytes())?;
+    // fsync: a key that is in the page cache and not on disk is a key that a
+    // power failure turns into a domain nobody can sign for.
+    f.sync_all()?;
+    Ok(())
 }

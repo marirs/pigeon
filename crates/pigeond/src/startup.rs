@@ -69,12 +69,38 @@ pub enum StartupError {
     Db(#[from] DbError),
 
     #[error(
-        "DKIM key for {domain} (selector {selector}) cannot be verified: this build \
-         cannot derive a public key from a private one, so it cannot tell whether the \
-         key on disk is the one published in DNS. Refusing to start rather than sign \
-         mail that may never verify."
+        "the DKIM private key for {domain} (selector {selector}) at {path} is not the \
+         one published in DNS.\n\n  \
+         Every signature it makes would verify as dkim=fail, at the receiver, \
+         silently.\n\n  \
+         Either restore the matching private key, or generate a new one and publish \
+         its record."
     )]
-    DkimUnverifiable { domain: String, selector: String },
+    DkimMismatch {
+        domain: String,
+        selector: String,
+        path: String,
+    },
+
+    #[error("DKIM key for {domain} (selector {selector}): {source}")]
+    DkimKeyUnreadable {
+        domain: String,
+        selector: String,
+        #[source]
+        source: pigeon_auth::DkimError,
+    },
+
+    #[error(
+        "the DKIM private key for {domain} (selector {selector}) at {path} is {mode:04o}. \
+         It must be no more permissive than 0600 — it is the one piece of state no backup \
+         of the database restores."
+    )]
+    DkimKeyTooPermissive {
+        domain: String,
+        selector: String,
+        path: String,
+        mode: u32,
+    },
 
     #[error("DKIM key for {domain} (selector {selector}): {source}")]
     DkimKeyUnusable {
@@ -166,65 +192,88 @@ where
 
 /// Every active DKIM key is present, contained, and provably the right one.
 ///
-/// # The last part is not implemented, and this refuses rather than pretends
+/// # Existence is not the property
 ///
-/// An existence check is not the property. A key file replaced during a botched
-/// rotation, or restored from a backup taken before the last one, exists,
-/// passes every permission check, and then signs every message with a key whose
-/// public half is not the one in DNS. Every signature verifies as `dkim=fail`,
-/// at the receiver, silently, while the daemon reports a clean start.
+/// A key file replaced during a botched rotation, or restored from a backup
+/// taken before the last one, exists and passes every permission check — and
+/// then signs every message with a key whose public half is not the one in DNS.
+/// Every signature verifies as `dkim=fail`, at the receiver, silently, while
+/// the daemon reports a clean start.
 ///
-/// Deriving the public key from the private one needs an RSA implementation
-/// that this workspace does not yet carry — it arrives with DKIM key
-/// *generation*, which is the same Milestone 1 item. Until then a row that
-/// cannot be verified stops startup.
+/// So the public key is derived from the private key and compared against the
+/// one stored beside it. Until Milestone 1 could do that, this refused to start
+/// rather than claiming a check it could not make; it now makes the check.
 ///
-/// That costs nothing today: `dkim_key` rows are created by `pigeon domain
-/// add`, which does not exist, because mutating commands wait for the snapshot
-/// builder. The check therefore has nothing to check — and saying so in code
-/// that fails loudly is the difference between a deferred branch and a comment
-/// claiming a guarantee the code does not provide.
+/// Every key is examined, not just the first: a host carrying forty domains
+/// that stops at the first good one has verified one fortieth of its signing.
 fn check_dkim_keys(db: &Connection, checked: &Checked) -> Result<(), StartupError> {
-    let mut stmt = db
-        .prepare(
-            "SELECT d.name, k.selector, k.private_key_path
-             FROM dkim_key k JOIN domain d ON d.id = k.domain_id
-             WHERE k.state = 'active'",
-        )
-        .map_err(DbError::Sqlite)?;
+    for key in pigeon_db::repo::active_dkim_keys(db)? {
+        // Containment first: a stored path is operator-editable, and without a
+        // root it can name any file the daemon can read.
+        let path = checked
+            .resolve_key(&key.private_key_path)
+            .map_err(|source| StartupError::DkimKeyUnusable {
+                domain: key.domain.clone(),
+                selector: key.selector.clone(),
+                source,
+            })?;
 
-    let mut rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(DbError::Sqlite)?;
+        require_private_key_mode(&path, &key)?;
 
-    // The first active key is enough to refuse on, so this takes one row rather
-    // than iterating. When the derivation below is implemented this becomes a
-    // loop over every key; until then, looping would only choose which of
-    // several unverifiable keys to name in the error.
-    let Some(row) = rows.next() else {
-        return Ok(());
-    };
-    let (domain, selector, path) = row.map_err(DbError::Sqlite)?;
-
-    // Containment first: a stored path is operator-editable, and without a root
-    // it can name any file the daemon can read.
-    checked
-        .resolve_key(&path)
-        .map_err(|source| StartupError::DkimKeyUnusable {
-            domain: domain.clone(),
-            selector: selector.clone(),
-            source,
+        let derived = pigeon_auth::dkim::public_from_private_file(&path).map_err(|source| {
+            StartupError::DkimKeyUnreadable {
+                domain: key.domain.clone(),
+                selector: key.selector.clone(),
+                source,
+            }
         })?;
 
-    // DEFERRED (Milestone 1, with DKIM key generation): derive the public key
-    // from the private key and compare it with `dkim_key.public_key`.
-    Err(StartupError::DkimUnverifiable { domain, selector })
+        if derived != key.public_key {
+            return Err(StartupError::DkimMismatch {
+                domain: key.domain,
+                selector: key.selector,
+                path: path.display().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A DKIM private key must not be readable by anyone else.
+///
+/// `SECURITY.md` requires `0600`. It is checked here rather than only when the
+/// key is written, because the file outlives the command that created it and
+/// nothing else ever looks at it again.
+fn require_private_key_mode(
+    path: &Path,
+    key: &pigeon_db::repo::DkimKey,
+) -> Result<(), StartupError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).map_err(|source| StartupError::DkimKeyUnreadable {
+            domain: key.domain.clone(),
+            selector: key.selector.clone(),
+            source: pigeon_auth::DkimError::Io {
+                path: path.display().to_string(),
+                source,
+            },
+        })?;
+        let mode = meta.permissions().mode() & 0o777;
+        // "No bits beyond 0600", not equality: an operator who made it 0400 has
+        // been stricter than asked.
+        if mode & !0o600 != 0 {
+            return Err(StartupError::DkimKeyTooPermissive {
+                domain: key.domain.clone(),
+                selector: key.selector.clone(),
+                path: path.display().to_string(),
+                mode,
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, key);
+    Ok(())
 }
 
 /// The alert identity must not be on a domain this Pigeon carries.
@@ -464,36 +513,128 @@ to = "me@example.net"
         start(&path, probe(ran)).await.expect("second start");
     }
 
+    /// Write a real keypair into the fixture and record it.
+    ///
+    /// `public_override` writes a *different* public key beside the private
+    /// one, which is the botched-rotation case.
+    fn install_dkim_key(f: &Fixture, db: &Connection, public_override: Option<&str>) -> String {
+        let pair = pigeon_auth::KeyPair::generate(1024).expect("generate");
+        let path = f.dir.join("keys/example.com.key");
+        std::fs::write(&path, pair.private_pem()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        db.execute_batch(
+            "INSERT OR IGNORE INTO domain(name, created_at, updated_at)
+             VALUES('example.com', 0, 0);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO dkim_key(domain_id, selector, public_key, private_key_path, created_at)
+             VALUES((SELECT id FROM domain WHERE name='example.com'), 'pigeon', ?1,
+                    'example.com.key', 0)",
+            [public_override.unwrap_or(pair.public_base64())],
+        )
+        .unwrap();
+        pair.public_base64().to_string()
+    }
+
     #[tokio::test]
-    async fn an_unverifiable_dkim_key_refuses_to_start() {
-        // The deferred branch, asserted to actually refuse. A comment saying
-        // "public key derivation is not implemented" next to code that starts
-        // anyway is the exact pattern this project keeps finding.
-        let f = Fixture::new("dkim");
+    async fn a_matching_dkim_key_starts() {
+        let f = Fixture::new("dkim-ok");
         let path = f.config("");
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let started = start(&path, probe(ran.clone())).await.expect("first start");
-        std::fs::write(f.dir.join("keys/example.com.key"), b"key").unwrap();
-        started
-            .db
-            .execute_batch(
-                "INSERT INTO domain(name, created_at, updated_at) VALUES('example.com', 0, 0);
-                 INSERT INTO dkim_key(domain_id, selector, public_key, private_key_path, created_at)
-                 VALUES(1, 'pigeon', 'PUB', 'example.com.key', 0);",
-            )
-            .unwrap();
+        install_dkim_key(&f, &started.db, None);
+        drop(started);
+
+        start(&path, probe(ran))
+            .await
+            .expect("a matching key was refused");
+    }
+
+    #[tokio::test]
+    async fn a_dkim_key_that_is_not_the_published_one_refuses_to_start() {
+        // The case an existence check passes and a signature fails: a key file
+        // replaced during a botched rotation, or restored from a backup taken
+        // before the last one. Every signature it makes verifies as dkim=fail,
+        // at the receiver, silently, while the daemon reports a clean start.
+        let f = Fixture::new("dkim-mismatch");
+        let path = f.config("");
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let started = start(&path, probe(ran.clone())).await.expect("first start");
+        let someone_elses = pigeon_auth::KeyPair::generate(1024).unwrap();
+        install_dkim_key(&f, &started.db, Some(someone_elses.public_base64()));
         drop(started);
 
         match start(&path, probe(ran)).await {
-            Err(StartupError::DkimUnverifiable { domain, selector }) => {
+            Err(StartupError::DkimMismatch {
+                domain, selector, ..
+            }) => {
                 assert_eq!(
                     (domain.as_str(), selector.as_str()),
                     ("example.com", "pigeon")
                 );
             }
             Err(other) => panic!("wrong error: {other:?}"),
-            Ok(_) => panic!("started with a DKIM key it cannot verify"),
+            Ok(_) => panic!("started with a key that is not the one published"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_world_readable_dkim_key_refuses_to_start() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new("dkim-perms");
+        let path = f.config("");
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let started = start(&path, probe(ran.clone())).await.expect("first start");
+        install_dkim_key(&f, &started.db, None);
+        drop(started);
+
+        std::fs::set_permissions(
+            f.dir.join("keys/example.com.key"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        match start(&path, probe(ran)).await {
+            Err(StartupError::DkimKeyTooPermissive { mode, .. }) => assert_eq!(mode, 0o644),
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("started with a world-readable DKIM private key"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dkim_key_whose_file_is_not_a_key_refuses_to_start() {
+        let f = Fixture::new("dkim-garbage");
+        let path = f.config("");
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let started = start(&path, probe(ran.clone())).await.expect("first start");
+        install_dkim_key(&f, &started.db, None);
+        std::fs::write(f.dir.join("keys/example.com.key"), b"not a key").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                f.dir.join("keys/example.com.key"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        drop(started);
+
+        match start(&path, probe(ran)).await {
+            Err(StartupError::DkimKeyUnreadable { .. }) => {}
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("started with a key file that is not a key"),
         }
     }
 

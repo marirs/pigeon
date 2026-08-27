@@ -530,3 +530,68 @@ pub fn clear_catchall(conn: &Connection, domain: &str) -> Result<(), DbError> {
     prune_destinations(conn)?;
     Ok(())
 }
+
+// ---------------------------------------------------------------- DKIM keys
+
+/// A key's public half and where its private half lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DkimKey {
+    pub domain: String,
+    pub selector: String,
+    pub algorithm: String,
+    pub public_key: String,
+    /// Relative to the configured keys root, which is what contains it.
+    pub private_key_path: String,
+    pub state: String,
+}
+
+/// Record a generated key.
+///
+/// The private key is **not** passed here and never enters the database. What
+/// is stored is where to find it, and the public half needed to render the
+/// record and to check the two still agree.
+pub fn add_dkim_key(
+    conn: &Connection,
+    domain: &str,
+    selector: &str,
+    public_key: &str,
+    private_key_path: &str,
+) -> Result<i64, DbError> {
+    let id = domain_id(conn, domain)?;
+    conn.execute(
+        "INSERT INTO dkim_key (domain_id, selector, algorithm, public_key,
+                               private_key_path, state, created_at)
+         VALUES (?1, ?2, 'rsa2048', ?3, ?4, 'active', ?5)",
+        params![id, selector, public_key, private_key_path, now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Active keys, for the startup verification and for `dns show`.
+pub fn active_dkim_keys(conn: &Connection) -> Result<Vec<DkimKey>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT d.name, k.selector, k.algorithm, k.public_key, k.private_key_path, k.state
+         FROM dkim_key k JOIN domain d ON d.id = k.domain_id
+         WHERE k.state = 'active'
+         ORDER BY d.name, k.selector",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(DkimKey {
+            domain: r.get(0)?,
+            selector: r.get(1)?,
+            algorithm: r.get(2)?,
+            public_key: r.get(3)?,
+            private_key_path: r.get(4)?,
+            state: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// A domain's active keys.
+pub fn dkim_keys_for(conn: &Connection, domain: &str) -> Result<Vec<DkimKey>, DbError> {
+    Ok(active_dkim_keys(conn)?
+        .into_iter()
+        .filter(|k| k.domain == domain.to_ascii_lowercase())
+        .collect())
+}
