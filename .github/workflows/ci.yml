@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+  no-openssl:
+    name: no openssl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Belt and braces. cargo-deny enforces the policy declaratively; the
+      # cargo tree check catches the same thing even if deny.toml is edited,
+      # and prints the dependency path that introduced it.
+      # --target all, because deny.toml checks every target and a
+      # platform-gated openssl-sys would otherwise slip past the host-only view.
+      - name: Resolve dependency graph
+        run: cargo tree --workspace --all-features --target all > /tmp/tree.txt
+
+      - name: Assert no OpenSSL
+        run: |
+          if grep -Eiq '(^|[^a-z-])(openssl|openssl-sys|openssl-src|openssl-probe|native-tls|tokio-native-tls|hyper-tls|aws-lc-rs|aws-lc-sys)([^a-z-]|$)' /tmp/tree.txt; then
+            echo "::error::A banned TLS backend entered the dependency graph."
+            echo
+            echo "Offending paths:"
+            cargo tree --workspace --all-features --invert openssl-sys 2>/dev/null || true
+            cargo tree --workspace --all-features --invert aws-lc-sys 2>/dev/null || true
+            echo
+            echo "Pigeon builds without OpenSSL. See deny.toml for the reasoning."
+            exit 1
+          fi
+          echo "No OpenSSL in the dependency graph."
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  msrv:
+    name: minimum supported Rust
+    runs-on: ubuntu-latest
+    # rust-toolchain.toml pins `channel = "stable"`, and rustup's directory
+    # override beats the toolchain this action installs. Without the explicit
+    # override below the job silently ran on current stable and could not fail,
+    # which made it decorative.
+    env:
+      RUSTUP_TOOLCHAIN: 1.88.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Confirm the pinned toolchain is actually in use
+        run: |
+          rustc --version
+          rustc --version | grep -q '1\.88\.0' || {
+            echo "::error::MSRV job is not running on 1.88.0"; exit 1; }
+      - run: cargo check --workspace --all-features
