@@ -55,12 +55,19 @@ bytes       = "1"
 
 # Mail
 # Both are pure Rust and use RustCrypto primitives rather than a C backend.
-# RSA key generation only. `ring` cannot generate RSA keys — mail-auth carries
-# the same TODO — and every other option is a banned TLS backend.
+# RSA key generation and parsing only. `ring` cannot generate RSA keys —
+# mail-auth carries the same TODO — and every other option is a banned TLS
+# backend.
 #
-# default-features off keeps the PKCS#1v1.5 *decryption* paths out of the build
-# along with everything else we do not use.
-rsa         = { version = "0.9", default-features = false, features = ["std", "getrandom", "pem"] }
+# The feature list selects `std`, PEM encoding, the 64-bit digit representation
+# and an OS RNG. It does **not** remove the decryption API: `rsa`'s features
+# govern encoding and arithmetic, not which operations exist. An earlier comment
+# here claimed otherwise, which would have made the deny.toml exception rest on
+# something untrue.
+#
+# What actually holds the exception is a CI grep over the source tree for
+# decryption calls — a *use* guard, not an absence. See deny.toml.
+rsa         = { version = "0.9", default-features = false, features = ["std", "getrandom", "pem", "u64_digit"] }
 mail-auth   = "0.7"
 mail-parser = "0.11"
 
@@ -95,6 +102,10 @@ rusqlite = { version = "0.40", features = ["bundled", "backup", "hooks"] }
 
 # Migration checksums (M1-SCHEMA.md I2). Pure Rust, RustCrypto.
 sha2 = "0.10"
+
+# Zeroizing<String> for DKIM private key material. Already in the graph via rsa;
+# named directly so the dependency is visible where it is relied on.
+zeroize = { version = "1", features = ["std"] }
 
 # Plumbing
 serde       = { version = "1", features = ["derive"] }

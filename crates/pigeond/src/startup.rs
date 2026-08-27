@@ -224,7 +224,20 @@ fn check_dkim_keys(db: &Connection, checked: &Checked) -> Result<(), StartupErro
 
         require_private_key_mode(&path, &key)?;
 
-        let derived = pigeon_auth::dkim::public_from_private_file(&path).map_err(|source| {
+        let (derived, shape) =
+            pigeon_auth::dkim::inspect_private_file(&path).map_err(|source| {
+                StartupError::DkimKeyUnreadable {
+                    domain: key.domain.clone(),
+                    selector: key.selector.clone(),
+                    source: Box::new(source),
+                }
+            })?;
+
+        // The algorithm was recorded and then ignored. A 1024-bit key stored as
+        // `rsa2048` matches its own public half perfectly and starts the daemon,
+        // while the record in DNS advertises a strength the signing key does not
+        // have.
+        pigeon_auth::dkim::check_algorithm(&key.algorithm, shape).map_err(|source| {
             StartupError::DkimKeyUnreadable {
                 domain: key.domain.clone(),
                 selector: key.selector.clone(),
@@ -527,14 +540,52 @@ to = "me@example.net"
         start(&path, probe(ran)).await.expect("second start");
     }
 
+    /// Two real 2048-bit keypairs, generated once for the whole test binary.
+    ///
+    /// Real size, because the startup check now verifies the key against the
+    /// algorithm recorded for it and a 1024-bit key stored as `rsa2048` is
+    /// exactly what it exists to refuse. Generating 2048 bits per test would
+    /// cost seconds each, so they are made once and reused.
+    ///
+    /// Held as plain `String`s rather than `KeyPair`, which is deliberately not
+    /// `Clone` — test key material in a static is not wiped, and that is
+    /// acceptable here in a way it is not in the daemon.
+    fn test_keys() -> &'static [(String, String); 2] {
+        static KEYS: std::sync::OnceLock<[(String, String); 2]> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            let one = pigeon_auth::KeyPair::generate(2048).expect("generate");
+            let two = pigeon_auth::KeyPair::generate(2048).expect("generate");
+            [
+                (
+                    one.private_pem().to_string(),
+                    one.public_base64().to_string(),
+                ),
+                (
+                    two.private_pem().to_string(),
+                    two.public_base64().to_string(),
+                ),
+            ]
+        })
+    }
+
     /// Write a real keypair into the fixture and record it.
     ///
     /// `public_override` writes a *different* public key beside the private
     /// one, which is the botched-rotation case.
     fn install_dkim_key(f: &Fixture, db: &Connection, public_override: Option<&str>) -> String {
-        let pair = pigeon_auth::KeyPair::generate(1024).expect("generate");
+        install_dkim_key_as(f, db, public_override, "rsa2048", 0)
+    }
+
+    fn install_dkim_key_as(
+        f: &Fixture,
+        db: &Connection,
+        public_override: Option<&str>,
+        algorithm: &str,
+        which: usize,
+    ) -> String {
+        let (private_pem, public_base64) = &test_keys()[which];
         let path = f.dir.join("keys/example.com.key");
-        std::fs::write(&path, pair.private_pem()).unwrap();
+        std::fs::write(&path, private_pem).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -546,13 +597,14 @@ to = "me@example.net"
         )
         .unwrap();
         db.execute(
-            "INSERT INTO dkim_key(domain_id, selector, public_key, private_key_path, created_at)
-             VALUES((SELECT id FROM domain WHERE name='example.com'), 'pigeon', ?1,
+            "INSERT INTO dkim_key(domain_id, selector, algorithm, public_key,
+                                  private_key_path, created_at)
+             VALUES((SELECT id FROM domain WHERE name='example.com'), 'pigeon', ?2, ?1,
                     'example.com.key', 0)",
-            [public_override.unwrap_or(pair.public_base64())],
+            rusqlite::params![public_override.unwrap_or(public_base64), algorithm],
         )
         .unwrap();
-        pair.public_base64().to_string()
+        public_base64.clone()
     }
 
     #[tokio::test]
@@ -581,8 +633,8 @@ to = "me@example.net"
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let started = start(&path, probe(ran.clone())).await.expect("first start");
-        let someone_elses = pigeon_auth::KeyPair::generate(1024).unwrap();
-        install_dkim_key(&f, &started.db, Some(someone_elses.public_base64()));
+        let someone_elses = test_keys()[1].1.clone();
+        install_dkim_key(&f, &started.db, Some(&someone_elses));
         drop(started);
 
         match start(&path, probe(ran)).await {
@@ -596,6 +648,79 @@ to = "me@example.net"
             }
             Err(other) => panic!("wrong error: {other:?}"),
             Ok(_) => panic!("started with a key that is not the one published"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_smaller_than_its_recorded_algorithm_refuses_to_start() {
+        // The algorithm column was recorded and then ignored. A 1024-bit key
+        // stored as `rsa2048` matches its own public half perfectly, so every
+        // other check here passes — while the record published in DNS
+        // advertises a strength the signing key does not have.
+        let f = Fixture::new("dkim-size");
+        let path = f.config("");
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let started = start(&path, probe(ran.clone())).await.expect("first start");
+        let small = pigeon_auth::KeyPair::generate(1024).expect("generate");
+        std::fs::write(f.dir.join("keys/example.com.key"), small.private_pem()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                f.dir.join("keys/example.com.key"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        started
+            .db
+            .execute_batch(
+                "INSERT INTO domain(name, created_at, updated_at) VALUES('example.com',0,0);",
+            )
+            .unwrap();
+        started
+            .db
+            .execute(
+                "INSERT INTO dkim_key(domain_id, selector, algorithm, public_key,
+                                      private_key_path, created_at)
+                 VALUES(1, 'pigeon', 'rsa2048', ?1, 'example.com.key', 0)",
+                [small.public_base64()],
+            )
+            .unwrap();
+        drop(started);
+
+        match start(&path, probe(ran)).await {
+            Err(StartupError::DkimKeyUnreadable { .. }) => {}
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("started with a 1024-bit key recorded as rsa2048"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ed25519_key_is_refused_rather_than_misparsed() {
+        // Not implemented. Without an explicit refusal it reaches the RSA
+        // parser and fails with a confusing message about PKCS#8.
+        let f = Fixture::new("dkim-ed");
+        let path = f.config("");
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let started = start(&path, probe(ran.clone())).await.expect("first start");
+        install_dkim_key_as(&f, &started.db, None, "ed25519", 0);
+        drop(started);
+
+        match start(&path, probe(ran)).await {
+            Err(StartupError::DkimKeyUnreadable { source, .. }) => {
+                assert!(
+                    matches!(
+                        *source,
+                        pigeon_auth::DkimError::AlgorithmNotImplemented { .. }
+                    ),
+                    "{source:?}"
+                );
+            }
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("started with an ed25519 key that nothing can use"),
         }
     }
 

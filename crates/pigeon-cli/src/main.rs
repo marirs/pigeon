@@ -424,21 +424,46 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
             // command for no reason.
             let pair = pigeon_auth::KeyPair::generate(pigeon_auth::dkim::DEFAULT_BITS)?;
             let selector = pigeon_auth::dkim::DEFAULT_SELECTOR;
-            let key_file = format!("{name}.key");
+
+            // A name no earlier key can already hold.
+            //
+            // `{domain}.key` collided deterministically: `domain remove` keeps
+            // the key file on purpose — it is the one piece of state no backup
+            // of the database restores — so a later `domain add` for the same
+            // name met a file `create_new` refused. With the write after the
+            // commit, that left the domain committed against a public key whose
+            // private half was the *previous* key, and the daemon then refused
+            // to start. Reproduced before fixing.
+            let key_file = format!("{name}.{selector}.{}.key", nonce());
+            let key_path = keys_root.join(&key_file);
+
+            // Written and fsynced *before* the transaction, so the row can only
+            // ever name a key that is already durable. The reverse order — the
+            // one this replaces — turns any write or fsync failure into a
+            // committed domain with no usable key.
+            if !cli.dry_run {
+                write_private_key(&key_path, pair.private_pem())?;
+            }
 
             let outcome = apply(cli, &mut conn, |tx| {
                 repo::add_domain(tx, domain, default.as_ref())?;
-                repo::add_dkim_key(tx, domain, selector, pair.public_base64(), &key_file)?;
-                Ok(())
-            })?;
+                repo::add_dkim_key(tx, domain, selector, pair.public_base64(), &key_file)
+                    .map(|_| ())
+            });
 
-            // Written only after the row committed. The other order leaves a key
-            // file for a domain that does not exist, which the next `domain add`
-            // for the same name would refuse to overwrite — and that file is the
-            // one piece of state no backup of the database restores.
-            if !cli.dry_run {
-                write_private_key(&keys_root.join(&key_file), pair.private_pem())?;
-            }
+            // A key file whose transaction did not commit belongs to no domain
+            // and can never be referenced, since the next attempt generates a
+            // new name. Removing it here keeps a failed command from leaving
+            // private key material behind.
+            let outcome = match outcome {
+                Ok(o) => o,
+                Err(e) => {
+                    if !cli.dry_run {
+                        let _ = std::fs::remove_file(&key_path);
+                    }
+                    return Err(e.into());
+                }
+            };
 
             if cli.json {
                 println!(
@@ -452,7 +477,7 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
                             "selector": selector,
                             "record_name": pigeon_auth::dkim::record_name(selector, &name),
                             "record_value": pair.txt_record(),
-                            "private_key": keys_root.join(&key_file).display().to_string(),
+                            "private_key": key_path.display().to_string(),
                         },
                     })
                 );
@@ -479,7 +504,7 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
                 println!(
                     "The private key is at {}. It never leaves this host and cannot be\n\
                      regenerated — losing it means publishing a new record by hand. Back it up.\n",
-                    keys_root.join(&key_file).display()
+                    key_path.display()
                 );
 
                 println!(
@@ -1301,8 +1326,29 @@ fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
         }
     })?;
     f.write_all(pem.as_bytes())?;
-    // fsync: a key that is in the page cache and not on disk is a key that a
+    // fsync the file: a key in the page cache and not on disk is a key that a
     // power failure turns into a domain nobody can sign for.
     f.sync_all()?;
+    drop(f);
+
+    // And the directory, so the *name* is durable too. Without this the file's
+    // contents survive a crash and its directory entry may not, which is the
+    // same outcome by a different route.
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
     Ok(())
+}
+
+/// A short random component for a key filename.
+///
+/// Not a security boundary — the file is `0600` in a `0700` directory and its
+/// name is stored in the database. It exists so that a key file can never
+/// collide with one an earlier domain of the same name left behind, which is
+/// what made `remove` then `add` break deterministically.
+fn nonce() -> String {
+    use rsa::rand_core::RngCore;
+    let mut bytes = [0u8; 6];
+    rsa::rand_core::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

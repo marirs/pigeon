@@ -991,6 +991,7 @@ dependencies = [
  "pigeon-types",
  "rsa",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -1005,6 +1006,7 @@ dependencies = [
  "pigeon-dns",
  "pigeon-route",
  "pigeon-types",
+ "rsa",
  "rusqlite",
  "serde_json",
 ]

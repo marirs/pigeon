@@ -229,6 +229,86 @@ private key, and rendering a record with an empty `p=` tag.
 
 ---
 
+## 7. Four findings against the DKIM work
+
+### The key was written after the commit
+
+`domain add` committed the row and then wrote the private key. The reasoning was
+about the wrong failure: a key file for a domain that does not exist looked like
+the thing to avoid, and the opposite — a domain that exists with no usable key —
+is worse and was deterministically reachable.
+
+`domain remove` keeps the key file on purpose, because it is the one piece of
+state no backup of the database restores. So with `{domain}.key` as the name:
+
+```text
+domain add example.com      -> row committed, example.com.key written
+domain remove example.com   -> row gone, example.com.key kept
+domain add example.com      -> new row committed with a NEW public key
+                               create_new refuses the existing file
+                               daemon now refuses to start
+```
+
+Reproduced against a real daemon before fixing, and the daemon's own message was
+the one that named it: *"the DKIM private key ... is not the one published in
+DNS."* The startup check caught the damage the command had done.
+
+**Fixed:** a key file name carrying a random component, written and fsynced —
+file *and* parent directory — before the transaction opens, so a row can only
+name a key that is already durable. A transaction that rolls back removes the
+file, since a key belonging to no domain is private key material left behind by
+a failed command.
+
+Seven tests now drive the real binary. That level matters: the repository was
+correct, the key writer was correct, the transaction was correct, and the
+command composed them wrongly. Nothing below the command could see it.
+
+### `Debug` printed the private key
+
+`KeyPair` derived `Debug`, so `{:?}` in a log line, an error, a panic message or
+a failing assertion would have written the complete private key wherever that
+went. `SECURITY.md` says DKIM private keys are never logged; a derive is how
+that stops being true without anyone deciding it.
+
+`to_pkcs8_pem` also returns `Zeroizing<String>`, and the code called
+`.to_string()` on it — copying the key into an ordinary `String` that is freed
+without being cleared.
+
+**Fixed:** manual redacting `Debug`, `Zeroizing` retained rather than copied out
+of, `Clone` removed, and the PEM read at startup zeroized too.
+
+### The recorded algorithm was ignored
+
+`dkim_key.algorithm` was stored and never read. A 1024-bit key recorded as
+`rsa2048` matches its own public half perfectly, so every other check passed —
+while the record published in DNS advertised a strength the signing key did not
+have.
+
+**Fixed:** the key's modulus size is checked against the recorded algorithm, and
+`ed25519` is refused explicitly rather than reaching the RSA parser and failing
+with a confusing message about PKCS#8.
+
+This also made the tests honest: they generated 1024-bit keys and recorded them
+as `rsa2048`, which the check correctly refuses. They now use real 2048-bit
+keys, generated once per test binary.
+
+### A comment overclaimed what a feature flag does
+
+`Cargo.toml` said `default-features = false` kept the RSA decryption paths out
+of the build. It does not: `rsa`'s features govern encoding and arithmetic, not
+which operations exist.
+
+The exception in `deny.toml` is still defensible — RustSec's own guidance is
+that the exposure is to *observable* private-key operations and that local use
+is acceptable, and Pigeon's use is offline generation and parsing. But it rests
+on a **source-use guard**, not on absence from the build, and the comment now
+says so.
+
+Five mutations, all caught: the original ordering, a non-unique key name, no
+cleanup after rollback, a derived `Debug`, and the algorithm check disabled.
+
+---
+
 ## What to carry into the rest of Milestone 1
 - Live configuration reload, so a mutation reaches a running daemon without a
   restart. Until it exists, the CLI says so after every change.

@@ -28,9 +28,14 @@ ignore = [
     # mail-auth carries the same TODO for the same reason. Every other option is
     # a TLS backend this workspace bans.
     #
-    # CI asserts the narrow use, so this stays an argument about what the code
-    # does rather than about what it intends: see the "no RSA decryption" step
-    # in .github/workflows/ci.yml.
+    # RustSec's own guidance is that the exposure is to *observable* private-key
+    # operations, and that local use is acceptable. Pigeon's use is offline
+    # generation and parsing, with no attacker anywhere near it.
+    #
+    # The decryption API is still compiled in — `rsa`'s features govern encoding
+    # and arithmetic, not which operations exist — so this is a guard on how the
+    # source uses the crate, not on what the build contains. CI greps for
+    # decryption calls: see the "no RSA decryption" step in ci.yml.
     #
     # REVISIT AT MILESTONE 2, when DKIM *signing* arrives. Signing is a private
     # key operation over attacker-influenceable content, and it must use `ring`

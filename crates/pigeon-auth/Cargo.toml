@@ -12,4 +12,5 @@ publish.workspace      = true
 [dependencies]
 pigeon-types = { workspace = true }
 rsa = { workspace = true }
+zeroize = { workspace = true }
 thiserror = { workspace = true }

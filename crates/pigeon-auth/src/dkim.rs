@@ -23,7 +23,9 @@
 //! never in any output.
 
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
+use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
+use zeroize::Zeroizing;
 
 /// The selector Pigeon publishes under unless told otherwise.
 ///
@@ -68,6 +70,29 @@ pub enum DkimError {
     },
 
     #[error(
+        "the DKIM key recorded as {recorded} is {actual} bits, not {expected}.\n\n  \
+         The record published in DNS advertises a key of a different strength than the \
+         one signing with it. Generate a new key of the recorded type, or correct the \
+         record."
+    )]
+    WrongKeySize {
+        recorded: String,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error(
+        "DKIM algorithm {algorithm} is recorded but not implemented. Ed25519 is a \
+         Milestone 5 item, and is only ever an additional selector alongside RSA — a \
+         domain publishing it alone fails DKIM at every receiver that has not \
+         implemented RFC 8463."
+    )]
+    AlgorithmNotImplemented { algorithm: String },
+
+    #[error("DKIM algorithm {algorithm:?} is not one this build recognises")]
+    UnknownAlgorithm { algorithm: String },
+
+    #[error(
         "the private key at {path} does not match the public key published for \
          {selector}._domainkey.{domain}.\n\n  \
          Every signature this key makes would verify as dkim=fail, at the receiver, \
@@ -86,10 +111,35 @@ pub enum DkimError {
 ///
 /// The private half is PKCS#8 PEM, ready to write to disk. The public half is
 /// the base64 that goes in the `p=` tag.
-#[derive(Debug, Clone)]
+///
+/// # Not `Debug`-derived, and not `Clone`
+///
+/// A derived `Debug` prints every field, so `{:?}` on this — in a log line, an
+/// error, a panic message, a test failure — would have written the complete
+/// private key wherever that went. `SECURITY.md` says DKIM private keys are
+/// never logged; a derive is how that stops being true without anybody
+/// deciding it.
+///
+/// `Clone` is absent for a duller reason: every copy is another buffer to
+/// wipe, and there is no use for a second one.
 pub struct KeyPair {
-    private_pem: String,
+    /// `Zeroizing`, so the buffer is wiped when it drops.
+    ///
+    /// `to_pkcs8_pem` already returns one; the earlier version called
+    /// `.to_string()` on it, which copied the key into an ordinary `String`
+    /// that is freed without being cleared and leaves the material in whatever
+    /// the allocator hands out next.
+    private_pem: Zeroizing<String>,
     public_base64: String,
+}
+
+impl std::fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyPair")
+            .field("private_pem", &"<redacted>")
+            .field("public_base64", &self.public_base64)
+            .finish()
+    }
 }
 
 impl KeyPair {
@@ -108,14 +158,26 @@ impl KeyPair {
     fn from_private(private: RsaPrivateKey) -> Result<Self, DkimError> {
         let public = RsaPublicKey::from(&private);
         Ok(Self {
-            private_pem: private.to_pkcs8_pem(LineEnding::LF)?.to_string(),
+            private_pem: private.to_pkcs8_pem(LineEnding::LF)?,
             public_base64: spki_base64(&public)?,
         })
     }
 
     /// PKCS#8 PEM. Write it `0600` and never print it.
+    ///
+    /// Borrowed rather than returned by value so a caller cannot casually take
+    /// ownership of a copy that nothing wipes.
     pub fn private_pem(&self) -> &str {
         &self.private_pem
+    }
+
+    /// The key size, for recording alongside the public half.
+    pub fn bits(&self) -> usize {
+        // Parsed back rather than remembered: this is the number a verifier
+        // will compute from the key on disk, so it is the one worth reporting.
+        RsaPrivateKey::from_pkcs8_pem(&self.private_pem)
+            .map(|k| k.n().bits())
+            .unwrap_or(0)
     }
 
     /// The base64 for the `p=` tag, and what is stored in `dkim_key.public_key`.
@@ -141,6 +203,86 @@ pub fn txt_record(public_base64: &str) -> String {
 /// The DNS name a selector is published at.
 pub fn record_name(selector: &str, domain: &str) -> String {
     format!("{selector}._domainkey.{domain}")
+}
+
+/// What `dkim_key.algorithm` records, and what it implies about the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Algorithm {
+    Rsa2048,
+    Ed25519,
+}
+
+impl Algorithm {
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        match raw {
+            "rsa2048" => Some(Self::Rsa2048),
+            "ed25519" => Some(Self::Ed25519),
+            _ => None,
+        }
+    }
+}
+
+/// What a private key on disk actually is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyShape {
+    pub bits: usize,
+}
+
+/// Read a private key and report the public half *and* the key's shape.
+///
+/// The shape matters because the database records an algorithm and the earlier
+/// check ignored it: a 1024-bit key recorded as `rsa2048` matched its own
+/// public half perfectly and started the daemon. The record published in DNS
+/// would then advertise a key half the strength of what the configuration
+/// claims, and nothing would say so.
+pub fn inspect_private_file(path: &std::path::Path) -> Result<(String, KeyShape), DkimError> {
+    // Zeroized on drop. The earlier version read the key into a plain `String`
+    // that was freed without being cleared.
+    let pem = Zeroizing::new(
+        std::fs::read_to_string(path).map_err(|source| DkimError::Io {
+            path: path.display().to_string(),
+            source,
+        })?,
+    );
+
+    let private = RsaPrivateKey::from_pkcs8_pem(&pem).map_err(|source| DkimError::ReadPrivate {
+        path: path.display().to_string(),
+        source,
+    })?;
+
+    let public = RsaPublicKey::from(&private);
+    Ok((
+        spki_base64(&public)?,
+        KeyShape {
+            bits: public.n().bits(),
+        },
+    ))
+}
+
+/// Check a key's shape against the algorithm recorded for it.
+pub fn check_algorithm(recorded: &str, shape: KeyShape) -> Result<(), DkimError> {
+    match Algorithm::from_stored(recorded) {
+        Some(Algorithm::Rsa2048) => {
+            if shape.bits != 2048 {
+                return Err(DkimError::WrongKeySize {
+                    recorded: recorded.to_string(),
+                    expected: 2048,
+                    actual: shape.bits,
+                });
+            }
+            Ok(())
+        }
+        // Refused rather than skipped. An Ed25519 row would reach the RSA
+        // parser above and fail with a confusing message about PKCS#8; saying
+        // it is not implemented is the honest version, and it is on the
+        // Milestone 5 list.
+        Some(Algorithm::Ed25519) => Err(DkimError::AlgorithmNotImplemented {
+            algorithm: "ed25519".to_string(),
+        }),
+        None => Err(DkimError::UnknownAlgorithm {
+            algorithm: recorded.to_string(),
+        }),
+    }
 }
 
 /// Derive the public key from a private key on disk, as base64.
@@ -277,5 +419,51 @@ mod tests {
         let err = public_from_private_file(std::path::Path::new("/nonexistent/pigeon.key"))
             .expect_err("read a key that is not there");
         assert!(matches!(err, DkimError::Io { .. }), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod redaction {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_the_private_key() {
+        // A derived Debug prints every field. `{:?}` in a log line, an error, a
+        // panic message or a failing assertion would then have written the
+        // complete private key wherever that went.
+        let pair = KeyPair::generate(1024).unwrap();
+        let printed = format!("{pair:?}");
+        assert!(
+            !printed.contains("PRIVATE KEY"),
+            "Debug leaked the private key: {printed}"
+        );
+        assert!(printed.contains("<redacted>"), "{printed}");
+        // The public half is not a secret and is useful in a log.
+        assert!(printed.contains(pair.public_base64()));
+    }
+
+    #[test]
+    fn a_key_reports_its_real_size() {
+        assert_eq!(KeyPair::generate(1024).unwrap().bits(), 1024);
+    }
+
+    #[test]
+    fn the_recorded_algorithm_is_checked_against_the_key() {
+        let small = KeyShape { bits: 1024 };
+        let right = KeyShape { bits: 2048 };
+
+        assert!(check_algorithm("rsa2048", right).is_ok());
+        assert!(matches!(
+            check_algorithm("rsa2048", small),
+            Err(DkimError::WrongKeySize { actual: 1024, .. })
+        ));
+        assert!(matches!(
+            check_algorithm("ed25519", right),
+            Err(DkimError::AlgorithmNotImplemented { .. })
+        ));
+        assert!(matches!(
+            check_algorithm("rsa4096", right),
+            Err(DkimError::UnknownAlgorithm { .. })
+        ));
     }
 }

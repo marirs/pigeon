@@ -19,7 +19,13 @@ serde_json = { workspace = true }
 pigeon-config = { workspace = true }
 pigeon-db = { workspace = true }
 pigeon-auth = { workspace = true }
+rsa = { workspace = true }
 pigeon-dns = { workspace = true }
+
+[dev-dependencies]
+pigeon-db = { workspace = true }
+pigeon-auth = { workspace = true }
+serde_json = { workspace = true }
 
 [[bin]]
 name = "pigeon"
