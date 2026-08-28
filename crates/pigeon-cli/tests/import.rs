@@ -568,3 +568,188 @@ fn the_json_response_follows_the_contract() {
         "conflicts must be [] not absent"
     );
 }
+
+// ------------------------------------------------- review findings, pinned
+
+#[test]
+fn a_reject_catch_all_is_refused() {
+    // It became `catchall_enabled = 1` with no own destination, which forwards
+    // via the domain default — turning a rule that says "refuse everything"
+    // into one that accepts everything.
+    let f = Fixture::new("rejectcatchall");
+    f.run(&["domain", "add", "example.com", "--to", "me@example.net"]);
+    let file = f.csv("a.csv", "address,destination,kind\n*@example.com,,reject\n");
+
+    let v = f.json(&["import", "csv", &file.display().to_string(), "--merge"]);
+    assert_eq!(v["conflicts"][0]["kind"], "reject_catchall", "{v}");
+
+    let show = f.json(&["domain", "show", "example.com"]);
+    assert_eq!(show["catchall"], false, "a reject row enabled a catch-all");
+}
+
+#[test]
+fn a_catch_all_cannot_fan_out() {
+    // Two rows silently became one destination, and which one depended on file
+    // order.
+    let f = Fixture::new("catchallfanout");
+    let file = f.csv(
+        "a.csv",
+        "address,destination\n*@example.com,a@x.test\n*@example.com,b@x.test\n",
+    );
+
+    let v = f.json(&["import", "csv", &file.display().to_string()]);
+    assert_eq!(v["conflicts"][0]["kind"], "catchall_fan_out", "{v}");
+    assert_eq!(f.domain_count(), 0);
+}
+
+#[test]
+fn merge_refuses_a_differing_catch_all_rather_than_overwriting_it() {
+    // `--merge` promises to change nothing that is already there, and the
+    // catch-all was the one rule it silently replaced.
+    let f = Fixture::new("mergecatchall");
+    f.run(&["domain", "add", "example.com", "--to", "me@example.net"]);
+    f.run(&["catchall", "add", "example.com", "--to", "original@x.test"]);
+
+    let file = f.csv(
+        "a.csv",
+        "address,destination\n*@example.com,different@x.test\n",
+    );
+    let v = f.json(&["import", "csv", &file.display().to_string(), "--merge"]);
+    assert_eq!(v["conflicts"][0]["kind"], "existing_alias_differs", "{v}");
+
+    let show = f.json(&["domain", "show", "example.com"]);
+    assert_eq!(show["catchall"], true);
+    let conn = pigeon_db::open_read_only(&f.db()).unwrap();
+    let current: String = conn
+        .query_row(
+            "SELECT d.local || '@' || d.domain FROM domain dom
+             JOIN destination d ON d.id = dom.catchall_destination_id
+             WHERE dom.name = 'example.com'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(current, "original@x.test", "merge overwrote the catch-all");
+}
+
+#[test]
+fn an_identical_catch_all_under_merge_is_unchanged() {
+    let f = Fixture::new("samecatchall");
+    f.run(&["domain", "add", "example.com", "--to", "me@example.net"]);
+    f.run(&["catchall", "add", "example.com", "--to", "same@x.test"]);
+
+    let file = f.csv("a.csv", "address,destination\n*@example.com,same@x.test\n");
+    let (ok, stdout, err) = f.import(&file, &["--merge", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["aliases_unchanged"], 1, "{v}");
+    assert_eq!(
+        v["catchalls_set"], 0,
+        "an identical catch-all was rewritten"
+    );
+}
+
+#[test]
+fn an_invalid_domain_is_refused_before_any_key_is_generated() {
+    // It used to reach key generation and be caught by the snapshot — a minute
+    // of work and a file on disk for a row the file could have been told about
+    // immediately.
+    let f = Fixture::new("baddomain");
+    let file = f.csv(
+        "a.csv",
+        "address,destination\nhello@not_a_domain,me@x.test\nhello@no-dot,me@x.test\n",
+    );
+
+    let v = f.json(&["import", "csv", &file.display().to_string()]);
+    let kinds: Vec<&str> = v["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["invalid_domain", "invalid_domain"], "{v}");
+    assert_eq!(
+        f.key_count(),
+        0,
+        "a key was generated for an unusable domain"
+    );
+}
+
+#[test]
+fn malformed_quoting_is_refused_rather_than_rewritten() {
+    // An unterminated quote used to be read as though it were not there, which
+    // imports a different address than the file names.
+    let f = Fixture::new("badquotes");
+
+    let unterminated = f.csv(
+        "a.csv",
+        "address,destination\nhello@example.com,\"me@example.net\n",
+    );
+    let v = f.json(&["import", "csv", &unterminated.display().to_string()]);
+    assert_eq!(v["conflicts"][0]["kind"], "malformed_csv", "{v}");
+
+    let inner = f.csv(
+        "b.csv",
+        "address,destination\nhello@example.com,me\"@example.net\n",
+    );
+    let v = f.json(&["import", "csv", &inner.display().to_string()]);
+    assert_eq!(v["conflicts"][0]["kind"], "malformed_csv", "{v}");
+
+    assert_eq!(f.domain_count(), 0);
+}
+
+#[test]
+fn a_duplicated_header_column_is_refused() {
+    // Taking the first or the last is a coin toss over which column holds the
+    // data, and the file gives no way to tell which the exporter meant.
+    let f = Fixture::new("duphdr");
+    let file = f.csv(
+        "a.csv",
+        "address,destination,destination\nhello@example.com,a@x.test,b@x.test\n",
+    );
+    let v = f.json(&["import", "csv", &file.display().to_string()]);
+    assert_eq!(v["conflicts"][0]["kind"], "duplicate_header", "{v}");
+}
+
+#[test]
+fn a_real_run_snapshot_failure_reports_conflicts_not_a_generic_error() {
+    // The loop between two imported rows is found inside the transaction, and
+    // its failure has to have the same shape as one found in the file — the
+    // contract promises a `conflicts` array for `import_conflicts`.
+    let f = Fixture::new("realconflict");
+    let file = f.csv(
+        "a.csv",
+        "address,destination\na@one.test,b@two.test\nb@two.test,a@one.test\n",
+    );
+
+    let v = f.json(&["import", "csv", &file.display().to_string()]);
+    assert_eq!(v["error"]["code"], "import_conflicts", "{v}");
+    assert_eq!(v["conflicts"][0]["kind"], "unserveable", "{v}");
+    assert!(
+        v["conflicts"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("loop"),
+        "{v}"
+    );
+}
+
+#[test]
+fn a_dry_run_counts_only_the_aliases_it_would_create() {
+    // `rule_count` counted catch-alls as aliases and counted rules already
+    // present, so a dry run of a no-op import claimed it would create
+    // everything in the file.
+    let f = Fixture::new("dryruncount");
+    let file = f.csv(
+        "a.csv",
+        "address,destination\nhello@example.com,me@example.net\n*@example.com,all@example.net\n",
+    );
+    assert!(f.import(&file, &[]).0);
+
+    let (ok, stdout, err) = f.import(&file, &["--merge", "--dry-run", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["aliases_created"], 0, "{v}");
+    assert_eq!(v["aliases_unchanged"], 2, "{v}");
+    assert_eq!(v["catchalls_set"], 1, "{v}");
+}

@@ -26,8 +26,9 @@ input format it needs, and the one decision that must never be inferred.
    apply every row
    build the prospective snapshot
    validate it
-6. commit once            <- the point of no return
-7. publish the snapshot
+6. commit once            <- the point of no return, and the end of the
+                             CLI's operation
+7. publication is the daemon's, not the CLI's — see below
 ```
 
 **Every returned error leaves zero imported rows and removes every key this run
@@ -83,6 +84,10 @@ only thing that can see it is a snapshot built from both.
 | Snapshot invalid (step 5) | Transaction rolls back; keys removed |
 | Commit fails (step 6) | Transaction rolls back; keys removed |
 
+Keys the cleanup itself could not remove are named in the failure. They are
+inert — nothing references them and no later run reuses their names — but a
+command that leaves private key material behind should say which files.
+
 A key that cannot be removed during cleanup is reported by name. It is inert —
 no row references it, and no later import will choose the same name — but a file
 holding private key material that nobody asked for should not disappear
@@ -110,6 +115,17 @@ honest statement is narrower than "any failure":
 **The commit is the point of no return.** Before it, an interrupted import is
 recoverable by re-running it. After it, the import happened, and what remains is
 bookkeeping the daemon reconstructs on its own.
+
+### Step 7 belongs to the daemon
+
+The CLI does not publish. It builds the snapshot to *validate* the change and
+then drops it: the CLI is a separate process, so a router it published would
+serve nothing and be freed when the command exits — a throwaway that reads like
+publication and is not.
+
+So **the commit completes the CLI's operation.** Making a running daemon pick
+the change up is the live-reload contract, and until that exists every mutating
+command says the daemon will not see it until it restarts.
 
 ---
 
@@ -383,9 +399,65 @@ timing-dependent test of a safety property is worse than none.
 Stated because "the post-lock re-check is tested" would otherwise imply more
 than it should.
 
+### Review findings, all fixed
+
+Ten, and the two that mattered most were about a catch-all meaning something
+other than what the file said.
+
+**A `reject` catch-all forwarded.** `apply` ignored `rule.reject`, so
+`*@example.com,,reject` became `catchall_enabled = 1` with no own destination —
+which forwards via the domain default. A rule saying "refuse everything" became
+one accepting everything. Refused at parse time now: a catch-all cannot reject,
+and a domain that should refuse unmatched addresses simply has no catch-all.
+
+**A catch-all fanned out silently.** Two catch-all rows kept only
+`destinations.first()`, so the second was dropped without a word and which one
+survived depended on file order. Refused.
+
+**`--merge` overwrote an existing catch-all**, having skipped it during
+comparison — in the mode whose entire promise is that it changes nothing already
+there. Compared against the *effective* destination now, since a catch-all
+inheriting the domain default and one naming the same address explicitly send
+mail to the same place.
+
+**The post-lock guard captured a count.** Replacing alias A with alias B keeps
+the count at two, passes the re-check, and `--replace` then deletes B without it
+ever having been in front of the confirmation. The capture is now a canonical
+fingerprint of every alias with its kind and sorted destinations, plus the
+catch-all's effective destination — which also catches a domain default moving
+under an inheriting alias, where no alias row changes at all.
+
+**A write failure left a partial key.** `write_private_key` returned the error
+after `create_new` had already made the file, and the path only reaches import's
+cleanup once the function *returns* — so a full disk left a truncated private
+key under a name nothing would collect. Every failure after the file exists now
+removes it and flushes the directory. This affected `domain add` too.
+
+**Cleanup failures were computed and discarded.** `orphaned_keys` could only
+ever be empty. They are attached to the error and every path reported.
+
+**A real-run snapshot failure emitted generic `usage` JSON.**
+`ApplyError::Conflicts` was flattened into `anyhow`, so the most interesting
+failure — a loop between two imported rows — arrived without the `conflicts`
+array the contract promises. Routed properly, with typed non-conflict errors
+keeping their own codes.
+
+**Malformed CSV was silently rewritten.** An unterminated `"me@example.net`
+became the valid `me@example.net`, and a quote inside an unquoted field was
+stripped — which for a quoted local part turns one address into another. Both
+refused, along with duplicate header columns.
+
+**Domains were only checked for non-emptiness**, so an invalid one reached key
+generation and was caught by the snapshot afterwards — a minute of work and a
+file on disk for a row that could have been refused immediately.
+
+**The dry run reported `rule_count` as `aliases_created`**, counting catch-alls
+as aliases and counting rules already present, so a dry run of a no-op import
+claimed it would create everything in the file.
+
 ### Mutations
 
-All nine turned a test red: cleanup skipped on rollback, the flag trigger
+All nine of the original set, and all seven of the review fixes, turned a test red: cleanup skipped on rollback, the flag trigger
 ignoring the catch-all, `--replace` removing the domain default, `--replace`
 widened past the file's domains, only the first conflict reported, the mode
 inferred rather than required, the re-check skipped, the re-check's comparison

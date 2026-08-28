@@ -35,11 +35,30 @@ pub enum Mode {
 /// A domain with a catch-all and no aliases is exactly the case an
 /// "existing aliases" test waves through, and `--replace` would then silently
 /// remove the rule accepting every address on it.
+///
+/// # Why this is a fingerprint and not a count
+///
+/// The first version captured the alias count and whether a catch-all existed.
+/// That passes the post-lock re-check for a change it exists to catch:
+///
+/// ```text
+/// plan captured:    2 aliases
+/// meanwhile:        alias A removed, alias B added
+/// re-check sees:    2 aliases -> unchanged
+/// --replace then deletes B, which was never in front of the confirmation
+/// ```
+///
+/// So the capture is the *content*: every alias with its kind and its sorted
+/// destinations, plus the catch-all's **effective** destination — effective
+/// because a catch-all inheriting the domain default changes meaning when the
+/// default changes, without the catch-all row moving at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingRouting {
     pub domain: String,
     pub aliases: usize,
     pub catchall: bool,
+    /// Canonical, sorted, and compared in full.
+    fingerprint: Vec<String>,
 }
 
 impl ExistingRouting {
@@ -53,6 +72,22 @@ impl ExistingRouting {
             (n, false) => format!("{}: {n} alias(es)", self.domain),
             (n, true) => format!("{}: {n} alias(es) and a catch-all", self.domain),
         }
+    }
+
+    /// What changed between two captures, for the abort message.
+    pub fn differences(&self, other: &Self) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in &self.fingerprint {
+            if !other.fingerprint.contains(line) {
+                out.push(format!("gone: {line}"));
+            }
+        }
+        for line in &other.fingerprint {
+            if !self.fingerprint.contains(line) {
+                out.push(format!("new:  {line}"));
+            }
+        }
+        out
     }
 }
 
@@ -70,6 +105,30 @@ pub struct Prepared {
     /// What `--replace` would remove, captured so the transaction can confirm
     /// it has not moved.
     pub scoped: Vec<ExistingRouting>,
+}
+
+impl Prepared {
+    /// Aliases this import would create: not catch-alls, and not rules already
+    /// present and identical.
+    pub fn aliases_to_create(&self) -> usize {
+        self.plan
+            .domains
+            .values()
+            .flat_map(|rules| rules.values())
+            .filter(|r| !r.is_catchall())
+            .count()
+            .saturating_sub(self.unchanged)
+    }
+
+    /// Catch-alls this import would set.
+    pub fn catchalls_to_set(&self) -> usize {
+        self.plan
+            .domains
+            .values()
+            .flat_map(|rules| rules.values())
+            .filter(|r| r.is_catchall())
+            .count()
+    }
 }
 
 /// Why a plan cannot be prepared.
@@ -177,17 +236,77 @@ pub fn existing_routing(
     conn: &Connection,
     domain: &str,
 ) -> Result<ExistingRouting, pigeon_db::DbError> {
-    let aliases = repo::list_aliases(conn, domain)?.len();
-    let catchall = repo::list_domains(conn)?
+    let name = domain.to_ascii_lowercase();
+    let aliases = repo::list_aliases(conn, domain)?;
+
+    let summary = repo::list_domains(conn)?
         .into_iter()
-        .find(|d| d.name == domain.to_ascii_lowercase())
-        .map(|d| d.catchall)
-        .unwrap_or(false);
+        .find(|d| d.name == name);
+    let catchall = summary.as_ref().map(|d| d.catchall).unwrap_or(false);
+    let default = summary.as_ref().and_then(|d| d.default_destination.clone());
+
+    let mut fingerprint: Vec<String> = aliases
+        .iter()
+        .map(|a| {
+            let mut dests = a.destinations.clone();
+            dests.sort();
+            format!(
+                "alias {} {} -> {}",
+                a.pattern,
+                if a.reject { "reject" } else { "forward" },
+                if dests.is_empty() {
+                    // Inheriting, so the *effective* target moves when the
+                    // domain default does — recorded, because that is a change
+                    // to what the alias does.
+                    format!("(default: {})", default.as_deref().unwrap_or("none"))
+                } else {
+                    dests.join(",")
+                }
+            )
+        })
+        .collect();
+
+    if catchall {
+        fingerprint.push(format!(
+            "catchall -> {}",
+            effective_catchall(conn, &name)?.unwrap_or_else(|| "none".into())
+        ));
+    }
+    fingerprint.sort();
+
     Ok(ExistingRouting {
-        domain: domain.to_ascii_lowercase(),
-        aliases,
+        domain: name,
+        aliases: aliases.len(),
         catchall,
+        fingerprint,
     })
+}
+
+/// Where a domain's catch-all actually sends mail.
+///
+/// Its own destination if it has one, otherwise the domain default it inherits.
+/// Comparing the stored column alone would call two catch-alls identical while
+/// they forward to different mailboxes.
+pub fn effective_catchall(
+    conn: &Connection,
+    domain: &str,
+) -> Result<Option<String>, pigeon_db::DbError> {
+    let own: Option<String> = conn
+        .query_row(
+            "SELECT d.local || '@' || d.domain FROM domain dom
+             JOIN destination d ON d.id = dom.catchall_destination_id
+             WHERE dom.name = ?1 AND dom.catchall_enabled = 1",
+            [domain.to_ascii_lowercase()],
+            |r| r.get(0),
+        )
+        .ok();
+    if own.is_some() {
+        return Ok(own);
+    }
+    Ok(repo::list_domains(conn)?
+        .into_iter()
+        .find(|d| d.name == domain.to_ascii_lowercase() && d.catchall)
+        .and_then(|d| d.default_destination))
 }
 
 /// Under merge, an alias present in both must agree.
@@ -205,6 +324,48 @@ fn compare_against_existing(
 
     for (pattern, rule) in rules {
         if rule.is_catchall() {
+            // Compared, not skipped. Skipping it here meant `apply` overwrote an
+            // existing catch-all with the file's — under `--merge`, which is
+            // the mode whose entire promise is that it changes nothing that is
+            // already there.
+            //
+            // The comparison is against the *effective* destination, because a
+            // catch-all inheriting the domain default and one naming the same
+            // address explicitly send mail to the same place.
+            let Some(current) = effective_catchall(conn, domain)? else {
+                continue;
+            };
+            let wanted = rule
+                .destinations
+                .first()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| {
+                    // No destination in the file means it inherits, so the
+                    // effective target is the domain default.
+                    repo::list_domains(conn)
+                        .ok()
+                        .and_then(|ds| {
+                            ds.into_iter()
+                                .find(|d| d.name == domain.to_ascii_lowercase())
+                                .and_then(|d| d.default_destination)
+                        })
+                        .unwrap_or_default()
+                });
+
+            if wanted == current {
+                *unchanged += 1;
+            } else {
+                conflicts.push(Conflict {
+                    row: rule.rows.first().copied().unwrap_or(0),
+                    address: format!("*@{domain}"),
+                    kind: ConflictKind::ExistingAliasDiffers,
+                    message: format!(
+                        "{domain} already has a catch-all forwarding to {current}; the file \
+                         says {wanted}. Use --replace to take the file's version, or correct \
+                         the file."
+                    ),
+                });
+            }
             continue;
         }
         let Some(existing) = present.get(pattern) else {

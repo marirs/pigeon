@@ -1524,7 +1524,16 @@ fn keys_root(cli: &Cli) -> anyhow::Result<PathBuf> {
 /// `create_new`, so an existing key is never overwritten: it is the one piece
 /// of state no backup of the database restores, and silently replacing it makes
 /// every signature the old key made unverifiable.
-pub(crate) fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
+///
+/// # Every failure after the file exists removes it
+///
+/// An earlier version returned the write or fsync error and left the partial
+/// file behind. Nothing referenced it and nothing would clean it up — import's
+/// cleanup only knows about keys whose path it was given, and the path is only
+/// recorded once this function *returns*. So a full disk left a truncated
+/// private key sitting in the keys directory, under a name a later run would
+/// not reuse and no operator would think to look for.
+fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
     let mut options = std::fs::OpenOptions::new();
@@ -1547,19 +1556,45 @@ pub(crate) fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Re
             anyhow::anyhow!("cannot write {}: {e}", path.display())
         }
     })?;
-    f.write_all(pem.as_bytes())?;
-    // fsync the file: a key in the page cache and not on disk is a key that a
-    // power failure turns into a domain nobody can sign for.
-    f.sync_all()?;
+
+    // From here the file exists, so every path out of this function has to
+    // remove it or leave key material nothing will ever collect.
+    let written = (|| -> std::io::Result<()> {
+        f.write_all(pem.as_bytes())?;
+        // fsync the file: a key in the page cache and not on disk is a key that
+        // a power failure turns into a domain nobody can sign for.
+        f.sync_all()
+    })();
     drop(f);
+
+    if let Err(e) = written {
+        discard_partial_key(path);
+        return Err(anyhow::anyhow!("cannot write {}: {e}", path.display()));
+    }
 
     // And the directory, so the *name* is durable too. Without this the file's
     // contents survive a crash and its directory entry may not, which is the
     // same outcome by a different route.
-    if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)?.sync_all()?;
+    if let Some(dir) = path.parent()
+        && let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all())
+    {
+        discard_partial_key(path);
+        return Err(anyhow::anyhow!("cannot flush {}: {e}", dir.display()));
     }
     Ok(())
+}
+
+/// Remove a key file this process created and could not finish, and flush the
+/// directory so the removal is durable too.
+///
+/// Best effort by necessity: the reason we are here is that writing failed, and
+/// the removal may fail for the same reason. It is not reported separately
+/// because the caller is already returning the failure that caused it.
+pub(crate) fn discard_partial_key(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
 }
 
 /// A short random component for a key filename.
@@ -1720,13 +1755,32 @@ fn import_cmd(cli: &Cli, verb: &ImportVerb) -> anyhow::Result<u8> {
 
     // Steps 4 to 6.
     let keys_root = keys_root(cli)?;
-    let applied =
-        import::apply::apply(&mut conn, &keys_root, &prepared, &nonce).map_err(|e| match e {
-            import::apply::ApplyError::Conflicts(c) => {
-                anyhow::anyhow!(format_conflicts(&c))
+    let applied = match import::apply::apply(&mut conn, &keys_root, &prepared, &nonce) {
+        Ok(a) => a,
+        // Conflicts keep their own path so a real-run failure has the same
+        // shape as a preparation failure. Flattening them into `anyhow`
+        // produced a generic `usage` code and no `conflicts` array — for
+        // the snapshot failure, which is the most interesting kind and the
+        // one the contract promises.
+        Err(import::apply::ApplyError::Conflicts(c)) => return report_conflicts(cli, &c),
+        Err(import::apply::ApplyError::WithOrphans { source, orphaned }) => {
+            report_orphans(&orphaned);
+            match *source {
+                import::apply::ApplyError::Conflicts(c) => {
+                    return report_conflicts(cli, &c);
+                }
+                other => return Err(anyhow::anyhow!("{other}")),
             }
-            other => anyhow::anyhow!("{other}"),
-        })?;
+        }
+        // Typed non-conflict errors keep their own codes and exit
+        // classification rather than collapsing to `usage`.
+        Err(import::apply::ApplyError::Db(e)) => return Err(e.into()),
+        Err(import::apply::ApplyError::Route(e)) => {
+            return Err(pigeon_route::MutationError::Invalid(e).into());
+        }
+        Err(import::apply::ApplyError::Dkim(e)) => return Err(e.into()),
+        Err(other) => return Err(anyhow::anyhow!("{other}")),
+    };
 
     if cli.json {
         json::ok(serde_json::json!({
@@ -1759,15 +1813,6 @@ fn import_cmd(cli: &Cli, verb: &ImportVerb) -> anyhow::Result<u8> {
         println!("  {} DKIM key(s) generated", applied.keys_generated);
     }
 
-    for path in &applied.orphaned_keys {
-        note(
-            cli,
-            &format!(
-                "\nWarning: a key file at {} could not be removed. Nothing references it.",
-                path.display()
-            ),
-        );
-    }
     note_reload(cli);
     Ok(exit::OK)
 }
@@ -1833,10 +1878,14 @@ fn dry_run(
             "rows": prepared.plan.rows_read,
             "domains_created": outcome.value,
             "domains_matched": prepared.existing_domains.len(),
-            "aliases_created": prepared.plan.rule_count(),
+            // Aliases only, and only the ones that would actually be created.
+            // Reporting `rule_count` counted catch-alls as aliases and counted
+            // rules already present and identical, so a dry run of a no-op
+            // import claimed it would create everything in the file.
+            "aliases_created": prepared.aliases_to_create(),
             "aliases_replaced": serde_json::Value::Null,
             "aliases_unchanged": prepared.unchanged,
-            "catchalls_set": serde_json::Value::Null,
+            "catchalls_set": prepared.catchalls_to_set(),
             "keys_generated": 0,
             "conflicts": [],
         }));
@@ -1847,7 +1896,10 @@ fn dry_run(
             "  {} domain(s) already present",
             prepared.existing_domains.len()
         );
-        println!("  {} rule(s) applied", prepared.plan.rule_count());
+        println!("  {} alias(es) created", prepared.aliases_to_create());
+        if prepared.catchalls_to_set() > 0 {
+            println!("  {} catch-all(s) set", prepared.catchalls_to_set());
+        }
         if prepared.unchanged > 0 {
             println!("  {} alias(es) already correct", prepared.unchanged);
         }
@@ -1859,6 +1911,24 @@ fn dry_run(
          generation will succeed.",
     );
     Ok(exit::OK)
+}
+
+/// Name every key file a failed import could not remove.
+///
+/// stderr in both modes: it is a warning about the filesystem rather than part
+/// of the command's result, and under `--json` the result is already the
+/// conflict envelope, which must stay the only value on stdout.
+fn report_orphans(orphaned: &[std::path::PathBuf]) {
+    if orphaned.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\nWarning: these key files were written by this import and could not be removed. \
+         Nothing references them."
+    );
+    for p in orphaned {
+        eprintln!("    {}", p.display());
+    }
 }
 
 fn format_conflicts(conflicts: &[import::Conflict]) -> String {

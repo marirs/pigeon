@@ -50,11 +50,7 @@ pub struct Plan {
     pub rows_read: usize,
 }
 
-impl Plan {
-    pub fn rule_count(&self) -> usize {
-        self.domains.values().map(BTreeMap::len).sum()
-    }
-}
+impl Plan {}
 
 /// Something wrong with the input, carrying where.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +64,8 @@ pub struct Conflict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictKind {
+    MalformedCsv,
+    DuplicateHeader,
     MissingHeader,
     UnknownColumn,
     WrongFieldCount,
@@ -78,6 +76,9 @@ pub enum ConflictKind {
     ForwardWithoutDestination,
     UnknownKind,
     KindConflict,
+    RejectCatchAll,
+    CatchAllFanOut,
+    InvalidDomain,
     DuplicateRow,
     /// Found against the database rather than in the file.
     ExistingAliasDiffers,
@@ -91,6 +92,8 @@ impl ConflictKind {
     /// The stable identifier in `--json`. Not the message.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::MalformedCsv => "malformed_csv",
+            Self::DuplicateHeader => "duplicate_header",
             Self::MissingHeader => "missing_header",
             Self::UnknownColumn => "unknown_column",
             Self::WrongFieldCount => "wrong_field_count",
@@ -101,6 +104,9 @@ impl ConflictKind {
             Self::ForwardWithoutDestination => "forward_without_destination",
             Self::UnknownKind => "unknown_kind",
             Self::KindConflict => "kind_conflict",
+            Self::RejectCatchAll => "reject_catchall",
+            Self::CatchAllFanOut => "catchall_fan_out",
+            Self::InvalidDomain => "invalid_domain",
             Self::DuplicateRow => "duplicate_row",
             Self::ExistingAliasDiffers => "existing_alias_differs",
             Self::Unserveable => "unserveable",
@@ -128,7 +134,19 @@ pub fn parse(text: &str) -> (Plan, Vec<Conflict>) {
     let mut conflicts = Vec::new();
     let mut plan = Plan::default();
 
-    let rows = split_rows(text);
+    let rows = match split_rows(text) {
+        Ok(r) => r,
+        Err((row, message)) => {
+            conflicts.push(Conflict {
+                row,
+                address: String::new(),
+                kind: ConflictKind::MalformedCsv,
+                message,
+            });
+            return (plan, conflicts);
+        }
+    };
+
     let Some((header_row, header)) = rows.first().cloned() else {
         conflicts.push(Conflict {
             row: 0,
@@ -195,10 +213,24 @@ fn header_columns(header: &[String]) -> Result<Columns, (ConflictKind, String)> 
     let mut unknown: Vec<&str> = Vec::new();
 
     for (i, name) in header.iter().enumerate() {
+        // A duplicated column is refused rather than resolved. Taking the first
+        // or the last is a coin toss over which column holds the data, and the
+        // file gives no way to tell which the exporter meant.
+        let claim = |slot: &mut Option<usize>, label: &str| -> Result<(), (ConflictKind, String)> {
+            if slot.is_some() {
+                return Err((
+                    ConflictKind::DuplicateHeader,
+                    format!("the header names `{label}` more than once"),
+                ));
+            }
+            *slot = Some(i);
+            Ok(())
+        };
+
         match name.trim().to_ascii_lowercase().as_str() {
-            "address" => address = Some(i),
-            "destination" => destination = Some(i),
-            "kind" => kind = Some(i),
+            "address" => claim(&mut address, "address")?,
+            "destination" => claim(&mut destination, "destination")?,
+            "kind" => claim(&mut kind, "kind")?,
             "" => {}
             _ => unknown.push(name.trim()),
         }
@@ -290,10 +322,10 @@ fn apply_row(
         }
     };
 
-    let (pattern, domain) = split_pattern(raw_address).map_err(|message| Conflict {
+    let (pattern, domain) = split_pattern(raw_address).map_err(|(kind, message)| Conflict {
         row,
         address: raw_address.to_string(),
-        kind: ConflictKind::InvalidAddress,
+        kind,
         message,
     })?;
 
@@ -337,6 +369,40 @@ fn apply_row(
             message: format!("{e}"),
         })?)
     };
+
+    // The catch-all is a single rule with a single destination, and the schema
+    // has no way to express anything else. Both of these were silently
+    // mishandled: a reject catch-all became `catchall_enabled = 1` with no own
+    // destination, which *forwards* via the domain default — turning "refuse
+    // everything" into "accept everything" — and a second catch-all row was
+    // dropped without a word.
+    if pattern == "*" {
+        if reject {
+            return Err(Conflict {
+                row,
+                address: raw_address.to_string(),
+                kind: ConflictKind::RejectCatchAll,
+                message: "a catch-all cannot reject. It exists to accept what no alias \
+                          claims; a domain that should refuse unmatched addresses simply \
+                          has no catch-all."
+                    .into(),
+            });
+        }
+        if let Some(existing) = plan.domains.get(&domain).and_then(|r| r.get("*"))
+            && !existing.destinations.is_empty()
+        {
+            return Err(Conflict {
+                row,
+                address: raw_address.to_string(),
+                kind: ConflictKind::CatchAllFanOut,
+                message: format!(
+                    "a catch-all takes one destination, and row {} already set it. \
+                     Fan-out is available on aliases, not on the catch-all.",
+                    existing.rows[0]
+                ),
+            });
+        }
+    }
 
     let rules = plan.domains.entry(domain).or_default();
     match rules.get_mut(&pattern) {
@@ -390,20 +456,59 @@ fn apply_row(
 ///
 /// Not `Address::parse`: the left side may be `*` or contain one, which is a
 /// pattern rather than an address.
-fn split_pattern(raw: &str) -> Result<(String, String), String> {
+fn split_pattern(raw: &str) -> Result<(String, String), (ConflictKind, String)> {
     let (local, domain) = raw
         .rsplit_once('@')
-        .ok_or_else(|| format!("{raw:?} has no '@'"))?;
+        .ok_or_else(|| (ConflictKind::InvalidAddress, format!("{raw:?} has no '@'")))?;
 
     if local.is_empty() {
-        return Err(format!("{raw:?} has no local part"));
+        return Err((
+            ConflictKind::InvalidAddress,
+            format!("{raw:?} has no local part"),
+        ));
     }
+
     let domain = domain.trim().to_ascii_lowercase();
-    if domain.is_empty() {
-        return Err(format!("{raw:?} has no domain"));
+
+    // Checked here, in the phase that writes nothing.
+    //
+    // Without this the snapshot catches it — after a key has been generated and
+    // written for a domain that can never carry mail. That is a minute of work
+    // and a file on disk for a row the file could have been told about
+    // immediately.
+    if !is_a_label(&domain) {
+        return Err((
+            ConflictKind::InvalidDomain,
+            format!(
+                "{domain:?} is not a usable domain. Managed domains are stored as \
+                 normalised A-labels: at least two labels, letters, digits and hyphens, \
+                 no leading or trailing hyphen."
+            ),
+        ));
     }
 
     Ok((local.trim().to_ascii_lowercase(), domain))
+}
+
+/// The same rule the routing snapshot applies to a managed domain.
+///
+/// Duplicated rather than shared because `pigeon-route` keeps it private, and
+/// exposing it to make one caller happy is a wider change than repeating six
+/// lines. The snapshot remains the enforcement point; this is the early report.
+fn is_a_label(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 255
+        && domain.contains('.')
+        && domain.is_ascii()
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 /// Split CSV text into rows of fields, honouring quotes.
@@ -411,13 +516,38 @@ fn split_pattern(raw: &str) -> Result<(String, String), String> {
 /// Returns the 1-based line each row started on, which is what a person reading
 /// an error message counts to — a quoted field spanning newlines otherwise makes
 /// every later row number wrong.
-fn split_rows(text: &str) -> Vec<(usize, Vec<String>)> {
+///
+/// # Strict, because the alternative rewrites the input
+///
+/// An earlier version tolerated malformed quoting, and tolerance here is not
+/// leniency — it is silent correction of a file the operator believes is
+/// correct:
+///
+/// - `"me@example.net` unterminated became the valid `me@example.net`, so a
+///   truncated export imported cleanly as something slightly different.
+/// - A `"` inside an unquoted field was stripped, which for a quoted local part
+///   turns one address into another.
+///
+/// Both are refused. An import that cannot read the file says so; it does not
+/// guess what the file meant.
+/// A parsed row: the 1-based line it started on, and its fields.
+type Row = (usize, Vec<String>);
+
+/// A parse failure: the line, and what was wrong with it.
+type CsvError = (usize, String);
+
+fn split_rows(text: &str) -> Result<Vec<Row>, CsvError> {
     let mut rows = Vec::new();
     let mut field = String::new();
     let mut row: Vec<String> = Vec::new();
     let mut in_quotes = false;
+    // Whether the current field began with a quote, so a later quote in an
+    // unquoted field can be refused rather than absorbed.
+    let mut quoted_field = false;
+    let mut field_has_content = false;
     let mut line = 1usize;
     let mut row_started_at = 1usize;
+    let mut quote_opened_at = 1usize;
     let mut chars = text.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -426,14 +556,48 @@ fn split_rows(text: &str) -> Vec<(usize, Vec<String>)> {
                 chars.next();
                 field.push('"');
             }
-            '"' => in_quotes = !in_quotes,
+            '"' if in_quotes => {
+                in_quotes = false;
+                // Anything but a separator after a closing quote means the
+                // field is neither quoted nor unquoted, and guessing which
+                // changes the value.
+                match chars.peek() {
+                    None | Some(',') | Some('\n') | Some('\r') => {}
+                    Some(other) => {
+                        return Err((
+                            line,
+                            format!(
+                                "unexpected {other:?} after a closing quote; a quoted field \
+                                 must end at a comma or a line break"
+                            ),
+                        ));
+                    }
+                }
+            }
+            '"' if field_has_content || quoted_field => {
+                return Err((
+                    line,
+                    "a quote inside an unquoted field. Quote the whole field, and double \
+                     any quote within it."
+                        .into(),
+                ));
+            }
+            '"' => {
+                in_quotes = true;
+                quoted_field = true;
+                quote_opened_at = line;
+            }
             ',' if !in_quotes => {
                 row.push(std::mem::take(&mut field));
+                quoted_field = false;
+                field_has_content = false;
             }
             '\r' if !in_quotes => {}
             '\n' if !in_quotes => {
                 row.push(std::mem::take(&mut field));
                 rows.push((row_started_at, std::mem::take(&mut row)));
+                quoted_field = false;
+                field_has_content = false;
                 line += 1;
                 row_started_at = line;
             }
@@ -441,13 +605,26 @@ fn split_rows(text: &str) -> Vec<(usize, Vec<String>)> {
                 line += 1;
                 field.push('\n');
             }
-            c => field.push(c),
+            c => {
+                field.push(c);
+                field_has_content = true;
+            }
         }
+    }
+
+    if in_quotes {
+        return Err((
+            quote_opened_at,
+            "a quoted field is never closed. An unterminated quote used to be read as \
+             though the quote were not there, which imports a different address than the \
+             file names."
+                .into(),
+        ));
     }
 
     if !field.is_empty() || !row.is_empty() {
         row.push(field);
         rows.push((row_started_at, row));
     }
-    rows
+    Ok(rows)
 }

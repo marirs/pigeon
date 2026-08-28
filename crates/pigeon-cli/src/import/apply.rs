@@ -22,9 +22,6 @@ pub struct Applied {
     pub catchalls_set: usize,
     pub keys_generated: usize,
     pub unchanged: usize,
-    /// Keys this run wrote that cleanup could not remove. Inert, and named
-    /// rather than left to be found with `ls`.
-    pub orphaned_keys: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -39,6 +36,15 @@ pub enum ApplyError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A failure, plus key files this run wrote and could not remove.
+    ///
+    /// They are inert — nothing references them and no later run reuses their
+    /// names — but they are private key material a failed command left behind,
+    /// so they are named rather than left to be found with `ls`.
+    WithOrphans {
+        source: Box<ApplyError>,
+        orphaned: Vec<PathBuf>,
+    },
 }
 
 impl std::fmt::Display for ApplyError {
@@ -51,6 +57,17 @@ impl std::fmt::Display for ApplyError {
             Self::Sqlite(e) => write!(f, "{e}"),
             Self::Dkim(e) => write!(f, "{e}"),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::WithOrphans { source, orphaned } => {
+                write!(f, "{source}\n\n  Key files this run could not remove:")?;
+                for p in orphaned {
+                    write!(f, "\n    {}", p.display())?;
+                }
+                write!(
+                    f,
+                    "\n\n  Nothing references them. Remove them once you are satisfied \
+                     no other import is running."
+                )
+            }
         }
     }
 }
@@ -109,13 +126,18 @@ pub fn apply(
             // Every returned error removes the keys this run wrote. A key
             // belonging to no domain is private key material left behind by a
             // failed command.
+            //
+            // An earlier version computed the failures and threw them away, so
+            // `orphaned_keys` could only ever be empty — the field existed and
+            // reported nothing.
             let orphaned = remove_keys(&written);
             if orphaned.is_empty() {
                 Err(e)
             } else {
-                // The original failure still wins; the orphans are reported by
-                // the caller alongside it.
-                Err(e)
+                Err(ApplyError::WithOrphans {
+                    source: Box::new(e),
+                    orphaned,
+                })
             }
         }
     }
@@ -190,8 +212,16 @@ fn write_rows(
 
         for rule in rules.values() {
             if rule.is_catchall() {
-                let to = rule.destinations.first();
-                repo::set_catchall(&tx, domain, to)?;
+                // Under merge an identical catch-all is left alone. Preparation
+                // has already refused a differing one, so reaching here with a
+                // catch-all already present means it matches — and rewriting it
+                // would be a write `--merge` promised not to make.
+                if prepared.mode == Mode::Merge
+                    && crate::import::plan::effective_catchall(&tx, domain)?.is_some()
+                {
+                    continue;
+                }
+                repo::set_catchall(&tx, domain, rule.destinations.first())?;
                 applied.catchalls_set += 1;
                 continue;
             }
@@ -229,7 +259,19 @@ fn write_rows(
         }]));
     }
 
+    // Step 6, and the point of no return.
     tx.commit()?;
+
+    // Step 7 — publication — is **not** done here, and deliberately not.
+    //
+    // The snapshot was built above to validate the change, then dropped. The
+    // CLI is a separate process from the daemon: a router it published would
+    // serve nothing and be freed when the command exits, which is a throwaway
+    // that reads like publication and is not.
+    //
+    // So the commit completes the CLI's operation. Making the running daemon
+    // pick the change up is the live-reload contract, and until that exists the
+    // command says the daemon will not see it until it restarts.
     Ok(applied)
 }
 
@@ -245,11 +287,14 @@ fn recheck_plan(conn: &Connection, prepared: &Prepared) -> Result<(), ApplyError
                 address: planned.domain.clone(),
                 kind: ConflictKind::StateChanged,
                 message: format!(
-                    "{} changed while this import was preparing: it had {}, and now has {}. \
-                     Nothing was imported. Re-run to see the current state before confirming.",
+                    "{} changed while this import was preparing. Nothing was imported. \
+                     Re-run to see the current state before confirming.\n{}",
                     planned.domain,
-                    planned.describe(),
-                    now.describe()
+                    planned
+                        .differences(&now)
+                        .iter()
+                        .map(|d| format!("\n      {d}"))
+                        .collect::<String>()
                 ),
             });
         }
@@ -301,12 +346,32 @@ fn already_identical(
 }
 
 /// Remove keys this run wrote. Returns the ones that could not be removed.
+///
+/// The directory is flushed after a successful removal, so the *absence* is as
+/// durable as the file was — a crash immediately after cleanup must not bring
+/// the key back.
 fn remove_keys(written: &[PreparedKey]) -> Vec<PathBuf> {
-    written
-        .iter()
-        .filter(|k| std::fs::remove_file(&k.path).is_err() && k.path.exists())
-        .map(|k| k.path.clone())
-        .collect()
+    let mut failed = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    for key in written {
+        match std::fs::remove_file(&key.path) {
+            Ok(()) => {
+                if let Some(dir) = key.path.parent()
+                    && !dirs.contains(&dir.to_path_buf())
+                {
+                    dirs.push(dir.to_path_buf());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => failed.push(key.path.clone()),
+        }
+    }
+
+    for dir in dirs {
+        let _ = std::fs::File::open(&dir).and_then(|d| d.sync_all());
+    }
+    failed
 }
 
 #[cfg(test)]
@@ -368,13 +433,11 @@ mod tests {
         let db = Db::new("gained");
         repo::add_domain(&db.conn, "example.com", None).unwrap();
 
-        // Planned when the domain was empty.
+        // Planned when the domain was empty. Captured rather than hand-built:
+        // the fingerprint is the whole point, and a literal would let the test
+        // assert against a shape the real capture does not produce.
         let prepared = prepared_with(
-            vec![ExistingRouting {
-                domain: "example.com".into(),
-                aliases: 0,
-                catchall: false,
-            }],
+            vec![existing_routing(&db.conn, "example.com").unwrap()],
             vec![],
         );
 
@@ -400,6 +463,128 @@ mod tests {
     }
 
     #[test]
+    fn replacing_one_alias_with_another_aborts_the_import() {
+        // The case a count cannot see, and the reason the capture is a
+        // fingerprint.
+        //
+        //   planned:    2 aliases
+        //   meanwhile:  A removed, B added
+        //   a count:    still 2 -> unchanged
+        //
+        // `--replace` would then delete B, which was never in front of the
+        // confirmation.
+        let db = Db::new("substitution");
+        let to = repo::Address::parse("me@example.net").unwrap();
+        repo::add_domain(&db.conn, "example.com", Some(&to)).unwrap();
+        repo::add_alias(
+            &db.conn,
+            "example.com",
+            "a",
+            AliasKind::Forward,
+            std::slice::from_ref(&to),
+        )
+        .unwrap();
+        repo::add_alias(
+            &db.conn,
+            "example.com",
+            "b",
+            AliasKind::Forward,
+            std::slice::from_ref(&to),
+        )
+        .unwrap();
+
+        let planned = existing_routing(&db.conn, "example.com").unwrap();
+        assert_eq!(planned.aliases, 2);
+        let prepared = prepared_with(vec![planned], vec![]);
+
+        // Same count, different content.
+        repo::remove_alias(&db.conn, "example.com", "a").unwrap();
+        repo::add_alias(
+            &db.conn,
+            "example.com",
+            "c",
+            AliasKind::Forward,
+            std::slice::from_ref(&to),
+        )
+        .unwrap();
+
+        match recheck_plan(&db.conn, &prepared) {
+            Err(ApplyError::Conflicts(c)) => {
+                assert_eq!(c[0].kind, ConflictKind::StateChanged);
+                assert!(c[0].message.contains("alias a"), "{}", c[0].message);
+                assert!(c[0].message.contains("alias c"), "{}", c[0].message);
+            }
+            other => panic!("a same-count substitution passed the re-check: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn changing_an_alias_destination_aborts_the_import() {
+        // Same count, same patterns, different target.
+        let db = Db::new("retargeted");
+        let one = repo::Address::parse("one@example.net").unwrap();
+        let two = repo::Address::parse("two@example.net").unwrap();
+        repo::add_domain(&db.conn, "example.com", Some(&one)).unwrap();
+        repo::add_alias(
+            &db.conn,
+            "example.com",
+            "a",
+            AliasKind::Forward,
+            std::slice::from_ref(&one),
+        )
+        .unwrap();
+
+        let prepared = prepared_with(
+            vec![existing_routing(&db.conn, "example.com").unwrap()],
+            vec![],
+        );
+
+        repo::remove_alias(&db.conn, "example.com", "a").unwrap();
+        repo::add_alias(
+            &db.conn,
+            "example.com",
+            "a",
+            AliasKind::Forward,
+            std::slice::from_ref(&two),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                recheck_plan(&db.conn, &prepared),
+                Err(ApplyError::Conflicts(_))
+            ),
+            "a retargeted alias passed the re-check"
+        );
+    }
+
+    #[test]
+    fn changing_the_domain_default_under_an_inheriting_alias_aborts_the_import() {
+        // The alias row does not move, and what it does changes. The capture
+        // records the *effective* destination for exactly this.
+        let db = Db::new("inheriting");
+        let one = repo::Address::parse("one@example.net").unwrap();
+        let two = repo::Address::parse("two@example.net").unwrap();
+        repo::add_domain(&db.conn, "example.com", Some(&one)).unwrap();
+        repo::add_alias(&db.conn, "example.com", "a", AliasKind::Forward, &[]).unwrap();
+
+        let prepared = prepared_with(
+            vec![existing_routing(&db.conn, "example.com").unwrap()],
+            vec![],
+        );
+
+        repo::set_default_destination(&db.conn, "example.com", Some(&two)).unwrap();
+
+        assert!(
+            matches!(
+                recheck_plan(&db.conn, &prepared),
+                Err(ApplyError::Conflicts(_))
+            ),
+            "an inheriting alias whose default moved passed the re-check"
+        );
+    }
+
+    #[test]
     fn a_domain_that_gained_a_catch_all_aborts_the_import() {
         // The catch-all half of the same window, and the one an alias count
         // would miss.
@@ -408,11 +593,7 @@ mod tests {
         repo::add_domain(&db.conn, "example.com", Some(&to)).unwrap();
 
         let prepared = prepared_with(
-            vec![ExistingRouting {
-                domain: "example.com".into(),
-                aliases: 0,
-                catchall: false,
-            }],
+            vec![existing_routing(&db.conn, "example.com").unwrap()],
             vec![],
         );
 
@@ -454,14 +635,17 @@ mod tests {
         let db = Db::new("unchanged");
         let to = repo::Address::parse("me@example.net").unwrap();
         repo::add_domain(&db.conn, "example.com", Some(&to)).unwrap();
-        repo::add_alias(&db.conn, "example.com", "hello", AliasKind::Forward, &[to]).unwrap();
+        repo::add_alias(
+            &db.conn,
+            "example.com",
+            "hello",
+            AliasKind::Forward,
+            std::slice::from_ref(&to),
+        )
+        .unwrap();
 
         let prepared = prepared_with(
-            vec![ExistingRouting {
-                domain: "example.com".into(),
-                aliases: 1,
-                catchall: false,
-            }],
+            vec![existing_routing(&db.conn, "example.com").unwrap()],
             vec![],
         );
 
