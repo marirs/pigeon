@@ -333,6 +333,9 @@ commits are seen.
 | Transient failure does not consume the version | fail the read, then succeed; assert the change arrives |
 | Transactions keep their snapshot across a publication | pin, publish, assert the pinned table is unchanged and the next one is not |
 | Shutdown joins | signal, join, assert the worker actually ended |
+| A dropped `Reloader` does not leak the worker | start, drop without signalling, assert the runtime still shuts down |
+| The load is transactional | tick inside an outer transaction, assert it refuses to nest |
+| An unreadable status is invalid, not transient | assert it warns once and backs off |
 | A commit before the worker starts is not missed | commit between startup's build and the worker's first poll |
 | A reconnect rebuilds unconditionally | force a reconnect, assert the next state is published |
 | An unrelated commit publishes nothing | write to a non-routing table, assert no publish and no log |
@@ -427,6 +430,57 @@ directly, through `has_baseline` and `baseline`.
 once after the failure, letting the backoff lapse, so "a new version cancels the
 throttle" passed whether or not it did. The fix is now committed while the
 throttle is still armed.
+
+### Review findings, all fixed
+
+Six, and the first three are the ones that mattered.
+
+**`load_and_fingerprint` opened no transaction**, while its documentation said
+it ran in one. `load` issues a query for domains, then one per domain, then one
+per alias — so a commit landing partway through assembles a configuration from
+two states of the database. That hybrid never existed and nobody committed it,
+and it would have been published as though somebody had. The comment was the
+specification and the code did not meet it.
+
+Pinned by a test that does not race a writer: SQLite refuses to nest
+transactions, so a tick on a connection already inside one must fail. If the
+load opened none of its own, it would succeed.
+
+**The worker started before the fallible setup.** An early `?` between the start
+and the listener bind dropped the `Reloader` without signalling it — and a
+dropped `watch::Sender` does *not* flip the value the receiver reads, so the
+loop ran forever. Being a `spawn_blocking` task, the runtime then waited for it
+and the process hung on shutdown. Verified.
+
+Fixed twice over: the worker now also exits when its channel closes, and it is
+started after every fallible step. The escape hatch alone would leave the next
+fallible step added above the start as a hang again.
+
+**`publish_for_test` was public**, which reopened the publication hole that
+making `publish` crate-private had closed — a downstream caller could replace a
+serving table with `Snapshot::default()` outside the commit contract. Removed;
+the one test that used it seeds through `Router::new`, which is what the daemon
+does.
+
+**Every `LoadError` became `Transient`**, including a status this build cannot
+read. That one reads the same way on every retry, so it is invalid
+configuration: warn once and back off, rather than retry every second and log at
+debug.
+
+**`conn_is_broken` used `SELECT 1`**, which SQLite answers without reading a
+page — verified to succeed against a connection whose file had been deleted. It
+probes a real table now.
+
+**And the section below claimed tests that did not exist.** `cargo test -p
+pigeond reload` reported zero. The shutdown and supervision rows in §7 described
+intent, and the daemon-side lifecycle bug above is exactly what that gap let
+through — the one part of the design with no test was the one part with a
+process-hanging defect.
+
+Four worker tests now, including one asserting that a dropped `Reloader` does
+not leave the worker running. Mutating the channel check makes that test hang
+rather than fail, which is the correct signature: a leaked blocking task is
+precisely what stops a runtime from shutting down.
 
 ### Verified against a running daemon
 

@@ -722,15 +722,19 @@ async fn run() -> io::Result<()> {
                  still comes from PIGEON_ACCEPT and delivery from PIGEON_FORWARD_TO."
             );
 
-            // The routing table is republished when the database changes, even
-            // though nothing routes from it yet. Starting the worker now means
-            // the detector — the part with the property worth proving — is
-            // exercised by every run rather than only once it has a consumer.
+            // The pieces the reload worker needs, carried forward. It is
+            // deliberately **not** started here: everything between this point
+            // and the listener binding can fail, and a worker started before
+            // them would be left running by an early return.
+            //
+            // That is survivable now — the worker also exits when its stop
+            // sender is dropped — but relying on the escape hatch instead of the
+            // ordering means the next fallible step added above the start is a
+            // hang again.
             let router = Arc::new(pigeon_route::Router::new(started.snapshot.clone()));
             let watcher = std::mem::take(&mut started.watcher);
-            let reloader = reload::Reloader::start(db_path, Arc::clone(&router), watcher);
 
-            Some((started, reloader))
+            Some((started, (db_path, router, watcher)))
         }
         _ => {
             tracing::warn!(
@@ -894,7 +898,16 @@ async fn run() -> io::Result<()> {
     // result silently — a daemon that spawned the worker and forgot it would
     // keep serving the last published table forever with routing frozen and
     // nothing saying why.
-    let stop_reload = booted.map(|(_, r)| {
+    // Started here, after every fallible step: the spool probe, the listener
+    // bind, the resolver. Nothing below this line returns early before the
+    // shutdown path.
+    //
+    // The routing table is republished when the database changes even though
+    // nothing routes from it yet, so the detector — the part with the property
+    // worth proving — is exercised by every run rather than only once it has a
+    // consumer.
+    let stop_reload = booted.map(|(_, (db_path, router, watcher))| {
+        let r = reload::Reloader::start(db_path, router, watcher);
         // `supervise` consumes the handle and becomes the only join, so the
         // stopper is taken first. Two ways to stop one worker would be two
         // orderings to keep straight.

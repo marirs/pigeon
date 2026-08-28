@@ -85,7 +85,20 @@ impl Reloader {
             };
 
             loop {
-                if *stopped.borrow_and_update() {
+                // Two ways to be told to stop, and the second one is the reason
+                // this is not just a boolean check.
+                //
+                // A dropped `watch::Sender` does **not** flip the value: the
+                // receiver keeps returning the last one it was sent, which is
+                // `false`. So a `Reloader` dropped without `stop_and_join` —
+                // by an early `?` during startup, before the daemon reaches its
+                // shutdown path — would leave this loop running forever. It is
+                // a `spawn_blocking` task, so the runtime then waits for it at
+                // shutdown and the process hangs.
+                //
+                // `has_changed` returns `Err` once the sender is gone, which is
+                // the signal a drop actually produces.
+                if *stopped.borrow_and_update() || stopped.has_changed().is_err() {
                     return;
                 }
 
@@ -195,7 +208,155 @@ fn open(path: &std::path::Path) -> Result<rusqlite::Connection, pigeon_db::DbErr
 }
 
 /// Whether a connection has failed in a way reopening might fix.
+///
+/// Probes with a real read against a table the loader uses. `SELECT 1` is
+/// answered by the expression evaluator without touching a single page — it
+/// succeeds against a connection whose file has been deleted underneath it —
+/// so it cannot detect the storage failures the reconnect exists for.
 fn conn_is_broken(conn: &rusqlite::Connection) -> bool {
-    conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
+    conn.query_row("SELECT count(*) FROM domain", [], |r| r.get::<_, i64>(0))
         .is_err()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A migrated database that removes itself.
+    struct Db(PathBuf);
+
+    impl Db {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "pigeond-reload-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("pigeon.db");
+            let mut conn = pigeon_db::open(&path).unwrap();
+            pigeon_db::migrate(&mut conn, &path).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> PathBuf {
+            self.0.join("pigeon.db")
+        }
+    }
+
+    impl Drop for Db {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn router() -> Arc<Router> {
+        Arc::new(Router::new(pigeon_route::Snapshot::default()))
+    }
+
+    #[tokio::test]
+    async fn shutdown_signals_and_joins() {
+        let db = Db::new("shutdown");
+        let r = Reloader::start(db.path(), router(), Watcher::new());
+        let stopper = r.stopper();
+        let supervisor = r.supervise();
+
+        // Bounded well under `SHUTDOWN_WAIT`, so a worker that ignored the
+        // signal would fail this rather than pass slowly.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            stopper.stop_and_join(supervisor),
+        )
+        .await
+        .expect("shutdown did not join the worker");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_reloader_does_not_leave_the_worker_running() {
+        // The lifecycle case this module had no test for, and the reason the
+        // bug survived review.
+        //
+        // Startup starts the worker, then something between there and the
+        // listener fails and returns early. The `Reloader` is dropped without
+        // `stop_and_join`, so the worker is never signalled — and a dropped
+        // `watch::Sender` does not flip the value the receiver reads. Without
+        // the closed-channel check, this loops forever, and because it is a
+        // `spawn_blocking` task the runtime waits for it and the process hangs.
+        //
+        // Asserted by the test completing: the runtime cannot shut down while
+        // a blocking task is running, so a leaked worker times out here.
+        let db = Db::new("dropped");
+        {
+            let r = Reloader::start(db.path(), router(), Watcher::new());
+            drop(r);
+        }
+
+        // Long enough for the worker to reach the top of its loop and notice.
+        tokio::time::sleep(pigeon_route::reload::POLL * 2).await;
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_ends_is_reported() {
+        // A panicking task cannot log its own death, and an unpolled handle
+        // holds the result silently. The supervisor is what turns either into
+        // something an operator can see.
+        //
+        // Driven by making the worker fail immediately: a path that is not a
+        // database. The worker logs and returns, and the supervisor's handle
+        // resolves — which is the observable the daemon relies on.
+        let r = Reloader::start(
+            PathBuf::from("/nonexistent/directory/pigeon.db"),
+            router(),
+            Watcher::new(),
+        );
+        let supervisor = r.supervise();
+
+        tokio::time::timeout(std::time::Duration::from_secs(4), supervisor)
+            .await
+            .expect("the supervisor did not observe the worker ending")
+            .expect("the supervisor task itself failed");
+    }
+
+    #[tokio::test]
+    async fn the_worker_publishes_a_change() {
+        // End to end through the worker rather than through `Watcher::tick`:
+        // that the loop actually calls the detector, on the connection it
+        // opened, and installs what comes back.
+        let db = Db::new("publishes");
+        let router = router();
+        let r = Reloader::start(db.path(), Arc::clone(&router), Watcher::new());
+
+        let writer = pigeon_db::open(&db.path()).unwrap();
+        let me = pigeon_db::repo::Address::parse("me@example.net").unwrap();
+        pigeon_db::repo::add_domain(&writer, "example.com", Some(&me)).unwrap();
+        writer
+            .execute("UPDATE domain SET status = 'active'", [])
+            .unwrap();
+        pigeon_db::repo::add_alias(
+            &writer,
+            "example.com",
+            "hello",
+            pigeon_db::repo::AliasKind::Forward,
+            &[],
+        )
+        .unwrap();
+
+        let mut published = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let snap = router.for_transaction();
+            let a = pigeon_types::Address::parse("hello@example.com").unwrap();
+            if matches!(snap.resolve(&a), pigeon_route::Decision::Forward { .. }) {
+                published = true;
+                break;
+            }
+        }
+
+        let stopper = r.stopper();
+        let supervisor = r.supervise();
+        stopper.stop_and_join(supervisor).await;
+
+        assert!(published, "the worker never published a committed change");
+    }
 }

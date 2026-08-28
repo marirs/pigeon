@@ -63,16 +63,6 @@ impl Router {
     ///
     /// A single pointer store, so a reader sees the old table or the new one
     /// and never a partial one.
-    /// Publish an already-validated snapshot, for startup and for tests.
-    ///
-    /// Public where [`Router::publish`] is not, because the caller here is
-    /// seeding a router before it serves anything — the same reason
-    /// [`Router::new`] is public. It cannot run ahead of a commit, because
-    /// there is no commit.
-    pub fn publish_for_test(&self, snapshot: Snapshot) {
-        self.publish(snapshot);
-    }
-
     pub(crate) fn publish(&self, snapshot: Snapshot) {
         *self.current.write().expect("router lock poisoned") = Arc::new(snapshot);
     }

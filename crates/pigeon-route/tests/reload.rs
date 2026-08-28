@@ -80,18 +80,24 @@ impl Fixture {
     }
 
     fn routes_to(&self, address: &str) -> Option<String> {
-        let snap = self.router.for_transaction();
-        let a = ParsedAddress::parse(address).unwrap();
-        match snap.resolve(&a) {
-            pigeon_route::Decision::Forward { destinations, .. } => {
-                Some(destinations[0].to_string())
-            }
-            _ => None,
-        }
+        routes_to(&self.router, address)
     }
 
     fn tick(&self, w: &mut Watcher) -> Tick {
         w.tick(&self.daemon, &self.router)
+    }
+}
+
+/// Where a router sends an address, if anywhere.
+///
+/// Free rather than a method, so a test can ask about a router it built itself
+/// — which is now the only way to seed one.
+fn routes_to(router: &Router, address: &str) -> Option<String> {
+    let snap = router.for_transaction();
+    let a = ParsedAddress::parse(address).unwrap();
+    match snap.resolve(&a) {
+        pigeon_route::Decision::Forward { destinations, .. } => Some(destinations[0].to_string()),
+        _ => None,
     }
 }
 
@@ -131,20 +137,23 @@ fn a_commit_before_the_worker_starts_is_not_missed() {
     let f = Fixture::new("startupwindow");
     f.seed();
 
-    // Startup's build, on its own connection.
+    // Startup's build, on its own connection, seeded through `Router::new` —
+    // which is how the daemon does it, and the only way to put a table into a
+    // router. There is deliberately no public way to *replace* a serving one
+    // outside the commit contract.
     let (snapshot, _reports, mut w) = pigeon_route::reload::initial(&f.daemon).unwrap();
-    f.router.publish_for_test(snapshot);
-    assert_eq!(f.routes_to("hello@example.com"), None);
+    let router = Router::new(snapshot);
+    assert_eq!(routes_to(&router, "hello@example.com"), None);
 
     // A commit that lands before the worker's first poll.
     f.add_alias("hello", "me@example.net");
 
     assert!(
-        matches!(f.tick(&mut w), Tick::Published { .. }),
+        matches!(w.tick(&f.daemon, &router), Tick::Published { .. }),
         "a commit made between startup's build and the first poll was missed"
     );
     assert_eq!(
-        f.routes_to("hello@example.com").as_deref(),
+        routes_to(&router, "hello@example.com").as_deref(),
         Some("me@example.net")
     );
 }
@@ -564,4 +573,79 @@ fn a_transaction_keeps_its_snapshot_across_a_reload() {
     );
     // And the next transaction sees the new one.
     assert_eq!(f.routes_to("hello@example.com"), None);
+}
+
+// --------------------------------------------------- review findings, pinned
+
+#[test]
+fn the_load_runs_inside_a_read_transaction() {
+    // `load` issues a query for domains, then one per domain for its aliases,
+    // then one per alias for its destinations. Without a transaction a commit
+    // landing partway through yields a configuration assembled from two states
+    // of the database — a hybrid nobody committed, published as though somebody
+    // had.
+    //
+    // Asserted deterministically rather than by racing a writer: SQLite refuses
+    // to nest transactions, so a tick on a connection that is *already* inside
+    // one must fail. If the load opened no transaction of its own, it would
+    // happily succeed.
+    let f = Fixture::new("readtxn");
+    f.seed();
+    let mut w = Watcher::new();
+    assert!(matches!(f.tick(&mut w), Tick::Published { .. }));
+    f.add_alias("hello", "me@example.net");
+
+    let outer = f.daemon.unchecked_transaction().unwrap();
+    let tick = w.tick(&f.daemon, &f.router);
+    drop(outer);
+
+    match tick {
+        Tick::Transient { message } => assert!(
+            message.contains("transaction"),
+            "failed for the wrong reason: {message}"
+        ),
+        other => panic!("the load did not open a transaction of its own: {other:?}"),
+    }
+}
+
+#[test]
+fn a_status_this_build_cannot_read_is_invalid_not_transient() {
+    // A row this build cannot interpret reads the same way on every retry.
+    // Treating it as transient means retrying every second and logging at
+    // debug, when what an operator needs is one warning and a backoff.
+    let f = Fixture::new("unknownstatus");
+    f.seed();
+    f.add_alias("hello", "me@example.net");
+    let mut w = Watcher::new();
+    assert!(matches!(f.tick(&mut w), Tick::Published { .. }));
+
+    // Written the way a restore or a newer build would leave it: the CHECK
+    // constraint is what normally prevents this, so it is removed first.
+    f.writer
+        .execute_batch(
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master SET sql = replace(sql,
+               \"CHECK (status IN ('new','pending_dns','ready','active','error'))\", '')
+             WHERE type='table' AND name='domain';
+             PRAGMA writable_schema=OFF;",
+        )
+        .unwrap();
+    let reopened = pigeon_db::open(&f.path()).unwrap();
+    reopened
+        .execute("UPDATE domain SET status = 'from_the_future'", [])
+        .unwrap();
+
+    match f.tick(&mut w) {
+        Tick::Invalid { logged, .. } => assert!(logged, "the first failure did not log"),
+        other => panic!("an unreadable status was not treated as invalid: {other:?}"),
+    }
+
+    // And it backs off rather than rebuilding every poll.
+    assert_eq!(f.tick(&mut w), Tick::Backoff);
+
+    // The last good table is still serving.
+    assert_eq!(
+        f.routes_to("hello@example.com").as_deref(),
+        Some("me@example.net")
+    );
 }

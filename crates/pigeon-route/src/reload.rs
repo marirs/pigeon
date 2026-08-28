@@ -220,9 +220,15 @@ impl Watcher {
             return Tick::Idle;
         }
 
-        let loaded = load_and_fingerprint(conn);
-        let (inputs, fingerprint) = match loaded {
+        let (inputs, fingerprint) = match load_and_fingerprint(conn) {
             Ok(pair) => pair,
+            // A row this build cannot interpret is not a transient fault: it
+            // will read the same way on every retry, and treating it as one
+            // means retrying every second and logging at debug rather than
+            // saying once, loudly, that the configuration cannot be served.
+            Err(e @ LoadError::UnknownStatus { .. }) => {
+                return self.record_invalid(version, format!("{e}"));
+            }
             Err(e) => {
                 // Not consumed. A transient failure that advanced `seen` would
                 // permanently swallow a real change.
@@ -259,29 +265,31 @@ impl Watcher {
             Err(e) => {
                 // The last known good table stays published: a running server
                 // with a stale-but-valid routing table beats one with none.
-                //
-                // `seen` is not advanced, so the version is still pending. What
-                // is throttled is only the rebuild.
-                let next_skip = match self.failed {
-                    Some(f) if f.version == version => (f.next_skip * 2).min(BACKOFF_MAX_POLLS),
-                    _ => 1,
-                };
-                self.failed = Some(Failed {
-                    version,
-                    skip_remaining: next_skip,
-                    next_skip,
-                });
-
-                let logged = self.logged_failure != Some(version);
-                if logged {
-                    self.logged_failure = Some(version);
-                }
-                Tick::Invalid {
-                    message: format!("{e}"),
-                    logged,
-                }
+                self.record_invalid(version, format!("{e}"))
             }
         }
+    }
+
+    /// Record a version whose configuration cannot be served.
+    ///
+    /// `seen` is not advanced, so the version is still pending. What is
+    /// throttled is only the rebuild — see [`Watcher::tick`].
+    fn record_invalid(&mut self, version: i64, message: String) -> Tick {
+        let next_skip = match self.failed {
+            Some(f) if f.version == version => (f.next_skip * 2).min(BACKOFF_MAX_POLLS),
+            _ => 1,
+        };
+        self.failed = Some(Failed {
+            version,
+            skip_remaining: next_skip,
+            next_skip,
+        });
+
+        let logged = self.logged_failure != Some(version);
+        if logged {
+            self.logged_failure = Some(version);
+        }
+        Tick::Invalid { message, logged }
     }
 
     /// How long to wait before the next iteration.
@@ -300,12 +308,28 @@ fn data_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
 
 /// Read the routing input and fingerprint it, in one read transaction.
 ///
-/// One transaction so the fingerprint and the snapshot are of the same state; a
-/// second read could see a different one and publish a table whose fingerprint
-/// describes something else.
+/// The transaction is not decoration. [`crate::load`] runs a query for domains,
+/// then one per domain for its aliases, then one per alias for its
+/// destinations — so without it, a commit landing partway through produces a
+/// configuration assembled from two different states of the database. That
+/// hybrid never existed and nobody committed it, and it would be published as
+/// though somebody had.
+///
+/// An earlier version of this function said "in one read transaction" in its
+/// documentation and opened none. The comment was the specification and the
+/// code did not meet it.
+///
+/// `unchecked_transaction` because the caller holds `&Connection`: the worker's
+/// connection is read-only and single-threaded, so the borrow rules a `&mut`
+/// would enforce are already guaranteed by construction.
 fn load_and_fingerprint(conn: &Connection) -> Result<(Vec<DomainInput>, [u8; 32]), LoadError> {
-    let inputs = crate::load(conn)?;
+    let tx = conn.unchecked_transaction().map_err(LoadError::Sqlite)?;
+    let inputs = crate::load(&tx)?;
     let fingerprint = fingerprint(&inputs);
+    // Read-only, so there is nothing to commit; dropping rolls back. Explicit
+    // because "this transaction is never committed" should not have to be
+    // inferred from the absence of a call.
+    drop(tx);
     Ok((inputs, fingerprint))
 }
 
