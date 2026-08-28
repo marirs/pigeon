@@ -1,6 +1,7 @@
 # Milestone 1 — live reload
 
-Design for review. **No implementation until this is settled.**
+**Implemented.** `pigeon-route/src/reload.rs` for the detector,
+`pigeond/src/reload.rs` for the worker and its supervision.
 
 The `Arc` swap is already built and already tested. What is new here is the
 change detector, and the only property that matters is that **it cannot miss a
@@ -380,3 +381,54 @@ available — a version change with an unchanged fingerprint is consumed silentl
 
 The line carries the domain and rule counts, and the build's reports go with it,
 so a redundant alias introduced at runtime is not silent.
+
+---
+
+## 9. As built
+
+| Design | Where |
+|---|---|
+| §2 detector, §3 ordering, §4 failure | `pigeon-route/src/reload.rs` — `Watcher::tick` |
+| §2 fingerprint | same file — `fingerprint` |
+| Startup handover | same file — `initial` |
+| §6 worker, supervision, shutdown | `pigeond/src/reload.rs` |
+
+Sixteen tests, two real connections throughout.
+
+### The race is produced, not waited for
+
+`tick_with` takes a hook that runs **after the rows are read** and before the
+version is recorded. That is the window the ordering rule is about: a commit
+there is not in the snapshot just built, and a version read after it would
+include it — so recording that version consumes a change that was never built.
+
+The first attempt put the hook *before* the rows, which is the harmless window,
+and the mutation "record the version after building" survived. Worth recording:
+the test looked like it covered the rule and covered the adjacent one.
+
+### What the mutation round found in the code
+
+Eight mutations, and getting them all caught took three passes.
+
+**A line that looked load-bearing and was not.** `tick` cleared `failed`
+whenever the version changed. No mutation of that line could be made to fail a
+test — because the throttle below is already guarded on `f.version == version`,
+so a stale record simply never matches. Removed, with the reasoning kept: a
+redundant guard is a guard nobody can check.
+
+**Two tests that passed for the wrong reason.** The reconnect test committed a
+change and watched it arrive, which passes whenever the fresh connection's
+counter differs from the recorded one — most of the time. The transient test
+observed the pending change through a *later* commit, and that commit moved the
+version, hiding an advanced baseline. Both now assert the watcher's state
+directly, through `has_baseline` and `baseline`.
+
+**A backoff test that spent the throttle before the thing it tested.** It ticked
+once after the failure, letting the backoff lapse, so "a new version cancels the
+throttle" passed whether or not it did. The fix is now committed while the
+throttle is still armed.
+
+### Verified against a running daemon
+
+`routing reloaded domains=1 rules=1`, logged while serving, after an alias was
+added by the CLI in another process.

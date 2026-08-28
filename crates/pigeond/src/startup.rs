@@ -53,6 +53,9 @@ pub struct Started {
     pub migration: Applied,
     /// The validated routing table. Nothing else can produce one.
     pub snapshot: Snapshot,
+    /// Detector state matching `snapshot`, so the worker's first tick compares
+    /// against the fingerprint that was actually published.
+    pub watcher: pigeon_route::Watcher,
     /// Non-fatal findings, in the order they were made.
     ///
     /// Remote state only. Anything local that is wrong is an error, not an
@@ -130,6 +133,13 @@ pub enum StartupError {
          Mail is not being accepted, because a routing table that cannot answer \
          correctly is worse than one that is missing."
     )]
+    Initial(pigeon_route::InitialError),
+
+    #[error(
+        "the routing configuration is not usable: {0}\n\nNothing was published. \
+         Mail is not being accepted, because a routing table that cannot answer \
+         correctly is worse than one that is missing."
+    )]
     Routing(#[from] pigeon_route::BuildError),
 
     #[error("spool {path} is unusable: {source}")]
@@ -180,8 +190,15 @@ where
 
     // 7. The enforcement boundary. Loading transcribes rows and decides
     // nothing; `build` is where every rule about a valid configuration lives.
-    let built = Snapshot::build(pigeon_route::load(&db)?)?;
-    for report in &built.reports {
+    //
+    // Built through `reload::initial` so the fingerprint the worker compares
+    // against is the one behind the table actually published. The *version* is
+    // deliberately not captured here: the worker starts with no baseline and
+    // rebuilds unconditionally on its first tick, which is what closes the
+    // window between this build and the worker starting.
+    let (snapshot, reports, watcher) =
+        pigeon_route::reload::initial(&db).map_err(StartupError::Initial)?;
+    for report in &reports {
         warnings.push(report.to_string());
     }
 
@@ -189,7 +206,8 @@ where
         config: checked,
         db,
         migration,
-        snapshot: built.snapshot,
+        snapshot,
+        watcher,
         warnings,
     })
 }

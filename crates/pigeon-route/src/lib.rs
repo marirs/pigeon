@@ -77,12 +77,14 @@ pub mod fold;
 pub mod load;
 pub mod mutate;
 pub mod pattern;
+pub mod reload;
 pub mod router;
 pub mod snapshot;
 
 pub use load::{LoadError, load};
 pub use mutate::{MutationError, Outcome, mutate, preview};
 pub use pattern::{PatternError, Wildcard};
+pub use reload::{InitialError, Tick, Watcher};
 pub use router::Router;
 pub use snapshot::{
     AliasInput, BuildError, Built, CatchAllInput, Decision, Destination, DomainInput, Report, Rule,

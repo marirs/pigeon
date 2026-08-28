@@ -78,7 +78,7 @@ Deviations worth carrying forward:
 - [x] address normalisation
 - [x] route precedence
 - [x] atomic routing snapshot
-- [ ] live config reload
+- [x] live config reload
 - [x] `pigeon route inbound`
 - [x] `--json` on every read command
 - [x] bulk import from a CSV file (provider adapters are additive; see `M1-IMPORT.md` §3)

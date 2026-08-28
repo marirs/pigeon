@@ -482,6 +482,17 @@ impl Snapshot {
         fold::domain(domain).is_some_and(|d| self.domains.contains_key(d.as_str()))
     }
 
+    /// How many rules the table holds, for the reload log line.
+    ///
+    /// A reload that says only "published" tells an operator nothing about
+    /// what changed; the counts are the cheapest thing that does.
+    pub fn rule_count(&self) -> usize {
+        self.domains
+            .values()
+            .map(|d| d.exact.len() + d.wildcards.len() + usize::from(d.catchall.is_some()))
+            .sum()
+    }
+
     /// Domains in the snapshot, for diagnostics.
     pub fn domain_names(&self) -> impl Iterator<Item = &str> {
         self.domains.keys().map(String::as_str)

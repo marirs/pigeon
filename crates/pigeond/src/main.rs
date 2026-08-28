@@ -27,6 +27,7 @@
 //! it is, for an operator to find. Configuration comes from the environment
 //! because the TOML loader and SQLite schema arrive in Milestone 1.
 
+mod reload;
 mod startup;
 
 use std::collections::HashSet;
@@ -676,7 +677,7 @@ async fn run() -> io::Result<()> {
     // it `PIGEON_ACCEPT` and `PIGEON_FORWARD_TO`.
     let booted = match std::env::var("PIGEON_CONFIG") {
         Ok(path) if !path.trim().is_empty() => {
-            let started = startup::start(Path::new(path.trim()), |dir| async move {
+            let mut started = startup::start(Path::new(path.trim()), |dir| async move {
                 prepare_spool(&dir).await
             })
             .await
@@ -713,6 +714,7 @@ async fn run() -> io::Result<()> {
             // So it is reported rather than half-used, and the log says which.
             let domains = started.snapshot.domain_names().count();
             let schema = pigeon_db::schema_version(&started.db).unwrap_or(0);
+            let db_path = started.config.config().database.clone();
             tracing::info!(schema, "control plane open");
             tracing::info!(
                 domains,
@@ -720,7 +722,15 @@ async fn run() -> io::Result<()> {
                  still comes from PIGEON_ACCEPT and delivery from PIGEON_FORWARD_TO."
             );
 
-            Some(started)
+            // The routing table is republished when the database changes, even
+            // though nothing routes from it yet. Starting the worker now means
+            // the detector — the part with the property worth proving — is
+            // exercised by every run rather than only once it has a consumer.
+            let router = Arc::new(pigeon_route::Router::new(started.snapshot.clone()));
+            let watcher = std::mem::take(&mut started.watcher);
+            let reloader = reload::Reloader::start(db_path, Arc::clone(&router), watcher);
+
+            Some((started, reloader))
         }
         _ => {
             tracing::warn!(
@@ -731,15 +741,15 @@ async fn run() -> io::Result<()> {
     };
 
     let listen = match &booted {
-        Some(b) => b.config.config().smtp.inbound.listen.to_string(),
+        Some((b, _)) => b.config.config().smtp.inbound.listen.to_string(),
         None => env_or("PIGEON_LISTEN", "127.0.0.1:2525"),
     };
     let hostname = match &booted {
-        Some(b) => b.config.config().hostname.clone(),
+        Some((b, _)) => b.config.config().hostname.clone(),
         None => env_or("PIGEON_HOSTNAME", "localhost"),
     };
     let spool = match &booted {
-        Some(b) => b.config.config().spool.clone(),
+        Some((b, _)) => b.config.config().spool.clone(),
         None => PathBuf::from(env_or("PIGEON_SPOOL", "./spool")),
     };
 
@@ -879,13 +889,33 @@ async fn run() -> io::Result<()> {
         ..Default::default()
     };
 
-    tokio::select! {
+    // Supervised from here rather than left to a dropped handle. A panicking
+    // task cannot report its own death, and an unpolled `JoinHandle` holds the
+    // result silently — a daemon that spawned the worker and forgot it would
+    // keep serving the last published table forever with routing frozen and
+    // nothing saying why.
+    let stop_reload = booted.map(|(_, r)| {
+        // `supervise` consumes the handle and becomes the only join, so the
+        // stopper is taken first. Two ways to stop one worker would be two
+        // orderings to keep straight.
+        let stopper = r.stopper();
+        (stopper, r.supervise())
+    });
+
+    let outcome = tokio::select! {
         r = pigeon_smtp::serve(listener, config, sink) => r,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
             Ok(())
         }
+    };
+
+    // Signalled *and* joined, through the supervisor.
+    if let Some((stopper, supervisor)) = stop_reload {
+        stopper.stop_and_join(supervisor).await;
     }
+
+    outcome
 }
 
 #[cfg(test)]

@@ -1048,6 +1048,7 @@ dependencies = [
  "pigeon-db",
  "pigeon-types",
  "rusqlite",
+ "sha2",
  "thiserror",
 ]
 
