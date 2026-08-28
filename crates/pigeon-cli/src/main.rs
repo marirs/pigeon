@@ -43,11 +43,13 @@
 //! validates the prospective snapshot *inside the same transaction*, rolls back
 //! if it will not serve, commits, and only then publishes.
 //!
-//! The daemon's Unix socket is not built yet, so mutation is offline-only: a
-//! change made while the daemon is running is in the database but not in the
-//! daemon's routing table until it restarts. `BEGIN IMMEDIATE` means the two
-//! cannot corrupt each other, and the CLI says so rather than leaving it to be
-//! discovered.
+//! A running daemon picks the change up on its own: it polls `data_version`
+//! and republishes when the routing input actually changed, so the CLI does not
+//! signal it and does not need to. What the CLI does say is *when* — committed
+//! and being served are one poll interval apart, and an operator who changes a
+//! route and immediately tests it would otherwise see the old one and conclude
+//! the change had not applied. `BEGIN IMMEDIATE` is what keeps the two
+//! processes from corrupting each other in the meantime.
 //!
 //! # The `--json` contract
 //!
@@ -435,14 +437,23 @@ fn apply<T>(
 
 /// Say what the change means for a daemon that is already running.
 ///
-/// The Unix socket that would tell it is Milestone 1 work that is not done, so
-/// this is the honest version: the rows are committed and the running daemon
-/// has not read them.
+/// Two things are true and the note has to carry both. The daemon *does* pick
+/// the change up on its own now — but "committed" and "being served" are one
+/// poll apart, and it does not route mail from that table until Milestone 3.
+/// Claiming only the first would tell an operator their forwarding changed.
+///
+/// The interval is read from the detector rather than written here, so shorten
+/// the poll and this sentence shortens with it. A hardcoded number is how a
+/// note becomes a lie one constant at a time.
 fn note_reload(cli: &Cli) {
     if !cli.dry_run {
         note(
             cli,
-            "\nA running pigeond will not see this until it restarts.",
+            &format!(
+                "\nA running pigeond reloads its routing table within {:?}; it does not \
+                 route mail from that table until Milestone 3.",
+                pigeon_route::reload::POLL
+            ),
         );
     }
 }

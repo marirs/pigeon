@@ -270,8 +270,9 @@ fn write_rows(
     // that reads like publication and is not.
     //
     // So the commit completes the CLI's operation. Making the running daemon
-    // pick the change up is the live-reload contract, and until that exists the
-    // command says the daemon will not see it until it restarts.
+    // pick the change up is the live-reload contract, which is the daemon's
+    // side of this boundary: it detects the commit and publishes its own
+    // snapshot, on its own connection.
     Ok(applied)
 }
 

@@ -124,8 +124,10 @@ serve nothing and be freed when the command exits — a throwaway that reads lik
 publication and is not.
 
 So **the commit completes the CLI's operation.** Making a running daemon pick
-the change up is the live-reload contract, and until that exists every mutating
-command says the daemon will not see it until it restarts.
+the change up is the live-reload contract — the daemon's side of this boundary,
+where it detects the commit and publishes its own snapshot on its own
+connection. Every mutating command still says *when*, because committed and
+being served are one poll interval apart.
 
 ---
 

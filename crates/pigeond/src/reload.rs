@@ -179,22 +179,32 @@ impl Reloader {
     /// join handle directly — and two ways to stop one worker is two orderings
     /// to keep straight.
     pub fn supervise(self) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            match self.handle.await {
-                // A clean exit is either shutdown, which is expected, or the
-                // worker giving up, which is not. It cannot tell the two apart
-                // from here, so it says what is true of both: routing stops
-                // changing.
-                Ok(()) => tracing::debug!("the reload worker exited; routing will not change"),
-                Err(e) if e.is_panic() => tracing::error!(
-                    error = %e,
-                    "the reload worker panicked; routing is frozen at the last published \
-                     table until the daemon restarts"
-                ),
-                Err(e) => tracing::error!(error = %e, "the reload worker ended abnormally"),
-            }
-        })
+        supervise_handle(self.handle)
     }
+}
+
+/// The supervision itself, over any handle.
+///
+/// Split from [`Reloader::supervise`] so a test can hand it a task that panics.
+/// The worker's own body has no failure injection point, and a branch that
+/// cannot be reached from a test is a branch that is not known to work — this
+/// module previously claimed a panic-supervision test it did not have.
+fn supervise_handle(handle: JoinHandle<()>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        match handle.await {
+            // A clean exit is either shutdown, which is expected, or the
+            // worker giving up, which is not. It cannot tell the two apart
+            // from here, so it says what is true of both: routing stops
+            // changing.
+            Ok(()) => tracing::debug!("the reload worker exited; routing will not change"),
+            Err(e) if e.is_panic() => tracing::error!(
+                error = %e,
+                "the reload worker panicked; routing is frozen at the last published \
+                 table until the daemon restarts"
+            ),
+            Err(e) => tracing::error!(error = %e, "the reload worker ended abnormally"),
+        }
+    })
 }
 
 fn open(path: &std::path::Path) -> Result<rusqlite::Connection, pigeon_db::DbError> {
@@ -210,9 +220,15 @@ fn open(path: &std::path::Path) -> Result<rusqlite::Connection, pigeon_db::DbErr
 /// Whether a connection has failed in a way reopening might fix.
 ///
 /// Probes with a real read against a table the loader uses. `SELECT 1` is
-/// answered by the expression evaluator without touching a single page — it
-/// succeeds against a connection whose file has been deleted underneath it —
-/// so it cannot detect the storage failures the reconnect exists for.
+/// answered by the expression evaluator without touching a single page, so it
+/// reports healthy for a connection whose storage has failed underneath it —
+/// which is the only situation this function is ever asked about.
+///
+/// Measured, because the obvious example is the wrong one: for a *deleted*
+/// file both probes still succeed, since the descriptor and the cached pages
+/// outlive the directory entry. The case that separates them is corruption —
+/// a file replaced underneath an open connection answers `SELECT 1` with `1`
+/// and a table read with `database disk image is malformed`.
 fn conn_is_broken(conn: &rusqlite::Connection) -> bool {
     conn.query_row("SELECT count(*) FROM domain", [], |r| r.get::<_, i64>(0))
         .is_err()
@@ -221,7 +237,90 @@ fn conn_is_broken(conn: &rusqlite::Connection) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    /// Every `tracing` event this test binary emits, in order.
+    ///
+    /// The supervisor's whole job is to *say* something — a test that only
+    /// awaits its handle passes just as well when the reporting is deleted, so
+    /// the log line is the assertion, not a side effect of one.
+    ///
+    /// Global rather than per-test because a subscriber is only visible to the
+    /// thread that installed it, and the events under test are emitted from a
+    /// spawned task on another thread. Tests therefore search the buffer for
+    /// their own message rather than reading it positionally.
+    #[derive(Clone, Default)]
+    struct Events(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+    }
+
+    impl Events {
+        fn find(&self, level: tracing::Level, needle: &str) -> Option<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(l, m)| *l == level && m.contains(needle))
+                .map(|(_, m)| m.clone())
+        }
+    }
+
+    fn events() -> Events {
+        static EVENTS: OnceLock<Events> = OnceLock::new();
+        EVENTS
+            .get_or_init(|| {
+                let events = Events::default();
+                let _ = tracing_subscriber::registry()
+                    .with(events.clone())
+                    .try_init();
+                events
+            })
+            .clone()
+    }
+
+    /// Wait for an event to arrive, or give up.
+    ///
+    /// The supervisor logs from a task the test does not hold, so the event can
+    /// trail the await by a scheduling tick.
+    async fn await_event(level: tracing::Level, needle: &str) -> String {
+        let events = events();
+        for _ in 0..200 {
+            if let Some(message) = events.find(level, needle) {
+                return message;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no {level} event containing {needle:?} was ever logged");
+    }
 
     /// A migrated database that removes itself.
     struct Db(PathBuf);
@@ -297,14 +396,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_worker_that_ends_is_reported() {
-        // A panicking task cannot log its own death, and an unpolled handle
-        // holds the result silently. The supervisor is what turns either into
-        // something an operator can see.
-        //
-        // Driven by making the worker fail immediately: a path that is not a
-        // database. The worker logs and returns, and the supervisor's handle
-        // resolves — which is the observable the daemon relies on.
+    async fn a_worker_that_gives_up_is_reported() {
+        // The worker giving up on its own: a path that is not a database, so it
+        // logs and returns before its first tick. What is asserted is that the
+        // supervisor then says routing has stopped changing — awaiting the
+        // handle alone would pass with all of the reporting deleted.
+        let events = events();
         let r = Reloader::start(
             PathBuf::from("/nonexistent/directory/pigeon.db"),
             router(),
@@ -316,6 +413,77 @@ mod tests {
             .await
             .expect("the supervisor did not observe the worker ending")
             .expect("the supervisor task itself failed");
+
+        // The worker's own complaint, and then the supervisor's.
+        assert!(
+            events
+                .find(tracing::Level::ERROR, "could not open the database")
+                .is_some(),
+            "the worker did not report why it gave up"
+        );
+        await_event(tracing::Level::DEBUG, "routing will not change").await;
+    }
+
+    #[tokio::test]
+    async fn a_panicking_worker_is_reported_as_a_panic() {
+        // The branch the daemon exists to have: a worker that dies mid-run
+        // cannot log its own death, because the panic unwinds past any logging
+        // it would have done, and a `JoinHandle` nobody awaits holds the result
+        // silently. Routing then freezes with nothing anywhere saying why.
+        //
+        // Injected through `supervise_handle` rather than through the worker,
+        // which has no failure point to reach: the worker is a `spawn_blocking`
+        // task, so this is one too, and `JoinError::is_panic` is what the branch
+        // actually keys on.
+        events();
+        let handle = tokio::task::spawn_blocking(|| panic!("simulated reload worker panic"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(4), supervise_handle(handle))
+            .await
+            .expect("the supervisor did not observe the panic")
+            .expect("the supervisor task itself failed");
+
+        // Not merely "an error was logged": a panic must be distinguishable
+        // from a clean exit, because the operator responses differ — one is a
+        // restart, the other is shutdown working correctly.
+        let message = await_event(tracing::Level::ERROR, "panicked").await;
+        assert!(
+            message.contains("frozen"),
+            "the panic report did not say routing had frozen: {message}"
+        );
+    }
+
+    #[test]
+    fn the_liveness_probe_reads_the_database() {
+        // Regression for a probe that reported healthy for every failure it was
+        // meant to catch. `SELECT 1` never touches a page, so it answers from
+        // the expression evaluator alone.
+        //
+        // The failure injected is corruption rather than deletion, because a
+        // deleted file is not actually a failure the connection can see: the
+        // descriptor and the cached pages outlive the directory entry, and both
+        // probes keep succeeding. Replacing the file underneath an open
+        // connection is what makes a real page read fail.
+        let db = Db::new("probe");
+        let conn = pigeon_db::open_read_only(&db.path()).unwrap();
+        // Read once first, so the connection is genuinely established and the
+        // corruption is discovered on a later read rather than at open.
+        assert!(
+            !conn_is_broken(&conn),
+            "a healthy connection read as broken"
+        );
+
+        std::fs::write(db.path(), vec![0x41; 40 * 1024]).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)).ok(),
+            Some(1),
+            "the naive probe would have to fail here for the old one to have worked"
+        );
+        assert!(
+            conn_is_broken(&conn),
+            "the probe did not notice that the database underneath it was gone"
+        );
     }
 
     #[tokio::test]

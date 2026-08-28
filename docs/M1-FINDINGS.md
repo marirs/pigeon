@@ -371,8 +371,84 @@ changed.
 
 ---
 
-## What to carry into the rest of Milestone 1
-- Live configuration reload, so a mutation reaches a running daemon without a
-  restart. Until it exists, the CLI says so after every change.
-- `--json` on every read command; several have it, not all.
-- Bulk import from an existing forwarding provider.
+## 9. Bulk import, and where its transaction had to end
+
+Ten findings against the first implementation, and the shape of most of them was
+the same: a boundary drawn around the *parse* rather than around the *effect*.
+
+The three rulings that set the boundary — replace the catch-all but preserve the
+domain default, require headers, preserve every existing lifecycle and admin
+state — are in `M1-IMPORT.md`. What the review added was that a file is not a
+transaction: a row that names a domain the file does not create, a catch-all
+that arrives twice, a key written for a domain whose insert then rolls back.
+Each was a case where the import had validated the input and not the outcome.
+
+The one worth repeating is the post-lock guard. It compared row *counts* before
+and after taking the write lock, which is the check that looks like a race
+detector and is not: a concurrent transaction that removes one alias and adds
+another leaves the count identical and the imported set stale.
+
+---
+
+## 10. Live reload, and the tests that were not there
+
+The design's own words were that the dangerous part is not the `Arc` swap but
+proving the detector cannot miss a commit. That turned out to be right, and
+also incomplete — the detector was the part that got the tests.
+
+Six findings; three mattered, and they are recorded in full in `M1-RELOAD.md`.
+The pattern behind them is the one `M0-FINDINGS.md` has been tracking since the
+beginning: **a comment asserting a guarantee the code does not provide.**
+`load_and_fingerprint` documented a read transaction it never opened. The probe
+documented a storage failure it could not see. §7 of the design listed tests for
+shutdown joining and panic supervision that did not exist — `cargo test -p
+pigeond reload` reported zero.
+
+That last one is the finding about findings. The single part of the design with
+no tests was the single part with a process-hanging defect: a worker started
+before the fallible setup, dropped by an early `?` without being signalled, and
+a dropped `watch::Sender` does not flip the value the receiver reads. It looped
+forever, and being a `spawn_blocking` task the runtime waited for it at
+shutdown. A claimed test is worse than an absent one, because it is the absent
+one plus a reason not to look.
+
+Two further claims were closed on a second pass. A supervisor test that only
+awaited its handle passed with all of the reporting deleted, so supervision is
+now asserted through the log events themselves, with the panic branch reached by
+handing `supervise_handle` a task that panics. And the probe fix had no
+regression test — reverting it to `SELECT 1` left the whole suite green.
+
+Writing that one corrected the justification as well. The reason first given was
+that `SELECT 1` succeeds against a connection whose file has been deleted, which
+is true and irrelevant: **both** probes succeed there, because the descriptor
+and the cached pages outlive the directory entry. The case that separates them
+is corruption. A file replaced underneath an open connection answers `SELECT 1`
+with `1` and a table read with `database disk image is malformed`. The fix was
+right; the stated reason for it was not, and an unmeasured justification is how
+a correct line survives into the next refactor for the wrong reason.
+
+---
+
+## Milestone 1 is complete
+
+Under the wording approved when fan-out moved:
+
+> The daemon's RCPT accept/reject decision and resolved destination set come
+> from the routing snapshot.
+
+That is Milestone 3's criterion, not this one. Milestone 1's is that `route
+inbound` exactly predicts what the snapshot answers, that no mutating command
+can commit a configuration that does not build and validate, and that an
+existing set of domains and aliases imports in one command. All three hold, each
+through the same code path the daemon uses rather than a second implementation
+of it.
+
+Live reload is part of that completion rather than an exception to it: a
+mutation reaches a running daemon without a restart, and the CLI no longer tells
+the operator otherwise.
+
+What remains open — fan-out to several destinations, retries, per-destination
+durable state, and the runtime wiring that consumes the published snapshot —
+belongs to Milestone 3 by the same argument that moved it there. Safe retries
+require independently durable destination state, and that state *is* Milestone
+3.

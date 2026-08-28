@@ -333,6 +333,9 @@ commits are seen.
 | Transient failure does not consume the version | fail the read, then succeed; assert the change arrives |
 | Transactions keep their snapshot across a publication | pin, publish, assert the pinned table is unchanged and the next one is not |
 | Shutdown joins | signal, join, assert the worker actually ended |
+| A worker that gives up is reported | assert the supervisor logged it, not merely that the handle resolved |
+| A panicking worker is reported as a panic | drive `supervise_handle` with a panicking task, assert the error event |
+| The liveness probe reads the database | corrupt the file under an open connection: `SELECT 1` still answers, the probe does not |
 | A dropped `Reloader` does not leak the worker | start, drop without signalling, assert the runtime still shuts down |
 | The load is transactional | tick inside an outer transaction, assert it refuses to nest |
 | An unreadable status is invalid, not transient | assert it warns once and backs off |
@@ -481,6 +484,41 @@ Four worker tests now, including one asserting that a dropped `Reloader` does
 not leave the worker running. Mutating the channel check makes that test hang
 rather than fail, which is the correct signature: a leaked blocking task is
 precisely what stops a runtime from shutting down.
+
+### Two of those tests were still claims
+
+A second pass found that two of the fixes above were asserted rather than
+tested, which is the same defect one level up.
+
+**The supervisor test only awaited its handle.** Delete every `tracing` call in
+`supervise` and it still passed — an await proves the task ended, not that
+anybody was told. Supervision is now asserted through the events themselves, and
+the panic branch is reached by handing `supervise_handle` a task that panics,
+since the worker's own body has no failure point a test can drive. That seam
+exists for exactly this reason: a branch a test cannot reach is a branch that is
+not known to work.
+
+Three mutations, all caught: the panic arm folded into the generic one, the
+clean-exit report deleted, and the panic message stripped of its wording. The
+last matters because a panic must stay distinguishable from a clean exit — one
+means restart, the other means shutdown worked.
+
+**The probe fix had no regression test.** Reverting `SELECT count(*) FROM
+domain` to `SELECT 1` left all 404 tests green.
+
+Writing that test corrected the reason for the fix as well. The justification
+first given was that `SELECT 1` succeeds against a connection whose file has
+been deleted — true, and irrelevant: **both** probes succeed there, because the
+descriptor and the cached pages outlive the directory entry. Measured:
+
+| after | `SELECT 1` | `SELECT count(*) FROM domain` |
+|---|---|---|
+| the file is deleted | `1` | `0` |
+| the file is replaced with garbage | `1` | `database disk image is malformed` |
+
+So corruption is the case that separates them, and corruption is what the test
+injects. The fix was right and the stated reason for it was not — which is how a
+correct line survives the next refactor for the wrong reason.
 
 ### Verified against a running daemon
 

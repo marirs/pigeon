@@ -238,7 +238,7 @@ fn notes_move_to_stderr_rather_than_disappearing() {
 
     out.json("alias add");
     assert!(
-        out.stderr.contains("will not see this until it restarts"),
+        out.stderr.contains("reloads its routing table within"),
         "the reload note vanished under --json: {:?}",
         out.stderr
     );

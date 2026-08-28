@@ -682,7 +682,7 @@ Five rules, and they hold for failures as well as successes.
 
 **Exactly one JSON value on stdout.** Every invocation, including one that fails. Parse stdout unconditionally; you never have to decide whether there is anything there.
 
-**Nothing else on stdout.** Notes, warnings and progress go to stderr, where they cannot corrupt the parse. They are not suppressed — a `route inbound` caveat or a "restart the daemon" note is worth as much to a script's operator as to a person, so it moves rather than vanishing.
+**Nothing else on stdout.** Notes, warnings and progress go to stderr, where they cannot corrupt the parse. They are not suppressed — a `route inbound` caveat or a "the daemon reloads in a moment" note is worth as much to a script's operator as to a person, so it moves rather than vanishing.
 
 **`format_version` on every response.** It starts at 1 and moves only when this contract changes. It is deliberately *not* the database schema version: a storage migration that adds an index changes nothing you can observe, and a renamed field changes everything while possibly needing no migration at all.
 
