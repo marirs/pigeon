@@ -28,12 +28,28 @@ meaningful sense: the listeners are bound, the keys root has been canonicalised
 and every stored key path validated against it, and the spool has been probed.
 Re-reading the file would produce values that disagree with a running process.
 
-**DKIM keys are a gap worth naming.** Startup derives each active key's public
-half and compares it with the stored one. A domain added while the daemon runs
-brings a key that check has never seen, and reload does not run it — the routing
-snapshot does not read `dkim_key` at all. That costs nothing today because
-nothing signs yet, and it must be closed when signing lands in Milestone 2:
-either reload verifies new keys, or signing verifies on first use.
+**Startup cross-checks are a gap worth naming, and DKIM is not the only one.**
+
+`M1-SCHEMA.md` §5 has three checks that compare configuration against schema,
+and every one of them can be invalidated by a mutation made while the daemon
+runs:
+
+| Check | How a live mutation breaks it | Consumer ships |
+|---|---|---|
+| Every active DKIM key derives its stored public half | `domain add` brings a key the check has never seen | M2 (signing) |
+| `alerts.identity` is not on a managed domain | `domain add` for the identity's own domain makes it managed — the exact configuration startup refuses | M5 (alerting) |
+| Hostname reverse DNS | unaffected; it reads no schema | — |
+
+Neither costs anything today, because nothing signs and nothing alerts. Both
+must be closed **when their consumer ships**, and the rule is the general one
+rather than two special cases:
+
+> Reload reruns every configuration-versus-schema invariant whose consumer is
+> live, or that consumer verifies at the point of use.
+
+Reload does not run them now because there is nothing to protect and a check
+with no consumer is a check nobody maintains. Recorded here so that adding the
+consumer and adding the check are one task rather than two.
 
 ---
 
@@ -53,6 +69,29 @@ rather than taken from the documentation:
 | The value is stable inside a read transaction, and that transaction is isolated | stable, isolated |
 | An open, uncommitted write transaction does not move it | unchanged until commit |
 | Several commits between polls produce one change | yes — they coalesce |
+| A commit to an **unrelated table** moves it | yes — it is *any* commit |
+
+### `data_version` is a doorbell, not a diff
+
+The last row matters more than it looks. `data_version` observes every commit to
+the database, not every commit to routing. Milestone 3 puts the queue in the
+same file, and a busy relay commits queue and delivery rows continuously — so a
+detector that rebuilt and published on every version change would rebuild
+constantly, publish identical tables, and log a reload for each one.
+
+So the version is only the **wake-up signal**. What decides whether anything
+happened is a canonical fingerprint of the routing inputs, computed from the
+rows the snapshot was built from:
+
+```text
+version changed  ->  load  ->  fingerprint == last published?
+                                  yes -> consume the version, publish nothing, log nothing
+                                  no  -> build, publish, log
+```
+
+A commit that did not touch routing is consumed silently. This is also what
+makes R-3 implementable: "log when routing changed" is not the same question as
+"log when the database changed", and only the fingerprint can tell them apart.
 
 ### The second row is a trap for later
 
@@ -73,17 +112,23 @@ introduces it will be nowhere near this file.
 This is the whole design.
 
 ```text
-loop {
-    v = PRAGMA data_version          <- recorded BEFORE the read transaction
-    if v == seen { sleep; continue }
+seen: Option<i64> = None            <- see "the baseline" below
 
-    BEGIN                            <- read transaction
+loop {
+    v = PRAGMA data_version         <- recorded BEFORE the read transaction
+    if seen == Some(v) && not retrying { sleep 1s; continue }
+
+    BEGIN                           <- read transaction
       rows = load()
+      fingerprint = hash(rows)
       snapshot = build(rows)?
     END
 
-    publish(snapshot)
-    seen = v                         <- the version read at the top, never a later one
+    if fingerprint != published {
+        publish(snapshot)
+        log
+    }
+    seen = Some(v)                  <- the version read at the top, never a later one
 }
 ```
 
@@ -114,6 +159,43 @@ slightly tighter, since version and data then correspond exactly. The rule is
 stated as "before" because it is the simpler thing to check in review, and both
 satisfy the invariant.
 
+### The baseline: `seen` starts as `None`
+
+Startup builds a snapshot from its own connection, and the worker starts
+afterwards. If the worker adopted the version it reads at start-up as its
+baseline, a commit landing between those two moments would be inside the
+baseline and never rebuilt — the same miss, arriving before the loop has run
+once.
+
+`None` closes it: the first iteration always rebuilds, whatever the version
+says. One redundant build at start, and no window.
+
+The alternative — capturing the baseline on the same connection *before*
+startup's build — also works and is more efficient by exactly one rebuild. It is
+not chosen because it couples the worker's correctness to the order of two
+things in `startup.rs`, and that coupling is invisible from here.
+
+### Reconnecting resets the baseline
+
+`data_version` is only comparable across calls **on the same connection**. It is
+a per-connection counter of changes that connection has observed, not a global
+sequence number, and the difference is not academic:
+
+```text
+old connection has seen 3 changes      -> reads 3
+reopen                                 -> reads 2
+three more commits happen              -> a brand-new connection still reads 2
+```
+
+Verified against the bundled SQLite. So a worker that reopens after a
+connection-level failure and adopts the new connection's current value would set
+`seen` to a number with no relationship to what it had already published, and
+would then skip every change until the new counter caught up.
+
+**After any reconnect, `seen` returns to `None`** and the next iteration rebuilds
+unconditionally. Reconnection is rare and a rebuild is cheap; a skipped change
+is neither.
+
 ### Coalescing is fine, and is the point
 
 Five commits between two polls produce one version change and one rebuild from
@@ -139,17 +221,42 @@ beats one with none. `seen` is not advanced here either.
 
 That raises a flooding problem the contract has to answer: an invalid
 configuration does not fix itself, so retrying every poll rebuilds forever and
-logs forever. So:
+logs forever.
+
+**The backoff throttles rebuilding, never polling.** The loop keeps reading
+`data_version` every second, whatever is failing. What the backoff decides is
+whether to attempt a *rebuild* for a version that has already failed:
+
+```text
+same version still failing   ->  skip the rebuild until the backoff expires
+a version not seen before    ->  cancel the backoff, rebuild immediately
+```
+
+Suspending the poll instead would mean a fix committed during a sixty-second
+backoff waits sixty seconds to be noticed — and the fix is the one commit that
+most deserves to be picked up promptly. Detection is cheap; only the rebuild is
+worth throttling.
 
 - **Log once per version.** The message names the version that failed; the same
   version does not log again.
-- **Back off the retry**, capped. The version is still not consumed — if it is
-  fixed, the fix is a new commit and a new version, which resets the backoff and
-  is attempted immediately.
+- **Back off the rebuild**, capped. The version is still not consumed — if it is
+  fixed, the fix is a new commit and a new version, which cancels the backoff
+  and is attempted on the next poll.
 
-**A poisoned lock or a panicked worker** is a bug, not a condition. The worker
-logs and exits; the daemon keeps serving the last published table. It does not
-silently restart itself into the same panic.
+**A panic in the worker** is a bug, not a condition — and it is the one failure
+the worker cannot report, because reporting is what it stopped doing.
+
+An earlier draft said "the worker logs and exits". It cannot: a panic unwinds
+past any logging the worker would have done, and a `JoinHandle` nobody awaits
+holds the result silently until someone asks. A daemon that spawned the worker
+and forgot it would keep serving the last published table forever, with routing
+frozen and nothing anywhere saying why.
+
+So the boundary is supervised from outside. The daemon holds the handle and
+awaits it; a task that ends — for any reason, panic or otherwise — is reported
+at that point, with the panic message when there is one. The daemon keeps
+serving the last published table, because a frozen-but-valid table is still
+better than none, but it says so rather than pretending.
 
 ### What each failure leaves
 
@@ -157,7 +264,7 @@ silently restart itself into the same panic.
 |---|---|---|---|
 | Transient | unchanged | not advanced | at each retry, at debug |
 | Invalid configuration | last known good | not advanced | once per version, at warn |
-| Worker panic | last known good | — | once, at error |
+| Worker panic | last known good | — | once, at error, **by the supervisor** |
 
 ---
 
@@ -179,10 +286,26 @@ publication that came from the worker rather than from a test.
 The worker is a task with a handle. Shutdown **signals and joins** — it does not
 signal and hope.
 
-Joining matters because the worker holds a SQLite connection, and a daemon that
-exits while a read transaction is open leaves the WAL needing recovery on the
-next start. That is recoverable and it is noise, and noise in a startup log is
-how a real message gets missed.
+Joining matters for two reasons, and an earlier draft gave a third that is not
+true.
+
+**Deterministic shutdown.** A signalled-but-unjoined worker may still be inside
+a rebuild, and a process that exits underneath it makes "did the last reload
+finish?" unanswerable from the outside. Joining makes the answer yes.
+
+**Connection cleanup.** The worker owns a SQLite connection, and joining is what
+closes it at a known point rather than at process teardown.
+
+The claim it replaces was that an abandoned read transaction leaves WAL recovery
+work. It does not — process exit releases the reader's locks, and the WAL is
+consistent either way. What a live reader actually does is **hold back
+checkpointing**: verified against the bundled SQLite, a checkpoint attempted with
+an open read transaction returns busy, and succeeds once the reader ends. That
+is a growth-of-WAL concern on a long-running daemon, not a correctness one, and
+it is not a reason to join at shutdown — the process is ending anyway.
+
+Keeping the wrong reason would have made the next reader believe a shutdown path
+was protecting them from something it was not.
 
 The wait is bounded. A worker that does not stop is logged and abandoned rather
 than hanging the shutdown, since the alternative is a daemon that cannot be
@@ -209,6 +332,11 @@ commits are seen.
 | Transient failure does not consume the version | fail the read, then succeed; assert the change arrives |
 | Transactions keep their snapshot across a publication | pin, publish, assert the pinned table is unchanged and the next one is not |
 | Shutdown joins | signal, join, assert the worker actually ended |
+| A commit before the worker starts is not missed | commit between startup's build and the worker's first poll |
+| A reconnect rebuilds unconditionally | force a reconnect, assert the next state is published |
+| An unrelated commit publishes nothing | write to a non-routing table, assert no publish and no log |
+| The backoff does not delay a fix | invalid, then fixed during the backoff window, assert prompt pickup |
+| A panicking worker is reported | make the worker panic, assert the supervisor logs it |
 
 The racing test is the one that needs care. It is not a timing test: the commit
 is made *deterministically* between the version read and the build, by driving
@@ -223,26 +351,32 @@ Mutations that must turn one of them red:
 - the detector using the same connection as the writer
 - shutdown signalling without joining
 - the poll comparing against a version captured after the transaction closes
+- `seen` initialised from the version at start-up instead of `None`
+- a reconnect adopting the new connection's current version
+- the backoff suspending the poll rather than only the rebuild
+- publishing and logging on every version change, without the fingerprint
+- the worker spawned and its handle dropped
 
 ---
 
-## 8. Open questions
+## 8. Rulings
 
-**R-1 — What is the poll interval?**
-Recommend **one second**, as a constant rather than configuration. The check is
+**R-1 — Poll interval: one second, as a constant.** Ruled. The check is
 a single pragma on an open connection and costs nothing; a knob here invites
 tuning a number that has no wrong value, and a slower poll only delays a reload
 nobody is waiting on synchronously.
 
-**R-2 — Should `pigeon` tell the daemon directly rather than being polled for?**
-Recommend **no, not in Milestone 1.** A Unix socket is the mechanism
+**R-2 — Polling only for Milestone 1.** Ruled. A Unix socket is the mechanism
 `ARCHITECTURE.md` §3.3 already describes for mutating commands, and building
 half of it as a reload ping would mean two notification paths to reconcile
 later. Polling is correct on its own; the socket can make it prompt when it
 arrives, and the detector remains the thing that cannot miss.
 
 **R-3 — Does the daemon log every successful reload?**
-Recommend **yes, at info, with counts** — domains and rules. A reload that
-happens is a change to what the daemon does, and an operator reading a log after
-an incident needs to see when the table changed. Reports from the build go with
-it, so a redundant alias introduced at runtime is not silent.
+Ruled: **log at info only when the routing input actually changed and was
+published**, not on every `data_version` change. The two are different questions
+once the queue shares the database, and §2 is what makes the distinction
+available — a version change with an unchanged fingerprint is consumed silently.
+
+The line carries the domain and rule counts, and the build's reports go with it,
+so a redundant alias introduced at runtime is not silent.
