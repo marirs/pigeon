@@ -249,35 +249,55 @@ epoch keeps changing underneath it.
 **So the regression test cannot be made against the published revision.** That
 is the number a failed build leaves stale, which is precisely the situation step
 4 exists for. It has to be made against a separate, explicitly named piece of
-state: the **observed baseline** — the revision the current lineage was
-established at, held beside the lineage and updated whether or not the build
-that followed succeeded.
+state: the **observed baseline** — the **high-water revision seen in the current
+lineage**, held beside the lineage and updated whether or not the build that
+followed succeeded.
+
+High-water, not the revision the lineage was established at, and the difference
+is not academic. Establish a lineage at 5, take a fixing commit at 6, and then
+restore to 5 a second time: against an establishment baseline the observation
+*equals* `B`, so it looks like the same rewound database and the daemon keeps
+serving revision 6's routing on top of a database holding revision 5's. A
+high-water baseline is 6 by then, so the second restore is below it and is
+handled as the regression it is.
 
 With a baseline `B` and lineage `L`, every poll's observed revision falls into
 one of three cases:
 
 | Observed | Meaning | Response |
 |---|---|---|
-| `< B` | a regression, or a second restore | new lineage, `B` := observed, build, publish |
-| `= B` | the same rewound database again | no new lineage; if the build failed, an ordinary throttled retry |
-| `> B` | a forward change within this lineage | the normal path |
+| `< B` | a regression, or a further restore | new lineage, `B` := observed, build, publish |
+| `= B` | nothing new since the highest this lineage has seen | no new lineage; if the build failed, an ordinary throttled retry |
+| `> B` | a forward change within this lineage | `B` := observed, the normal path |
 
-The worked case: published `(L, 10)`, baseline 10. A restore to revision 5 is a
-regression, so the lineage becomes `L+1` and the baseline becomes 5 — *then* the
-build fails, leaving publication at `(L, 10)` and the baseline at 5. The next
-poll observes 5, which now equals the baseline, so it retries under backoff
-instead of resetting. A further restore to 4 is below the baseline and earns a
-new lineage. And a fixing commit at revision 6 is above it: an ordinary rebuild
-in lineage `L+1`, published as `(L+1, 6)`, which beats the stale `(L, 10)`
-because the lineage is compared first.
+`B` moves on **both** the outer rows, and in both cases before the build is
+attempted — so a failed rebuild at 7 still leaves `B` at 7, and a later
+observation of 6 is correctly a rewind rather than a fresh forward change.
+
+The worked case: published `(L, 10)`, `B` = 10. A restore to revision 5 is a
+regression, so the lineage becomes `L+1` and `B` becomes 5 — *then* the build
+fails, leaving publication at `(L, 10)` and `B` at 5. The next poll observes 5,
+which now equals `B`, so it retries under backoff instead of resetting. A
+further restore to 4 is below `B` and earns a new lineage. A fixing commit at
+revision 6 is above it: `B` becomes 6 and an ordinary rebuild in lineage `L+1`
+publishes `(L+1, 6)`, which beats the stale `(L, 10)` because the lineage is
+compared first. And a *second* restore to 5, after all that, is below the
+high-water 6 and resets again — which is the case an establishment baseline
+would have missed entirely.
 
 This is a second piece of revision state with the *opposite* failure rule to the
 one the detector already keeps, and they are easy to conflate. `seen` is
-deliberately **not** advanced by a failed rebuild — advancing it would let a
-transient failure swallow a real change permanently. The baseline **is**
-advanced by one, because it answers a different question: not "has this been
-served?" but "which lineage are we in?". A reset that has happened has happened,
-whether or not what followed it worked.
+deliberately **not** advanced by a failed rebuild, and stays unchanged until the
+change has actually been handled — advancing it early would let a transient
+failure swallow a real change permanently. `B` **is** advanced by a failed
+rebuild, because it answers a different question: not "has this been served?"
+but "what has this lineage seen?". What was observed was observed, whether or
+not what followed it worked.
+
+Two revision numbers side by side with contradictory update rules is exactly the
+kind of thing a later refactor unifies on the grounds that it looks redundant.
+They are not: collapsing them into `seen` loses regression detection after a
+failed build, and collapsing them into `B` makes a transient failure permanent.
 
 The reason the epoch has to be composite is worth stating, since a bare counter
 is the first thing anyone reaches for. A ticket taken *before* loading orders
