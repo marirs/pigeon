@@ -204,13 +204,13 @@ does the ordering, as C-1 wants.
 
 **Two things advance the lineage, and content is only one of them.**
 
-- **Any revision regression** — an observed revision *lower* than the published
-  one — regardless of whether the rows changed. This is the case a
+- **Any revision regression** — an observed revision *lower* than the observed
+  baseline `B` below — regardless of whether the rows changed. This is the case a
   fingerprint-only rule gets wrong: a restore from revision 10 back to revision
   5 whose routing rows happen to be identical passes the fingerprint check
-  unchanged, so the lineage does not move and the published state stays at
-  revision 10. The *next real routing change* then commits at revision 6 and is
-  rejected as older than what is published. The restore was harmless; the
+  unchanged, so the lineage does not move and both `B` and the published state
+  stay at revision 10. The *next real routing change* then commits at revision 6
+  and is rejected as older than what is published. The restore was harmless; the
   rejection of everything after it is not, and it persists until the revision
   sequence climbs back past 10.
 - **An equal revision over different rows**, which needs the fingerprint,
@@ -298,6 +298,26 @@ Two revision numbers side by side with contradictory update rules is exactly the
 kind of thing a later refactor unifies on the grounds that it looks redundant.
 They are not: collapsing them into `seen` loses regression detection after a
 failed build, and collapsing them into `B` makes a transient failure permanent.
+
+**And every piece of per-failure state has to carry the lineage with it.** The
+detector's throttle and its log-once record are keyed on the version that
+failed, which is sufficient while there is exactly one lineage. It stops being
+sufficient here, and the case that breaks it is C-2 itself: a restore that
+leaves the revision *equal* and the rows different starts a new lineage at the
+same number. Revision-keyed state would then be inherited across the boundary —
+the new lineage's first rebuild throttled by the old lineage's failure, and its
+warning suppressed as already logged for revision 10.
+
+That is the worst possible place to lose a warning. The operator has just
+restored a database, the restored configuration does not build, and the log says
+nothing because a *different* configuration failed at the same number some time
+earlier. So the throttle and the logged-once record are keyed on
+`(lineage, revision)`, and a new lineage starts with neither.
+
+None of this is a defect in the M1 detector, which keys on the version alone
+because a lineage is not a thing yet. It is what has to change at the same time
+the lineage arrives — the two are one edit, and doing the first without the
+second is silently worse than doing neither.
 
 The reason the epoch has to be composite is worth stating, since a bare counter
 is the first thing anyone reaches for. A ticket taken *before* loading orders
