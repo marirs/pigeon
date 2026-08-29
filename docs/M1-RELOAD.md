@@ -197,12 +197,33 @@ reconciliation interval.
 
 **A composite in-memory epoch,** if the socket path must not hold a lock across
 a load. The published state carries `(lineage, revision)`, compared
-lexicographically. `lineage` is a daemon-local counter, not a database value,
-and **only reconciliation advances it** — on discovering that the rows no longer
-match the fingerprint it holds for the revision it already published, which is
-exactly the restore C-2 describes. Reconciliation then publishes at the new
-lineage and wins over every in-flight publisher, because those loaded under the
-old one. Within a lineage the revision does the ordering, as C-1 wants.
+lexicographically. `lineage` is a daemon-local counter, not a database value.
+Whoever advances it publishes at the new lineage and wins over every in-flight
+publisher, because those loaded under the old one; within a lineage the revision
+does the ordering, as C-1 wants.
+
+**Two things advance the lineage, and content is only one of them.**
+
+- **Any revision regression** — an observed revision *lower* than the published
+  one — regardless of whether the rows changed. This is the case a
+  fingerprint-only rule gets wrong: a restore from revision 10 back to revision
+  5 whose routing rows happen to be identical passes the fingerprint check
+  unchanged, so the lineage does not move and the published state stays at
+  revision 10. The *next real routing change* then commits at revision 6 and is
+  rejected as older than what is published. The restore was harmless; the
+  rejection of everything after it is not, and it persists until the revision
+  sequence climbs back past 10.
+- **An equal revision over different rows**, which needs the fingerprint,
+  because nothing about the number distinguishes it. This is the case C-2
+  describes and the reason reconciliation loads at all.
+
+They differ in cost, and therefore in owner. A regression is visible in the
+revision read every ordinary poll already performs, so it is caught at the next
+poll and needs no load. Only the equal-revision case has to wait for
+reconciliation, which is the one that has to read rows to see anything. Stating
+the rule as "reconciliation advances the lineage" would be both wrong and slow:
+wrong because the regression is not a content question, slow because the cheap
+half would inherit the expensive half's interval.
 
 The reason the epoch has to be composite is worth stating, since a bare counter
 is the first thing anyone reaches for. A ticket taken *before* loading orders
