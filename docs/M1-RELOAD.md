@@ -144,11 +144,12 @@ next mutation, whenever that is. Not a race that resolves itself a second later;
 a stale table that persists until someone edits something.
 
 So either every publication goes through one coordinator that serialises them,
-or publication is conditional on the revision being strictly newer than the
-published one — a compare-and-set, where a publisher holding an older revision
-loses and discards its snapshot. The second is cheaper and composes with the
-socket; whichever is chosen, "publish whatever I just built" stops being
-correct the moment there are two publishers.
+or publication is conditional on being newer than the published state — a
+compare-and-set, where a publisher holding older state loses and discards its
+snapshot. Whichever is chosen, "publish whatever I just built" stops being
+correct the moment there are two publishers. **What the comparison is made on is
+settled by C-3, not here**: the obvious answer, the database revision, conflicts
+with C-2.
 
 **C-2 — A revision is only meaningful within one database.** A restore from
 backup can present the *same* number as the state already published, with
@@ -174,6 +175,47 @@ every commit forces a load, and the fingerprint sees the actual rows each time.
 A routing revision is deliberately *narrow*, and narrowing the doorbell removes
 the fingerprint's opportunity to notice anything the doorbell missed. The
 reconciliation poll is where that opportunity has to be given back.
+
+**C-3 — C-1 and C-2 cannot both be satisfied by a revision CAS.** The two
+constraints were recorded separately and their remedies do not compose. C-1's
+cheap form orders publication by the database revision; C-2 exists precisely
+because a restore can present an equal or lower revision over different rows.
+Reconciliation must therefore install a snapshot the CAS is built to reject —
+and exempting it from the CAS puts back the unordered second publisher that C-1
+is about. An exemption is not a smaller version of the problem: reconciliation
+is the publisher most likely to be slow, because it always loads.
+
+Two ways out, and they differ in what they cost rather than in what they
+guarantee.
+
+**A publication coordinator.** One critical section spanning load *and*
+publication, so ordering comes from the lock rather than from any number, and
+reconciliation is an ordinary participant. It is the smaller thing to get right,
+and the contention argument against it does not really apply here: mutations are
+operator actions, not traffic, so the lock is uncontended outside the
+reconciliation interval.
+
+**A composite in-memory epoch,** if the socket path must not hold a lock across
+a load. The published state carries `(lineage, revision)`, compared
+lexicographically. `lineage` is a daemon-local counter, not a database value,
+and **only reconciliation advances it** — on discovering that the rows no longer
+match the fingerprint it holds for the revision it already published, which is
+exactly the restore C-2 describes. Reconciliation then publishes at the new
+lineage and wins over every in-flight publisher, because those loaded under the
+old one. Within a lineage the revision does the ordering, as C-1 wants.
+
+The reason the epoch has to be composite is worth stating, since a bare counter
+is the first thing anyone reaches for. A ticket taken *before* loading orders
+publishers by when they started, and the one that started earlier can be the one
+that read later state. A ticket taken *after* loading orders them by when they
+finished, and a publisher that read old rows can finish last. Neither orders by
+*what was read* — only the revision does that, which is why the database's
+number stays in the key and the in-memory counter exists solely to break the
+tie a restore creates.
+
+Not settled here. C-3 is a constraint on the M3 design, not a decision made
+ahead of it — but the design that ignores it will look correct, because the
+failure needs a restore and a concurrent publication in the same window.
 
 ### The second row is a trap for later
 
