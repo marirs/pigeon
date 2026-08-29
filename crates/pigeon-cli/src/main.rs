@@ -45,10 +45,9 @@
 //!
 //! A running daemon picks the change up on its own: it polls `data_version`
 //! and republishes when the routing input actually changed, so the CLI does not
-//! signal it and does not need to. What the CLI does say is *when* — committed
-//! and being served are one poll interval apart, and an operator who changes a
-//! route and immediately tests it would otherwise see the old one and conclude
-//! the change had not applied. `BEGIN IMMEDIATE` is what keeps the two
+//! signal it and does not need to. What the CLI does say is that it is a poll
+//! rather than a push: an operator who changes a route and immediately tests it
+//! would otherwise see the old one and conclude the change had not applied. `BEGIN IMMEDIATE` is what keeps the two
 //! processes from corrupting each other in the meantime.
 //!
 //! # The `--json` contract
@@ -438,19 +437,26 @@ fn apply<T>(
 /// Say what the change means for a daemon that is already running.
 ///
 /// Two things are true and the note has to carry both. The daemon *does* pick
-/// the change up on its own now — but "committed" and "being served" are one
-/// poll apart, and it does not route mail from that table until Milestone 3.
-/// Claiming only the first would tell an operator their forwarding changed.
+/// the change up on its own now, and it does not route mail from that table
+/// until Milestone 3. Claiming only the first would tell an operator their
+/// forwarding had changed.
 ///
-/// The interval is read from the detector rather than written here, so shorten
-/// the poll and this sentence shortens with it. A hardcoded number is how a
-/// note becomes a lie one constant at a time.
+/// It states the *cadence*, not a deadline. `POLL` is the sleep between
+/// iterations, so the interval from commit to published is that sleep plus the
+/// rebuild — and longer still when a commit lands during snapshot construction
+/// and is only caught by a later poll, or when invalid configuration has put
+/// the detector into backoff. "Within one second" would be a latency guarantee
+/// the detector does not offer.
+///
+/// The interval is read from the detector rather than written here, so change
+/// the poll and this sentence changes with it. A hardcoded number is how a note
+/// becomes a lie one constant at a time.
 fn note_reload(cli: &Cli) {
     if !cli.dry_run {
         note(
             cli,
             &format!(
-                "\nA running pigeond reloads its routing table within {:?}; it does not \
+                "\nA running pigeond polls for routing changes every {:?}; it does not \
                  route mail from that table until Milestone 3.",
                 pigeon_route::reload::POLL
             ),

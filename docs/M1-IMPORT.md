@@ -126,8 +126,9 @@ publication and is not.
 So **the commit completes the CLI's operation.** Making a running daemon pick
 the change up is the live-reload contract — the daemon's side of this boundary,
 where it detects the commit and publishes its own snapshot on its own
-connection. Every mutating command still says *when*, because committed and
-being served are one poll interval apart.
+connection. Every mutating command still says that the daemon
+*polls* rather than being pushed to, because committed and being served are not
+the same instant.
 
 ---
 

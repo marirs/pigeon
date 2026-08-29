@@ -238,8 +238,17 @@ fn notes_move_to_stderr_rather_than_disappearing() {
 
     out.json("alias add");
     assert!(
-        out.stderr.contains("reloads its routing table within"),
+        out.stderr.contains("polls for routing changes every"),
         "the reload note vanished under --json: {:?}",
+        out.stderr
+    );
+    // Both clauses, because the second is the one that keeps the first from
+    // misleading: the daemon reloading its routing table is not the same as
+    // mail being forwarded differently, and an operator told only the first
+    // would go looking for a delivery bug that is a milestone away.
+    assert!(
+        out.stderr.contains("does not route mail from that table"),
+        "the note kept its reload half and dropped its caveat: {:?}",
         out.stderr
     );
 }
