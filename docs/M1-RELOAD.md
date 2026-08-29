@@ -325,6 +325,49 @@ SQLite commit rather than around a counter — acceptable here because mutations
 are operator actions and the poll's own hold is one `PRAGMA` and a comparison,
 but it is no longer obviously the cheaper option once written out.
 
+**Reconciliation needs the same rule, and it is the hard case.** Every other
+detection is a revision read: take the lock, compare, release. Reconciliation
+has to *load*, and its decision depends on state that can move while it is
+loading.
+
+The interleaving: reconciliation observes revision 10, loads outside the lock,
+and while it reads, a socket commit produces revision 11 and publishes it.
+Reconciliation now holds revision 10's rows, compares them against the
+fingerprint it remembers, finds a difference — correctly, because 11 is a
+different configuration — and concludes it is looking at C-2's restore. It mints
+a lineage and publishes revision 10's content, which wins because the lineage
+compares first. Revision 11 is gone, and the mechanism that removed it is the
+one detection path that is *supposed* to be able to reset the lineage. Nothing
+established so far catches this: reconciliation's observation was authoritative
+when it was taken, and stopped being so while it worked.
+
+Two ways to close it, matching the two answers to C-1 itself:
+
+- **Hold the coordinator lock across the load.** Consistent with the coordinator
+  answer, and the simplest thing to reason about. Note what it costs here
+  specifically: reconciliation is the one path that *always* loads, so this is
+  the longest hold in the system, taken on a timer, blocking socket commits for
+  its duration.
+- **Capture, load, re-verify.** Under the lock, capture `(lineage, B, published
+  fingerprint)` and the authoritative revision. Load outside it. Reacquire, and
+  reset only if all four are unchanged; otherwise the observation is stale, so
+  discard the snapshot and retry on the next interval.
+
+The tuple is the part to get right, and revision alone is not enough — C-2's
+entire case is an equal revision over different rows, so a recheck that compares
+only the number would confirm a state that had in fact been replaced. The
+published fingerprint is what makes the recheck mean "nothing was published
+while I read" rather than "the counter did not move". This is the same shape,
+and the same trap, as the import path's `recheck_plan` in `M1-IMPORT.md`, where
+comparing row *counts* across the lock let a remove-plus-add pass unnoticed.
+
+A discarded reconciliation is a lost race, not a failure: it must not arm the
+backoff or log a warning, because something else published and the system is
+progressing. Starvation is the only thing to watch, and it is unlikely for the
+same reason the coordinator is affordable — mutations are operator actions, not
+traffic — but a reconciliation that loses repeatedly should escalate to taking
+the lock across its load rather than retrying optimistically forever.
+
 `B` moves on **both** the outer rows, and in both cases before the build is
 attempted — so a failed rebuild at 7 still leaves `B` at 7, and a later
 observation of 6 is correctly a rewind rather than a fresh forward change.
