@@ -217,13 +217,36 @@ does the ordering, as C-1 wants.
   because nothing about the number distinguishes it. This is the case C-2
   describes and the reason reconciliation loads at all.
 
-They differ in cost, and therefore in owner. A regression is visible in the
-revision read every ordinary poll already performs, so it is caught at the next
-poll and needs no load. Only the equal-revision case has to wait for
-reconciliation, which is the one that has to read rows to see anything. Stating
-the rule as "reconciliation advances the lineage" would be both wrong and slow:
-wrong because the regression is not a content question, slow because the cheap
-half would inherit the expensive half's interval.
+They differ in cost, and therefore in owner. A regression is *detectable* in the
+revision read every ordinary poll already performs, so it is noticed at the next
+poll rather than at the next reconciliation. Only the equal-revision case has to
+wait, because nothing but a load can see it. Stating the rule as "reconciliation
+advances the lineage" would be both wrong and slow: wrong because a regression
+is not a content question, slow because the cheap half would inherit the
+expensive half's interval.
+
+**Cheap to detect is not cheap to handle.** The revision comparison says the
+sequence was rewound; it says nothing about the rows, and revision 5's routing
+tables may differ from the revision 10 tables currently published. Noticing the
+regression and doing nothing would leave the daemon serving state that no longer
+exists in the database — the C-2 failure, arrived at by a different route. So
+the response is a full one:
+
+1. Advance the lineage, **once**.
+2. Load and build at the observed revision immediately, rather than waiting for
+   the reconciliation interval.
+3. Publish under the new lineage, which is what makes it win over in-flight
+   publishers still carrying the old one.
+4. Record that the reset happened — **including when the build fails.**
+
+Step 4 is the one that is easy to leave out. A failed build leaves the published
+state where it was, at the higher revision, so the next poll sees the same
+regression and would reset again: an unbounded lineage climbing once per second,
+a warning per poll, and — worse than either — an invalid-configuration backoff
+that never engages, because backoff is keyed on the version that failed and the
+epoch keeps changing underneath it. Recording the reset against the observed
+revision makes the retry an ordinary failed rebuild, throttled like any other,
+while a *further* regression is still a new observation and resets again.
 
 The reason the epoch has to be composite is worth stating, since a bare counter
 is the first thing anyone reaches for. A ticket taken *before* loading orders
