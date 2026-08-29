@@ -161,6 +161,8 @@ Forwarded mail is accepted with passing authentication by every major receiving 
 - [ ] malformed message handling
 - [ ] graceful shutdown
 
+- [ ] a routing revision counter, bumped by triggers on the routing tables, so
+      queue commits stop waking the reload loader
 - [ ] the daemon's RCPT accept/reject decision and resolved destination set come
       from the routing snapshot, replacing `PIGEON_ACCEPT` and
       `PIGEON_FORWARD_TO`
@@ -173,6 +175,13 @@ The daemon's `RCPT` accept/reject decision and resolved destination set come
 from the routing snapshot. Each resolved destination has independently
 retryable queue state, and `pigeon route inbound` predicts that decision and
 destination set exactly.
+
+The routing revision arrives with the queue for a reason. Live reload polls
+`data_version`, which moves on *every* commit to the database — so the moment
+the queue shares that file, a busy relay would make the detector load and hash
+the routing tables once a second to conclude each time that nothing routing-
+related had changed. A counter bumped only when routing changes makes the
+doorbell selective. See `M1-RELOAD.md` §2.
 
 This arrived from Milestone 1, which could not meet it: fan-out belongs here
 because safe retries require independently durable destination state. Note what

@@ -443,10 +443,14 @@ fn apply<T>(
 ///
 /// It states the *cadence*, not a deadline. `POLL` is the sleep between
 /// iterations, so the interval from commit to published is that sleep plus the
-/// rebuild — and longer still when a commit lands during snapshot construction
-/// and is only caught by a later poll, or when invalid configuration has put
-/// the detector into backoff. "Within one second" would be a latency guarantee
-/// the detector does not offer.
+/// rebuild, and longer when a commit lands during snapshot construction and is
+/// caught only by a later poll. "Within one second" would be a latency
+/// guarantee the detector does not offer.
+///
+/// Backoff is *not* one of those cases, though it looks like one. The throttle
+/// is keyed on the version that failed, so a commit fixing an invalid
+/// configuration moves `data_version` past it and rebuilds on the next poll.
+/// Backoff delays retrying a failure, never the fix for it.
 ///
 /// The interval is read from the detector rather than written here, so change
 /// the poll and this sentence changes with it. A hardcoded number is how a note

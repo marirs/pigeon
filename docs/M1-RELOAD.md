@@ -94,6 +94,41 @@ A commit that did not touch routing is consumed silently. This is also what
 makes R-3 implementable: "log when routing changed" is not the same question as
 "log when the database changed", and only the fingerprint can tell them apart.
 
+#### What the fingerprint does not remove
+
+It suppresses publication and logging. It does not suppress the **read** — the
+routing rows are loaded and hashed *before* the detector can discover the commit
+was unrelated. Today that costs nothing: an idle daemon wakes once a second and
+runs one `PRAGMA data_version`, and the load only happens when something
+actually committed. It is not busy-waiting, and it is not scanning.
+
+Milestone 3 changes the arithmetic rather than the mechanism. Every queue commit
+moves `data_version`, so a busy relay would mean one full routing read per
+second, every second, to conclude each time that routing had not changed.
+
+SQLite offers no reliable cross-process change event, so the answer is to make
+the doorbell more selective:
+
+- **A routing revision.** A small counter bumped transactionally — by triggers
+  on the routing tables, so no writer can forget — and polled instead of
+  `data_version`. Queue traffic stops waking the loader at all.
+- **The Unix socket.** `ARCHITECTURE.md` §3.3 already routes mutating commands
+  through the daemon, which is the event-driven path: commit, then publish
+  immediately, with no detection involved.
+
+**Plan: the revision first, the socket after, and the poll never removed.** The
+revision lands before queue traffic begins, because that is when the cost
+appears. The socket makes daemon-owned commits prompt when it arrives. The poll
+stays as reconciliation, at a slower interval — offline tools, restores from
+backup, and a dropped notification are all real, and none of them should be able
+to turn a missed message into a stale routing table. Notification is what makes
+reload *fast*; polling is what keeps it *correct*, and collapsing the two would
+trade a bounded delay for a silent wrong answer.
+
+Filesystem watchers were considered and rejected as a mechanism. Watching the
+database and WAL is noisy, platform-specific, and cannot say whether routing
+changed — at best a wake-up hint, which is the part that is already cheap.
+
 ### The second row is a trap for later
 
 `data_version` does not move for commits made on the *same* connection. Today
