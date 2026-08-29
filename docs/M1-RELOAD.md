@@ -301,6 +301,30 @@ So the two paths are separated by construction:
   lineage. A losing candidate is a non-event: no log beyond debug, no state
   change, nothing to repair.
 
+**"Atomic with the commit" is a locking requirement, not a figure of speech.**
+It cannot be an ordinary in-memory assignment after `COMMIT` returns. The
+detector state — lineage, `B`, `seen`, and the per-`(lineage, revision)` failure
+records — sits behind one lock, and the socket path holds that lock across all
+three of: the successful SQLite commit, the update of `B` to the revision that
+commit produced, and the capture of the lineage its candidate will be published
+under. The poll takes the same lock while it reads the revision and classifies
+it.
+
+The window a post-commit assignment leaves is small and its consequences are
+not. A detection landing inside it observes rows the baseline does not know
+about, and the socket's later write then lands on whatever state that detection
+established — clobbering a lineage reset with a revision from the database that
+reset was reacting to. The lineage capture belongs inside the same lock for the
+mirror-image reason: a candidate built before a reset must not be stamped with
+the lineage minted after it, because that is precisely the stale-content-wins
+inversion above, arrived at from the publisher's side.
+
+This is the cost of the epoch alternative honestly stated, and it is worth
+comparing against C-1's coordinator before choosing. The lock is held across a
+SQLite commit rather than around a counter — acceptable here because mutations
+are operator actions and the poll's own hold is one `PRAGMA` and a comparison,
+but it is no longer obviously the cheaper option once written out.
+
 `B` moves on **both** the outer rows, and in both cases before the build is
 attempted — so a failed rebuild at 7 still leaves `B` at 7, and a later
 observation of 6 is correctly a rewind rather than a fresh forward change.
