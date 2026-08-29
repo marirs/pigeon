@@ -261,14 +261,45 @@ serving revision 6's routing on top of a database holding revision 5's. A
 high-water baseline is 6 by then, so the second restore is below it and is
 handled as the regression it is.
 
-With a baseline `B` and lineage `L`, every poll's observed revision falls into
-one of three cases:
+With a baseline `B` and lineage `L`, every **authoritative observation** of the
+database's current revision falls into one of three cases:
 
 | Observed | Meaning | Response |
 |---|---|---|
 | `< B` | a regression, or a further restore | new lineage, `B` := observed, build, publish |
 | `= B` | nothing new since the highest this lineage has seen | no new lineage; if the build failed, an ordinary throttled retry |
 | `> B` | a forward change within this lineage | `B` := observed, the normal path |
+
+**Authoritative is doing real work in that sentence, and dropping it inverts the
+whole scheme.** The table is about what the database's revision *is right now*.
+It is not about the revision a candidate snapshot happens to carry, and the two
+are easy to conflate because both are integers compared against `B`.
+
+A publisher that loaded at revision 11 and was descheduled while revision 12 was
+observed and published arrives holding `11 < B`. It is not a regression. Nothing
+was rewound; that publisher is simply late, and the correct response is the one
+C-1 already specifies — it loses the comparison and discards its snapshot.
+
+Treating it as a regression would be worse than any failure discussed so far. It
+would mint a new lineage for stale content, and because the lineage is compared
+first, that stale snapshot would then *beat* the newer state already published.
+The mechanism built to stop a late publisher overwriting a newer one would have
+become the mechanism that guarantees it, with the revision consumed and no
+signal left to repair it.
+
+So the two paths are separated by construction:
+
+- **Detection** — the poll's revision read, reconciliation, and the daemon's own
+  socket commits, which are authoritative because the daemon made them and knows
+  the revision they produced. These observe the current revision, advance `B`,
+  and are the only things that may reset the lineage. A socket commit advances
+  `B` atomically with the commit itself, so a poll cannot see the new rows and
+  the old baseline.
+- **Publication** — compare the candidate's `(lineage, revision)` against what
+  is published, install it if it is strictly greater, discard it otherwise. This
+  path performs **no** regression detection and never touches `B` or the
+  lineage. A losing candidate is a non-event: no log beyond debug, no state
+  change, nothing to repair.
 
 `B` moves on **both** the outer rows, and in both cases before the build is
 attempted — so a failed rebuild at 7 still leaves `B` at 7, and a later
