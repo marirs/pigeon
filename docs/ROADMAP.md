@@ -162,7 +162,9 @@ Forwarded mail is accepted with passing authentication by every major receiving 
 - [ ] graceful shutdown
 
 - [ ] a routing revision counter, bumped by triggers on the routing tables, so
-      queue commits stop waking the reload loader
+      queue commits stop waking the reload loader — publication conditional on
+      a strictly newer revision, and a periodic forced reconciliation, since a
+      restore can present the same revision over different rows
 - [ ] the daemon's RCPT accept/reject decision and resolved destination set come
       from the routing snapshot, replacing `PIGEON_ACCEPT` and
       `PIGEON_FORWARD_TO`

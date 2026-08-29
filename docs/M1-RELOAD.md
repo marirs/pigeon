@@ -129,6 +129,52 @@ Filesystem watchers were considered and rejected as a mechanism. Watching the
 database and WAL is noisy, platform-specific, and cannot say whether routing
 changed — at best a wake-up hint, which is the part that is already cheap.
 
+#### Two constraints that plan must satisfy
+
+Both come from the same place: the plan adds a second publisher and replaces the
+signal that today is accidentally total.
+
+**C-1 — Publication needs one order.** Socket-driven and poll-driven publication
+are two concurrent writers to the same `Router`. Nothing about the swap orders
+them, so the interleaving is available: A commits, B commits, B publishes, then
+A — which had loaded first and was descheduled — publishes its older state over
+B's. The routing table is now behind the database with **no pending signal to
+repair it**: the revision has already been consumed, and the next change is the
+next mutation, whenever that is. Not a race that resolves itself a second later;
+a stale table that persists until someone edits something.
+
+So either every publication goes through one coordinator that serialises them,
+or publication is conditional on the revision being strictly newer than the
+published one — a compare-and-set, where a publisher holding an older revision
+loses and discards its snapshot. The second is cheaper and composes with the
+socket; whichever is chosen, "publish whatever I just built" stops being
+correct the moment there are two publishers.
+
+**C-2 — A revision is only meaningful within one database.** A restore from
+backup can present the *same* number as the state already published, with
+different rows underneath it. The detector compares equal, does not load, and
+serves a routing table that the database on disk no longer contains.
+
+Note which mitigation actually covers it. Database identity — an id stored in
+the schema, compared alongside the revision — catches a *different* database
+swapped in, but the common case is a restore of the *same* database, whose
+identity matches. A revision that moves backwards is detectable and must force a
+reload rather than being treated as "not newer", but a restore to a point whose
+revision happens to equal the current one moves it neither forward nor back.
+
+**Only reconciliation covers that case**, so the periodic forced load and
+fingerprint is not an optimisation to drop later — it is what makes the revision
+safe to trust in between. Requiring a restart after a restore is the honest
+alternative, but it is an operational rule enforced by documentation, and the
+failure mode when it is not followed is silent.
+
+Worth being explicit about what changes here, because it is easy to miss:
+today's `data_version` is accidentally *total* — it moves for every commit, so
+every commit forces a load, and the fingerprint sees the actual rows each time.
+A routing revision is deliberately *narrow*, and narrowing the doorbell removes
+the fingerprint's opportunity to notice anything the doorbell missed. The
+reconciliation poll is where that opportunity has to be given back.
+
 ### The second row is a trap for later
 
 `data_version` does not move for commits made on the *same* connection. Today
