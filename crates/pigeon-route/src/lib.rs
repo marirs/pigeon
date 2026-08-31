@@ -85,7 +85,7 @@ pub use load::{LoadError, load};
 pub use mutate::{MutationError, Outcome, mutate, preview};
 pub use pattern::{PatternError, Wildcard};
 pub use reload::{InitialError, Tick, Watcher};
-pub use router::Router;
+pub use router::{Publish, Router};
 pub use snapshot::{
     AliasInput, BuildError, Built, CatchAllInput, Decision, Destination, DomainInput, Report, Rule,
     Snapshot, Tier,

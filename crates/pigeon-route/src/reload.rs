@@ -13,8 +13,9 @@ use std::time::Duration;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
+use crate::LoadError;
+use crate::router::Publish;
 use crate::snapshot::{DomainInput, Snapshot};
-use crate::{LoadError, Router};
 
 /// How often the version is checked.
 ///
@@ -126,7 +127,7 @@ impl Watcher {
     ///
     /// The ordering here is the design. Every line is placed against a way of
     /// missing a commit.
-    pub fn tick(&mut self, conn: &Connection, router: &Router) -> Tick {
+    pub fn tick(&mut self, conn: &Connection, router: &impl Publish) -> Tick {
         self.tick_with(conn, router, || {})
     }
 
@@ -168,7 +169,7 @@ impl Watcher {
     pub fn tick_with(
         &mut self,
         conn: &Connection,
-        router: &Router,
+        router: &impl Publish,
         between: impl FnOnce(),
     ) -> Tick {
         // Read BEFORE the transaction. Recording a version read *after* the
@@ -255,7 +256,15 @@ impl Watcher {
             Ok(built) => {
                 let domains = built.snapshot.domain_names().count();
                 let rules = built.snapshot.rule_count();
-                router.publish(built.snapshot);
+
+                // Publication itself can fail — the daemon derives signing keys
+                // from the snapshot as it installs it — and a failure here is
+                // the same kind of event as a configuration that will not
+                // build: the previous state keeps serving, and the operator is
+                // told once rather than every second.
+                if let Err(e) = router.publish(built.snapshot) {
+                    return self.record_invalid(version, e);
+                }
                 self.published = Some(fingerprint);
                 self.seen = Some(version);
                 self.failed = None;

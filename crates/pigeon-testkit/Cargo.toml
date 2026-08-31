@@ -11,3 +11,8 @@ publish.workspace      = true
 
 [dependencies]
 tokio = { workspace = true }
+
+# For the DNS stub: a test cannot publish a DKIM record, and `mail-auth`
+# consults a cache before the resolver — so serving the record from one is how
+# a signature gets verified with no packet leaving the machine.
+mail-auth = { workspace = true }

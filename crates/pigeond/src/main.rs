@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pigeon_dns::{LookupError, MxError, MxLookup, SystemResolver, order_hosts};
-use pigeon_smtp::{DataError, Envelope, Message, MessageSink, ServerConfig};
+use pigeon_smtp::{DataError, Envelope, Message, MessageSink, Recipient, ServerConfig};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -148,12 +148,10 @@ impl std::fmt::Display for ForwardError {
 /// avoid, arrived at from the other side.
 fn build_auth(
     started: &startup::Started,
-    router: Arc<pigeon_route::Router>,
+    snapshot: pigeon_route::Snapshot,
     hostname: &str,
 ) -> io::Result<Auth> {
-    use pigeon_auth::pipeline::SigningKey;
-
-    let checked = &started.config;
+    let checked = started.config.clone();
     let cfg = checked.config();
 
     let ring = pigeon_auth::KeyRing::load(&cfg.srs_secret_file).map_err(|e| {
@@ -171,80 +169,152 @@ fn build_auth(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("resolver: {e}")))?;
     let pipeline = pigeon_auth::pipeline::Pipeline::new(verifier, hostname.to_string());
 
-    // Keys are loaded from the paths the snapshot named, resolved against the
-    // configured root — the row is operator-editable, so without containment it
-    // could name any file the daemon can read.
-    let snapshot = router.for_transaction();
+    // The first publication happens here rather than through the reload path,
+    // and it fails startup: a key that will not load at boot will not load at
+    // the first message either, and the operator should hear about it once,
+    // now, rather than per message.
+    let keys = load_keys(&snapshot, &checked)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    tracing::info!(domains = keys.len(), "loaded DKIM signing keys");
+
+    Ok(Auth {
+        pipeline: Arc::new(pipeline),
+        srs: Arc::new(srs),
+        runtime: Arc::new(RuntimeState {
+            current: std::sync::RwLock::new(Arc::new(Runtime {
+                snapshot: Arc::new(snapshot),
+                keys,
+            })),
+            derive_keys: Box::new(move |snapshot| load_keys(snapshot, &checked)),
+        }),
+    })
+}
+
+/// Parse every signing key the snapshot names.
+///
+/// Every failure is a *local* configuration question, so none of them is
+/// tolerated: a `rewrite_from` domain with no usable key would have to have
+/// every one of its messages refused after acceptance, which is the outcome
+/// R-4 exists to avoid reached from the other side.
+fn load_keys(
+    snapshot: &pigeon_route::Snapshot,
+    checked: &pigeon_config::Checked,
+) -> Result<HashMap<String, pigeon_auth::pipeline::SigningKey>, String> {
+    use pigeon_auth::pipeline::SigningKey;
+
     let mut keys = HashMap::new();
     for domain in snapshot.domains() {
         let Some(forwarding) = snapshot.forwarding(domain) else {
             continue;
         };
         let Some(identity) = &forwarding.dkim else {
-            // A domain that rewrites `From:` and cannot sign it would have to
-            // be refused per message. Refuse to start instead: it is one
-            // message either way, and this one names the domain.
             if forwarding.policy == pigeon_types::ForwardPolicy::RewriteFrom {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "domain {domain} is set to rewrite_from and has no active DKIM key; \
-                         a rewritten From: that cannot be signed fails DMARC on a domain \
-                         Pigeon controls"
-                    ),
+                return Err(format!(
+                    "domain {domain} is set to rewrite_from and has no active DKIM key; \
+                     a rewritten From: that cannot be signed fails DMARC on a domain \
+                     Pigeon controls"
                 ));
             }
             continue;
         };
 
+        // The stored path is operator-editable, so it is resolved against the
+        // configured root and refused if it escapes.
         let path = checked
             .resolve_key(&identity.private_key_path)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("DKIM key for {domain}: {e}"),
-                )
-            })?;
-        let pem = std::fs::read_to_string(&path).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("DKIM key for {domain} at {}: {e}", path.display()),
-            )
-        })?;
-        let key = SigningKey::from_pkcs8_pem(&pem, domain, &identity.selector).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("DKIM key for {domain}: {e}"),
-            )
-        })?;
+            .map_err(|e| format!("DKIM key for {domain}: {e}"))?;
+        let pem = std::fs::read_to_string(&path)
+            .map_err(|e| format!("DKIM key for {domain} at {}: {e}", path.display()))?;
+        let key = SigningKey::from_pkcs8_pem(&pem, domain, &identity.selector)
+            .map_err(|e| format!("DKIM key for {domain}: {e}"))?;
         keys.insert(domain.to_string(), key);
     }
 
-    tracing::info!(domains = keys.len(), "loaded DKIM signing keys");
-
-    Ok(Auth {
-        pipeline: Arc::new(pipeline),
-        keys: Arc::new(keys),
-        srs: Arc::new(srs),
-        router,
-    })
+    Ok(keys)
 }
 
-/// Everything the authentication pipeline needs, resolved at startup.
+/// The routing table and the keys derived from it, as one indivisible thing.
 ///
-/// One `Pipeline` for the process, one parsed key per domain, one `Srs`. All
+/// They cannot be published separately. Adding a DKIM key changes the policy a
+/// domain can support; rotating one changes which key must sign. Installing the
+/// snapshot without its keys would leave a `rewrite_from` domain with nothing
+/// to sign with, and installing keys without the snapshot would sign under a
+/// policy that is no longer in force. So one struct, swapped in one write.
+#[derive(Debug)]
+struct Runtime {
+    snapshot: Arc<pigeon_route::Snapshot>,
+    /// Parsed signing keys, by domain, from the paths *this* snapshot names.
+    keys: HashMap<String, pigeon_auth::pipeline::SigningKey>,
+}
+
+/// The published [`Runtime`], and what it takes to build one.
+///
+/// Implements [`pigeon_route::Publish`], so the reload worker installs the
+/// combined state through the same path a snapshot would have taken — and a
+/// key that will not load fails the publication rather than being discovered
+/// one message later.
+struct RuntimeState {
+    current: std::sync::RwLock<Arc<Runtime>>,
+    /// How keys are derived from a snapshot.
+    ///
+    /// A closure rather than the configuration itself, because the derivation
+    /// is what has to happen on every publication and the configuration is only
+    /// one of its inputs. It also lets a test publish a snapshot and see the
+    /// keys rebuilt, which is the property this whole type exists for.
+    derive_keys: KeyLoader,
+}
+
+type KeyLoader = Box<
+    dyn Fn(
+            &pigeon_route::Snapshot,
+        ) -> Result<HashMap<String, pigeon_auth::pipeline::SigningKey>, String>
+        + Send
+        + Sync,
+>;
+
+impl std::fmt::Debug for RuntimeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeState")
+            .field("current", &self.current)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeState {
+    /// The state for one mail transaction.
+    ///
+    /// Pinned at `MAIL FROM` and used for every decision until the message is
+    /// spooled, so a reload landing mid-transaction cannot accept a recipient
+    /// under one configuration and sign under another.
+    fn pin(&self) -> Arc<Runtime> {
+        Arc::clone(&self.current.read().expect("runtime lock poisoned"))
+    }
+}
+
+impl pigeon_route::Publish for RuntimeState {
+    fn publish(&self, snapshot: pigeon_route::Snapshot) -> Result<(), String> {
+        // Keys first: a snapshot whose keys will not load is not installed at
+        // all. The previous runtime keeps serving, which is the same rule the
+        // detector applies to a configuration that will not build.
+        let keys = (self.derive_keys)(&snapshot)?;
+        *self.current.write().expect("runtime lock poisoned") = Arc::new(Runtime {
+            snapshot: Arc::new(snapshot),
+            keys,
+        });
+        Ok(())
+    }
+}
+
+/// Everything the authentication pipeline needs.
+///
+/// One `Pipeline` for the process, one `Srs`, and the published runtime. All
 /// shared: the keys and the SRS ring are key material, and a copy per message
 /// would be a copy of the key material per message.
 #[derive(Clone)]
 struct Auth {
     pipeline: Arc<pigeon_auth::pipeline::Pipeline>,
-    /// Parsed signing keys, by domain. Loaded once, from the paths the snapshot
-    /// named, resolved against the configured key root.
-    keys: Arc<HashMap<String, pigeon_auth::pipeline::SigningKey>>,
     srs: Arc<pigeon_auth::Srs>,
-    /// The routing table, for the forwarding policy and the key selection. The
-    /// same table the accept decision came from.
-    router: Arc<pigeon_route::Router>,
+    runtime: Arc<RuntimeState>,
 }
 
 struct SpoolSink<R: MxLookup> {
@@ -291,6 +361,7 @@ impl<R: MxLookup> Clone for SpoolSink<R> {
 /// policy, and that is a documented narrowing rather than an oversight.
 async fn authenticate(
     auth: &Auth,
+    runtime: Option<&Arc<Runtime>>,
     peer: std::net::IpAddr,
     helo: &str,
     envelope: &Envelope,
@@ -299,9 +370,17 @@ async fn authenticate(
 ) -> Result<pigeon_auth::pipeline::Outbound, pigeon_auth::pipeline::PipelineError> {
     use pigeon_auth::pipeline::Rewrite;
 
-    // Pinned for the whole transaction, so the policy that decides how this
-    // message is signed is the one that accepted it.
-    let snapshot = auth.router.for_transaction();
+    // Pinned at `MAIL FROM`, not read here: the policy that decides how this
+    // message is signed must be the one that accepted its recipients. Reading
+    // it now would let a reload between `RCPT TO` and the end of `DATA` sign
+    // under a configuration that never accepted the message.
+    //
+    // The fallback exists only for the environment path, where there is no
+    // database and every domain is unknown — which resolves to `Preserve` and
+    // no key, the same as an unmanaged domain.
+    let fallback = auth.runtime.pin();
+    let runtime = runtime.unwrap_or(&fallback);
+    let snapshot = &runtime.snapshot;
 
     let recipient_domain = envelope
         .recipients
@@ -311,7 +390,7 @@ async fn authenticate(
         .unwrap_or_default();
 
     let forwarding = snapshot.forwarding(&recipient_domain);
-    let signing = auth.keys.get(&recipient_domain);
+    let signing = runtime.keys.get(&recipient_domain);
 
     let rewrite = match forwarding.map(|f| f.policy) {
         Some(pigeon_types::ForwardPolicy::RewriteFrom) => {
@@ -337,7 +416,72 @@ async fn authenticate(
 }
 
 impl<R: MxLookup + 'static> MessageSink for SpoolSink<R> {
-    fn accepts_recipient(&self, address: &str) -> bool {
+    /// The runtime pinned for this transaction, if there is one to pin.
+    ///
+    /// `None` on the Milestone 0 environment path, where there is no database
+    /// and so no snapshot, no keys and no policy.
+    type Transaction = Option<Arc<Runtime>>;
+
+    fn begin(&self) -> Self::Transaction {
+        self.auth.as_ref().map(|a| a.runtime.pin())
+    }
+
+    fn accepts_recipient(
+        &self,
+        transaction: &Self::Transaction,
+        address: &str,
+        accepted: &[String],
+    ) -> Recipient {
+        // Until fan-out exists, one message is forwarded under one domain's
+        // policy and signed with one domain's key — so a second recipient in a
+        // different managed domain would have its policy decided by the order
+        // the sender listed them in. That is a decision belonging to the
+        // sender, which it must not be.
+        //
+        // Deferred rather than rejected: the address is deliverable, just not
+        // alongside the others, so a permanent answer would tell the sender to
+        // give up on a working mailbox. Milestone 3's per-destination state is
+        // what removes the restriction.
+        if let Some(runtime) = transaction
+            && let Some(first) = accepted.first()
+            && let (Ok(new), Ok(old)) = (
+                pigeon_types::Address::parse(address),
+                pigeon_types::Address::parse(first),
+            )
+        {
+            let new_domain = new.domain().to_ascii_lowercase();
+            let old_domain = old.domain().to_ascii_lowercase();
+            if new_domain != old_domain
+                && runtime.snapshot.forwarding(&new_domain).is_some()
+                && runtime.snapshot.forwarding(&old_domain).is_some()
+            {
+                tracing::debug!(
+                    %address,
+                    first = %first,
+                    "deferring a recipient in a second managed domain"
+                );
+                return Recipient::Defer;
+            }
+        }
+
+        if self.accepts_recipient_inner(address) {
+            Recipient::Accept
+        } else {
+            Recipient::Reject
+        }
+    }
+
+    async fn deliver(
+        &self,
+        transaction: Self::Transaction,
+        message: Message,
+    ) -> Result<String, DataError> {
+        self.deliver_inner(transaction, message).await
+    }
+}
+
+impl<R: MxLookup + 'static> SpoolSink<R> {
+    fn accepts_recipient_inner(&self, address: &str) -> bool {
         if self.accept.is_empty() {
             return true;
         }
@@ -357,7 +501,11 @@ impl<R: MxLookup + 'static> MessageSink for SpoolSink<R> {
             .any(|allowed| allowed.same_mailbox(&parsed))
     }
 
-    async fn deliver(&self, message: Message) -> Result<String, DataError> {
+    async fn deliver_inner(
+        &self,
+        transaction: Option<Arc<Runtime>>,
+        message: Message,
+    ) -> Result<String, DataError> {
         let id = self.next_id();
         let Message {
             mut envelope,
@@ -378,7 +526,17 @@ impl<R: MxLookup + 'static> MessageSink for SpoolSink<R> {
         // handled this?".
         let processed = match &self.auth {
             Some(auth) => {
-                match authenticate(auth, peer, &helo, &envelope, &received, &body).await {
+                match authenticate(
+                    auth,
+                    transaction.as_ref(),
+                    peer,
+                    &helo,
+                    &envelope,
+                    &received,
+                    &body,
+                )
+                .await
+                {
                     Ok(out) => Some(out),
                     Err(e) => {
                         // R-8. A rewritten `From:` that cannot be signed fails DMARC
@@ -979,10 +1137,14 @@ async fn run() -> io::Result<()> {
             // sender is dropped — but relying on the escape hatch instead of the
             // ordering means the next fallible step added above the start is a
             // hang again.
-            let router = Arc::new(pigeon_route::Router::new(started.snapshot.clone()));
+            // The snapshot rather than a `Router`: the daemon publishes a
+            // combined runtime — the table *and* the keys derived from it —
+            // and a `Router` here would be a second place a table could be
+            // installed, which is exactly the split this replaces.
+            let snapshot = started.snapshot.clone();
             let watcher = std::mem::take(&mut started.watcher);
 
-            Some((started, (db_path, router, watcher)))
+            Some((started, (db_path, snapshot, watcher)))
         }
         _ => {
             tracing::warn!(
@@ -1133,7 +1295,7 @@ async fn run() -> io::Result<()> {
     // would put two copies of the secret in memory and, worse, allow them to
     // disagree after a rotation.
     let auth = match &booted {
-        Some((b, (_, router, _))) => Some(build_auth(b, Arc::clone(router), &hostname)?),
+        Some((b, (_, snapshot, _))) => Some(build_auth(b, snapshot.clone(), &hostname)?),
         None => None,
     };
 
@@ -1145,6 +1307,10 @@ async fn run() -> io::Result<()> {
     //
     // Absent configuration, no check: a Pigeon with no SRS ring refuses nobody
     // for this reason.
+    // Cloned before the sink takes ownership: the reload worker publishes into
+    // the same state the sink reads from, which is the point.
+    let auth_runtime = auth.as_ref().map(|a| Arc::clone(&a.runtime));
+
     let return_path = auth.as_ref().map(|a| {
         let srs = Arc::clone(&a.srs);
         Arc::new(move |sender: &str| {
@@ -1191,14 +1357,20 @@ async fn run() -> io::Result<()> {
     // nothing routes from it yet, so the detector — the part with the property
     // worth proving — is exercised by every run rather than only once it has a
     // consumer.
-    let stop_reload = booted.map(|(_, (db_path, router, watcher))| {
-        let r = reload::Reloader::start(db_path, router, watcher);
-        // `supervise` consumes the handle and becomes the only join, so the
-        // stopper is taken first. Two ways to stop one worker would be two
-        // orderings to keep straight.
-        let stopper = r.stopper();
-        (stopper, r.supervise())
-    });
+    // The reload worker publishes into the combined runtime, so a reload that
+    // adds or rotates a key installs the table and the key together or neither.
+    // Publishing the table alone would leave a `rewrite_from` domain with no
+    // key, or one still signing with the key that was just retired.
+    let stop_reload = booted
+        .zip(auth_runtime)
+        .map(|((_, (db_path, _, watcher)), runtime)| {
+            let r = reload::Reloader::start(db_path, runtime, watcher);
+            // `supervise` consumes the handle and becomes the only join, so the
+            // stopper is taken first. Two ways to stop one worker would be two
+            // orderings to keep straight.
+            let stopper = r.stopper();
+            (stopper, r.supervise())
+        });
 
     let outcome = tokio::select! {
         r = pigeon_smtp::serve(listener, config, sink) => r,
@@ -1443,12 +1615,18 @@ mod tests {
         let tmp = TempDir::new("accept");
         let s = sink(tmp.path(), &["Bob@Example.com"]);
 
-        assert!(s.accepts_recipient("Bob@example.com"), "domain not folded");
-        assert!(s.accepts_recipient("Bob@EXAMPLE.COM"), "domain not folded");
+        assert!(
+            s.accepts_recipient_inner("Bob@example.com"),
+            "domain not folded"
+        );
+        assert!(
+            s.accepts_recipient_inner("Bob@EXAMPLE.COM"),
+            "domain not folded"
+        );
         // A different mailbox, and one the operator never listed. RFC 5321
         // §2.4 reserves the local part to the destination host.
         assert!(
-            !s.accepts_recipient("bob@example.com"),
+            !s.accepts_recipient_inner("bob@example.com"),
             "folded the local part"
         );
     }
@@ -1457,15 +1635,15 @@ mod tests {
     fn an_empty_accept_list_accepts_anything() {
         let tmp = TempDir::new("accept-any");
         let s = sink(tmp.path(), &[]);
-        assert!(s.accepts_recipient("whoever@example.com"));
+        assert!(s.accepts_recipient_inner("whoever@example.com"));
     }
 
     #[test]
     fn malformed_recipients_are_not_accepted_by_a_configured_list() {
         let tmp = TempDir::new("accept-bad");
         let s = sink(tmp.path(), &["a@example.com"]);
-        assert!(!s.accepts_recipient("not-an-address"));
-        assert!(!s.accepts_recipient("x@."));
+        assert!(!s.accepts_recipient_inner("not-an-address"));
+        assert!(!s.accepts_recipient_inner("x@."));
     }
 
     #[tokio::test]
@@ -1661,7 +1839,6 @@ mod tests {
                 pigeon_auth::verify::Verifier::from_system().unwrap(),
                 "pigeon.test",
             )),
-            keys: Arc::new(keys),
             srs: Arc::new(pigeon_auth::Srs::new(
                 pigeon_auth::KeyRing::parse(
                     "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
@@ -1669,14 +1846,154 @@ mod tests {
                 .unwrap(),
                 "pigeon.test",
             )),
-            router: Arc::new(pigeon_route::Router::new(snapshot)),
+            runtime: Arc::new(RuntimeState {
+                current: std::sync::RwLock::new(Arc::new(Runtime {
+                    snapshot: Arc::new(snapshot),
+                    keys,
+                })),
+                // Rebuilt on every publication from the same fixture key, so a
+                // reload in a test installs keys the same way production does.
+                derive_keys: Box::new(move |snapshot| {
+                    let mut keys = HashMap::new();
+                    if with_key {
+                        for domain in snapshot.domains() {
+                            keys.insert(
+                                domain.to_string(),
+                                pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(
+                                    e2e_key(),
+                                    domain,
+                                    "sel",
+                                )
+                                .unwrap(),
+                            );
+                        }
+                    }
+                    Ok(keys)
+                }),
+            }),
         }
+    }
+
+    /// Publish a new table for the same domain, with a different policy.
+    fn republish(runtime: &Arc<RuntimeState>, policy: pigeon_types::ForwardPolicy) {
+        use pigeon_route::Publish;
+        use pigeon_route::snapshot::{DkimIdentity, DomainInput, Forwarding as RouteForwarding};
+
+        let inputs = vec![DomainInput {
+            name: "example.com".into(),
+            gate: pigeon_types::DomainGate {
+                status: pigeon_types::DomainStatus::Active,
+                inbound_enabled: true,
+                outbound_enabled: false,
+            },
+            plus_addressing: true,
+            forwarding: RouteForwarding {
+                policy,
+                dkim: Some(DkimIdentity {
+                    selector: "sel".into(),
+                    private_key_path: "unused-in-test".into(),
+                    algorithm: "rsa2048".into(),
+                }),
+            },
+            default_destination: Some(pigeon_route::snapshot::Destination {
+                local: "me".into(),
+                domain: "example.net".into(),
+            }),
+            aliases: vec![pigeon_route::snapshot::AliasInput {
+                pattern: "hello".into(),
+                reject: false,
+                destinations: vec![],
+            }],
+            catchall: None,
+        }];
+
+        runtime
+            .publish(pigeon_route::Snapshot::build(inputs).unwrap().snapshot)
+            .expect("the fixture should publish");
+    }
+
+    /// Add a second managed domain to a fixture runtime.
+    ///
+    /// Built by republishing through the same path production uses, so the keys
+    /// for both domains come from the same derivation.
+    fn second_domain(auth: Auth, domain: &str) -> Auth {
+        use pigeon_route::Publish;
+        use pigeon_route::snapshot::{DkimIdentity, DomainInput, Forwarding as RouteForwarding};
+
+        let existing: Vec<String> = auth
+            .runtime
+            .pin()
+            .snapshot
+            .domains()
+            .map(str::to_string)
+            .collect();
+
+        let inputs = existing
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(domain))
+            .map(|name| DomainInput {
+                name: name.into(),
+                gate: pigeon_types::DomainGate {
+                    status: pigeon_types::DomainStatus::Active,
+                    inbound_enabled: true,
+                    outbound_enabled: false,
+                },
+                plus_addressing: true,
+                forwarding: RouteForwarding {
+                    policy: pigeon_types::ForwardPolicy::Preserve,
+                    dkim: Some(DkimIdentity {
+                        selector: "sel".into(),
+                        private_key_path: "unused-in-test".into(),
+                        algorithm: "rsa2048".into(),
+                    }),
+                },
+                default_destination: Some(pigeon_route::snapshot::Destination {
+                    local: "me".into(),
+                    domain: "example.net".into(),
+                }),
+                aliases: vec![pigeon_route::snapshot::AliasInput {
+                    pattern: "hello".into(),
+                    reject: false,
+                    destinations: vec![],
+                }],
+                catchall: None,
+            })
+            .collect();
+
+        auth.runtime
+            .publish(pigeon_route::Snapshot::build(inputs).unwrap().snapshot)
+            .expect("the fixture should publish");
+        auth
+    }
+
+    async fn spawn_two_domain_daemon(
+        dir: &Path,
+        peer_addr: SocketAddr,
+        auth: Auth,
+    ) -> (SocketAddr, Arc<PathBuf>) {
+        spawn_with_accept(
+            dir,
+            peer_addr,
+            auth,
+            &["hello@example.com", "hello@other.example"],
+        )
+        .await
     }
 
     async fn spawn_authenticated(
         dir: &Path,
         peer_addr: SocketAddr,
         auth: Auth,
+    ) -> (SocketAddr, Arc<PathBuf>) {
+        spawn_with_accept(dir, peer_addr, auth, &["hello@example.com"]).await
+    }
+
+    async fn spawn_with_accept(
+        dir: &Path,
+        peer_addr: SocketAddr,
+        auth: Auth,
+        accept: &[&str],
     ) -> (SocketAddr, Arc<PathBuf>) {
         use pigeon_dns::{FakeResolver, MxRecord};
 
@@ -1689,7 +2006,7 @@ mod tests {
         let sink = SpoolSink {
             auth: Some(auth),
             dir: Arc::clone(&spool),
-            accept: Arc::new(["hello@example.com".to_string()].into_iter().collect()),
+            accept: Arc::new(accept.iter().map(|a| a.to_string()).collect()),
             counter: Arc::new(AtomicU64::new(0)),
             boot: 0x0bad_cafe,
             forwarding: Some(Forwarding {
@@ -1805,6 +2122,132 @@ mod tests {
             .close()
     }
 
+    /// Verify the ARC set and any DKIM signature on a message the daemon sent.
+    ///
+    /// Header *presence* is not the property: a wiring bug that seals the wrong
+    /// buffer produces headers that look right and do not validate. This checks
+    /// them against the fixture key, offline, through the same library a
+    /// receiver would use.
+    async fn validate(message: &str) -> (mail_auth::DkimResult, Vec<mail_auth::DkimResult>) {
+        use mail_auth::{AuthenticatedMessage, MessageAuthenticator, Parameters};
+        use pigeon_testkit::dns::DnsStub;
+
+        let stub = DnsStub::with_dkim_record(
+            &pigeon_auth::dkim::public_from_private_pem(e2e_key())
+                .map(|public| pigeon_auth::dkim::txt_record(&public))
+                .expect("the fixture key has a public half"),
+        );
+
+        let authenticator = MessageAuthenticator::new_system_conf().expect("resolver");
+        let parsed =
+            AuthenticatedMessage::parse(message.as_bytes()).expect("the sent message parses");
+
+        let arc = authenticator
+            .verify_arc(Parameters {
+                params: &parsed,
+                cache_txt: Some(&stub),
+                cache_mx: None::<&DnsStub>,
+                cache_ptr: None::<&DnsStub>,
+                cache_ipv4: None::<&DnsStub>,
+                cache_ipv6: None::<&DnsStub>,
+            })
+            .await;
+
+        let dkim = authenticator
+            .verify_dkim(Parameters {
+                params: &parsed,
+                cache_txt: Some(&stub),
+                cache_mx: None::<&DnsStub>,
+                cache_ptr: None::<&DnsStub>,
+                cache_ipv4: None::<&DnsStub>,
+                cache_ipv6: None::<&DnsStub>,
+            })
+            .await;
+
+        (
+            arc.result().clone(),
+            dkim.iter().map(|d| d.result().clone()).collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_arc_set_the_daemon_sent_actually_validates() {
+        // The end-to-end claim, checked rather than assumed. Every step between
+        // the pipeline and the socket — spooling, re-reading, dot-stuffing —
+        // can corrupt what was signed, and nothing about a header's presence
+        // would say so.
+        let tmp = TempDir::new("e2e-arc-valid");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (addr, spool) = spawn_authenticated(
+            tmp.path(),
+            peer_addr,
+            e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true),
+        )
+        .await;
+
+        submit(
+            addr,
+            "sender@remote.test",
+            "hello@example.com",
+            "From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n",
+        )
+        .await;
+        assert!(wait_until_spool_is_empty(&spool).await, "never forwarded");
+
+        // What the peer received, with the end-of-data marker removed.
+        let sent = delivered(&transcript);
+        let sent = sent.strip_suffix(".\r\n").unwrap_or(&sent).to_string();
+
+        let (arc, _) = validate(&sent).await;
+        assert_eq!(
+            arc,
+            mail_auth::DkimResult::Pass,
+            "the ARC set the daemon transmitted does not validate: {arc:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rewritten_from_the_daemon_sent_is_validly_signed() {
+        // The same, for the signature that carries the DMARC pass under
+        // rewrite_from. A signature over the wrong buffer is a header that
+        // looks correct and fails at the receiver.
+        let tmp = TempDir::new("e2e-dkim-valid");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (addr, spool) = spawn_authenticated(
+            tmp.path(),
+            peer_addr,
+            e2e_auth(
+                "example.com",
+                pigeon_types::ForwardPolicy::RewriteFrom,
+                true,
+            ),
+        )
+        .await;
+
+        submit(
+            addr,
+            "sender@remote.test",
+            "hello@example.com",
+            "From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n",
+        )
+        .await;
+        assert!(wait_until_spool_is_empty(&spool).await, "never forwarded");
+
+        let sent = delivered(&transcript);
+        let sent = sent.strip_suffix(".\r\n").unwrap_or(&sent).to_string();
+
+        let (arc, dkim) = validate(&sent).await;
+        assert_eq!(
+            arc,
+            mail_auth::DkimResult::Pass,
+            "the ARC set does not validate"
+        );
+        assert!(
+            dkim.contains(&mail_auth::DkimResult::Pass),
+            "the rewritten From: is not validly signed: {dkim:?}"
+        );
+    }
+
     #[tokio::test]
     async fn what_is_spooled_is_what_is_transmitted() {
         // A retry must send the same bytes, and the ARC set signs exactly one
@@ -1871,6 +2314,165 @@ mod tests {
         assert!(
             spooled.ends_with("\r\n"),
             "the spooled form is unterminated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_installs_the_table_and_its_keys_together() {
+        // The property the combined runtime exists for. Publishing a snapshot
+        // whose keys cannot be derived must install *neither*: a table without
+        // its keys leaves a rewrite_from domain unable to sign, and keys
+        // without their table sign under a policy no longer in force.
+        use pigeon_route::Publish;
+
+        let good = e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true);
+        let before = good.runtime.pin();
+        assert_eq!(before.keys.len(), 1);
+
+        // A state whose key derivation always fails, standing in for a key
+        // file that has been removed between reloads.
+        let broken = Arc::new(RuntimeState {
+            current: std::sync::RwLock::new(Arc::clone(&before)),
+            derive_keys: Box::new(|_| Err("the key file is gone".into())),
+        });
+
+        let published = broken.publish(pigeon_route::Snapshot::default());
+        assert!(published.is_err(), "a keyless snapshot was installed");
+
+        let after = broken.pin();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the previous runtime was replaced by one that could not be completed"
+        );
+        assert_eq!(after.keys.len(), 1, "the keys were dropped");
+    }
+
+    #[tokio::test]
+    async fn a_reload_between_rcpt_and_data_does_not_change_the_policy() {
+        // The pin, made falsifiable. The recipient is accepted under Preserve;
+        // the configuration then changes to rewrite_from before the body
+        // arrives. The message must be forwarded under the policy that
+        // accepted it — reading the policy at DATA would rewrite and sign a
+        // message that was admitted on different terms, and the sender would
+        // have no way to know which one applied.
+        let tmp = TempDir::new("e2e-pinned");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let auth = e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true);
+        let runtime = Arc::clone(&auth.runtime);
+        let (addr, spool) = spawn_authenticated(tmp.path(), peer_addr, auth).await;
+
+        let mut c = pigeon_testkit::RawClient::connect(addr)
+            .await
+            .expect("connect");
+        c.read_reply().await.expect("banner");
+        c.send(b"EHLO client.test\r\n").await.expect("ehlo");
+        c.read_reply().await.expect("ehlo reply");
+        c.send(b"MAIL FROM:<sender@remote.test>\r\n")
+            .await
+            .expect("mail");
+        c.read_reply().await.expect("mail reply");
+        c.send(b"RCPT TO:<hello@example.com>\r\n")
+            .await
+            .expect("rcpt");
+        assert_eq!(c.read_reply().await.expect("rcpt reply").0, 250);
+
+        // The reload lands here: after the recipient was accepted, before the
+        // body exists.
+        republish(&runtime, pigeon_types::ForwardPolicy::RewriteFrom);
+
+        c.send(b"DATA\r\n").await.expect("data");
+        assert_eq!(c.read_reply().await.expect("data reply").0, 354);
+        c.send(b"From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n.\r\n")
+            .await
+            .expect("body");
+        assert_eq!(c.read_reply().await.expect("accepted").0, 250);
+        assert!(wait_until_spool_is_empty(&spool).await, "never forwarded");
+
+        let sent = delivered(&transcript);
+        assert!(
+            sent.contains("From: <sender@remote.test>"),
+            "the message was rewritten under a policy that did not accept it:\n{sent}"
+        );
+        assert!(
+            !sent.contains("DKIM-Signature:"),
+            "the message was signed under a policy that did not accept it:\n{sent}"
+        );
+
+        // And the new policy is in force for the *next* transaction, so the
+        // test cannot pass by the reload having done nothing.
+        assert_eq!(
+            runtime
+                .pin()
+                .snapshot
+                .forwarding("example.com")
+                .unwrap()
+                .policy,
+            pigeon_types::ForwardPolicy::RewriteFrom
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_managed_domain_is_deferred_rather_than_refused() {
+        // Recipient order would otherwise choose the forwarding policy and the
+        // signing identity, which is a decision belonging to the sender.
+        //
+        // Deferred, not rejected: the address is deliverable on its own, so a
+        // permanent answer would tell the sender to give up on a working
+        // mailbox.
+        let tmp = TempDir::new("e2e-two-domains");
+        let (peer_addr, _transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+
+        let mut auth = e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true);
+        // A second managed domain in the same table.
+        auth = second_domain(auth, "other.example");
+
+        let (addr, _spool) = spawn_two_domain_daemon(tmp.path(), peer_addr, auth).await;
+
+        let mut c = pigeon_testkit::RawClient::connect(addr)
+            .await
+            .expect("connect");
+        c.read_reply().await.expect("banner");
+        c.send(b"EHLO client.test\r\n").await.expect("ehlo");
+        c.read_reply().await.expect("ehlo reply");
+        c.send(b"MAIL FROM:<sender@remote.test>\r\n")
+            .await
+            .expect("mail");
+        assert_eq!(c.read_reply().await.expect("mail reply").0, 250);
+
+        c.send(b"RCPT TO:<hello@example.com>\r\n")
+            .await
+            .expect("rcpt 1");
+        assert_eq!(
+            c.read_reply().await.expect("rcpt 1 reply").0,
+            250,
+            "the first recipient was not accepted"
+        );
+
+        c.send(b"RCPT TO:<hello@other.example>\r\n")
+            .await
+            .expect("rcpt 2");
+        let (code, text) = c.read_reply().await.expect("rcpt 2 reply");
+        assert_eq!(
+            code / 100,
+            4,
+            "a second managed domain was not deferred: {code} {text}"
+        );
+
+        // And the same address on its own is fine, which is what makes the
+        // refusal about the combination rather than the recipient.
+        c.send(b"RSET\r\n").await.expect("rset");
+        c.read_reply().await.expect("rset reply");
+        c.send(b"MAIL FROM:<sender@remote.test>\r\n")
+            .await
+            .expect("mail 2");
+        c.read_reply().await.expect("mail 2 reply");
+        c.send(b"RCPT TO:<hello@other.example>\r\n")
+            .await
+            .expect("rcpt 3");
+        assert_eq!(
+            c.read_reply().await.expect("rcpt 3 reply").0,
+            250,
+            "the deferred address is not deliverable on its own either"
         );
     }
 

@@ -1275,6 +1275,7 @@ dependencies = [
 name = "pigeon-testkit"
 version = "0.0.1"
 dependencies = [
+ "mail-auth",
  "tokio",
 ]
 
@@ -1286,6 +1287,7 @@ version = "0.0.1"
 name = "pigeond"
 version = "0.0.1"
 dependencies = [
+ "mail-auth",
  "pigeon-alert",
  "pigeon-auth",
  "pigeon-config",

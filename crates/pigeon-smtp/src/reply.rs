@@ -134,6 +134,19 @@ pub fn no_such_user() -> Reply {
     Reply::line(550, "No such user here")
 }
 
+/// This recipient cannot be handled in the same transaction as the ones
+/// already accepted.
+///
+/// Transient on purpose. The address is deliverable — just not alongside the
+/// others — so a permanent refusal would tell the sender to give up on a
+/// mailbox that works.
+pub fn recipient_deferred() -> Reply {
+    Reply::line(
+        450,
+        "Recipient not available in this transaction; send it separately",
+    )
+}
+
 pub fn too_many_recipients() -> Reply {
     Reply::line(452, "Too many recipients")
 }

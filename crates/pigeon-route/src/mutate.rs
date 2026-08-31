@@ -104,7 +104,7 @@ where
     tx.commit()?;
 
     // 5. After the commit. Never before.
-    router.publish(built.snapshot);
+    router.install(built.snapshot);
 
     Ok(Outcome {
         value,

@@ -27,6 +27,9 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 pigeon-testkit = { workspace = true }
+# The end-to-end tests verify the ARC set and DKIM signature the daemon
+# actually transmitted, rather than asserting the headers exist.
+mail-auth = { workspace = true }
 
 [[bin]]
 name = "pigeond"

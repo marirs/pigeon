@@ -45,7 +45,7 @@ pub use client::{Accepted, ClientError, deliver};
 pub use codec::{DataReader, DataStatus, LineError, LineReader};
 pub use command::{Command, ParseError, parse};
 pub use reply::Reply;
-pub use server::{MessageSink, ServerConfig, serve};
+pub use server::{MessageSink, Recipient, ServerConfig, serve};
 pub use session::{Action, DataError, Envelope, Message, Session, State};
 
 /// Largest message Pigeon will accept, before per-domain policy narrows it.

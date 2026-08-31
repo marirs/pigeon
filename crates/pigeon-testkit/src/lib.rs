@@ -20,6 +20,7 @@
 //! bounced, or lost.
 
 #![forbid(unsafe_code)]
+pub mod dns;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

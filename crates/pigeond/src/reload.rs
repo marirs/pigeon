@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pigeon_route::{Router, Tick, Watcher};
+use pigeon_route::{Publish, Tick, Watcher};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -67,7 +67,11 @@ impl Reloader {
     ///
     /// The connection is opened inside the worker and owned by it, so it is
     /// closed when the worker ends rather than at process teardown.
-    pub fn start(path: PathBuf, router: Arc<Router>, watcher: Watcher) -> Self {
+    pub fn start<P: Publish + Send + Sync + 'static>(
+        path: PathBuf,
+        router: Arc<P>,
+        watcher: Watcher,
+    ) -> Self {
         let (stop, mut stopped) = watch::channel(false);
 
         let handle = tokio::task::spawn_blocking(move || {
@@ -102,7 +106,7 @@ impl Reloader {
                     return;
                 }
 
-                match watcher.tick(&conn, &router) {
+                match watcher.tick(&conn, router.as_ref()) {
                     Tick::Published { domains, rules } => {
                         // R-3: logged only when the routing input actually
                         // changed and was published. A version change with an
@@ -350,8 +354,8 @@ mod tests {
         }
     }
 
-    fn router() -> Arc<Router> {
-        Arc::new(Router::new(pigeon_route::Snapshot::default()))
+    fn router() -> Arc<pigeon_route::Router> {
+        Arc::new(pigeon_route::Router::new(pigeon_route::Snapshot::default()))
     }
 
     #[tokio::test]

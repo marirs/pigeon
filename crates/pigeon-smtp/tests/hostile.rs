@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pigeon_smtp::{DataError, Envelope, Message, MessageSink, ServerConfig};
+use pigeon_smtp::{DataError, Envelope, Message, MessageSink, Recipient, ServerConfig};
 use pigeon_testkit::RawClient;
 
 /// Accepts only addresses on domains this server owns.
@@ -40,14 +40,23 @@ impl LocalOnly {
 }
 
 impl MessageSink for LocalOnly {
-    fn accepts_recipient(&self, address: &str) -> bool {
-        match address.rsplit_once('@') {
+    type Transaction = ();
+
+    fn begin(&self) {}
+
+    fn accepts_recipient(&self, _txn: &(), address: &str, _accepted: &[String]) -> Recipient {
+        let carried = match address.rsplit_once('@') {
             Some((_, domain)) => self.domains.iter().any(|d| d.eq_ignore_ascii_case(domain)),
             None => false,
+        };
+        if carried {
+            Recipient::Accept
+        } else {
+            Recipient::Reject
         }
     }
 
-    async fn deliver(&self, message: Message) -> Result<String, DataError> {
+    async fn deliver(&self, _txn: (), message: Message) -> Result<String, DataError> {
         self.received.lock().unwrap().push(message.envelope);
         Ok("OK".into())
     }

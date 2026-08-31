@@ -63,8 +63,32 @@ impl Router {
     ///
     /// A single pointer store, so a reader sees the old table or the new one
     /// and never a partial one.
-    pub(crate) fn publish(&self, snapshot: Snapshot) {
+    pub(crate) fn install(&self, snapshot: Snapshot) {
         *self.current.write().expect("router lock poisoned") = Arc::new(snapshot);
+    }
+}
+
+/// Where a validated snapshot goes when it is ready to serve.
+///
+/// A trait rather than a concrete [`Router`] because a snapshot is not always
+/// the whole of what has to change atomically. The daemon publishes the routing
+/// table *and* the signing keys derived from it: adding or rotating a DKIM key
+/// changes both, and installing one without the other would leave a domain
+/// rewriting `From:` with no key to sign it, or signing with a key whose record
+/// has been withdrawn.
+///
+/// Publication may therefore fail — deriving the rest of the state can fail —
+/// and a failure is treated exactly like a configuration that will not build:
+/// the previous state stays, and the reason is reported once.
+pub trait Publish {
+    fn publish(&self, snapshot: Snapshot) -> Result<(), String>;
+}
+
+impl Publish for Router {
+    /// Installing a snapshot alone cannot fail.
+    fn publish(&self, snapshot: Snapshot) -> Result<(), String> {
+        self.install(snapshot);
+        Ok(())
     }
 }
 
@@ -118,7 +142,7 @@ mod tests {
             Some("old@x.test")
         );
 
-        router.publish(table("hello", "new@x.test"));
+        router.install(table("hello", "new@x.test"));
         assert_eq!(
             first_destination(&router.for_transaction(), "hello@example.com").as_deref(),
             Some("new@x.test")
@@ -139,7 +163,7 @@ mod tests {
         let pinned = router.for_transaction();
 
         // The operator reloads mid-transaction, removing the recipient.
-        router.publish(Snapshot::default());
+        router.install(Snapshot::default());
 
         // RCPT TO, and later the delivery decision, both still see the table
         // the transaction started with.
@@ -185,7 +209,7 @@ mod tests {
             .collect();
 
         for i in 0..200 {
-            router.publish(table(
+            router.install(table(
                 "hello",
                 if i % 2 == 0 { "a@x.test" } else { "b@x.test" },
             ));

@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-use pigeon_smtp::{DataError, Envelope, Message, MessageSink, ServerConfig};
+use pigeon_smtp::{DataError, Envelope, Message, MessageSink, Recipient, ServerConfig};
 
 // ---------------------------------------------------------------- test sink
 
@@ -36,11 +36,19 @@ impl TestSink {
 }
 
 impl MessageSink for TestSink {
-    fn accepts_recipient(&self, address: &str) -> bool {
-        self.allowed.iter().any(|a| a == address)
+    type Transaction = ();
+
+    fn begin(&self) {}
+
+    fn accepts_recipient(&self, _txn: &(), address: &str, _accepted: &[String]) -> Recipient {
+        if self.allowed.iter().any(|a| a == address) {
+            Recipient::Accept
+        } else {
+            Recipient::Reject
+        }
     }
 
-    async fn deliver(&self, message: Message) -> Result<String, DataError> {
+    async fn deliver(&self, _txn: (), message: Message) -> Result<String, DataError> {
         self.received.lock().unwrap().push(message);
         Ok("TESTID".to_string())
     }

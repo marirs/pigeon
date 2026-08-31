@@ -26,18 +26,61 @@ use crate::session::{Action, DataError, Message, Session, State};
 /// Recipient checking is synchronous because routing is an in-memory snapshot;
 /// if it ever needs I/O, that snapshot has been designed wrong.
 pub trait MessageSink: Clone + Send + Sync + 'static {
+    /// State pinned for one mail transaction.
+    ///
+    /// Created at `MAIL FROM` and handed back at delivery, so everything from
+    /// the recipient decision to the signature is taken from one consistent
+    /// view. Without it, a reload landing between `RCPT TO` and the end of
+    /// `DATA` could accept a recipient under one configuration and forward it
+    /// under another — accepting mail for a route that no longer exists, or
+    /// signing with a key that has just been retired.
+    ///
+    /// `()` for a sink with nothing to pin.
+    type Transaction: Send + Sync;
+
+    /// Begin a transaction, pinning whatever must not change inside it.
+    ///
+    /// At `MAIL FROM` rather than at the first `RCPT TO`: earlier is safe,
+    /// later is not, and this is the point at which the transaction exists.
+    fn begin(&self) -> Self::Transaction;
+
     /// Whether this address should be accepted at `RCPT TO`.
     ///
     /// Called before the sender transmits the body, which is the only point at
     /// which a message can be refused without Pigeon becoming responsible for
-    /// bouncing it.
-    fn accepts_recipient(&self, address: &str) -> bool;
+    /// bouncing it. `accepted` is what the envelope holds already, so a sink
+    /// can refuse a combination it cannot handle as one message.
+    fn accepts_recipient(
+        &self,
+        transaction: &Self::Transaction,
+        address: &str,
+        accepted: &[String],
+    ) -> Recipient;
 
     /// Take a complete message. The returned id appears in the `250`.
     ///
     /// Returning `Ok` is a promise that the message will survive a crash, so
     /// this must not return until it is durable.
-    fn deliver(&self, message: Message) -> impl Future<Output = Result<String, DataError>> + Send;
+    fn deliver(
+        &self,
+        transaction: Self::Transaction,
+        message: Message,
+    ) -> impl Future<Output = Result<String, DataError>> + Send;
+}
+
+/// What to do with a recipient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recipient {
+    Accept,
+    /// No such user here, or nothing routes it. Permanent.
+    Reject,
+    /// Not in *this* transaction. Transient, so the sender retries the address
+    /// in another one rather than treating it as undeliverable.
+    ///
+    /// Exists for combinations rather than addresses: a sink that can handle
+    /// each of two recipients but not both at once has no permanent answer to
+    /// give about either.
+    Defer,
 }
 
 /// How long a single reply may take to write before the peer is assumed dead.
@@ -302,6 +345,9 @@ async fn handle<S: MessageSink>(
     let mut line = Vec::with_capacity(MAX_COMMAND_LINE);
     let mut chunk = vec![0u8; 8 * 1024];
     let mut data: Option<DataReader> = None;
+    // Pinned at `MAIL FROM`, taken at delivery, dropped by `RSET` and by the
+    // end of every transaction. `None` outside one.
+    let mut transaction: Option<S::Transaction> = None;
     let started = Instant::now();
 
     tracing::debug!(%peer, "connection opened");
@@ -354,8 +400,16 @@ async fn handle<S: MessageSink>(
             }
             input = &input[used..];
             let reader = data.take().expect("checked above");
-            if let Flow::Stop =
-                finish_data(&mut stream, &mut session, &sink, &config, peer, reader).await?
+            if let Flow::Stop = finish_data(
+                transaction.take(),
+                &mut stream,
+                &mut session,
+                &sink,
+                &config,
+                peer,
+                reader,
+            )
+            .await?
             {
                 return Ok(());
             }
@@ -366,7 +420,7 @@ async fn handle<S: MessageSink>(
         loop {
             match lines.take_line(&mut line) {
                 Ok(true) => {
-                    match step(&mut stream, &mut session, &sink, &line).await? {
+                    match step(&mut transaction, &mut stream, &mut session, &sink, &line).await? {
                         Step::Continue => {}
                         Step::Close => return Ok(()),
                         Step::BeginData => {
@@ -380,6 +434,7 @@ async fn handle<S: MessageSink>(
                             if reader.is_complete() {
                                 let rest = pending[used..].to_vec();
                                 if let Flow::Stop = finish_data(
+                                    transaction.take(),
                                     &mut stream,
                                     &mut session,
                                     &sink,
@@ -419,6 +474,7 @@ enum Step {
 
 /// Handle one framed command line.
 async fn step<S: MessageSink>(
+    transaction: &mut Option<S::Transaction>,
     stream: &mut TcpStream,
     session: &mut Session,
     sink: &S,
@@ -450,18 +506,51 @@ async fn step<S: MessageSink>(
     if let command::Command::Rcpt { path, .. } = cmd
         && matches!(session.state(), State::Mail | State::Rcpt)
         && pigeon_types::Address::parse(path).is_ok()
-        && !sink.accepts_recipient(path)
     {
-        tracing::debug!(recipient = %path, "recipient refused");
-        let action = session.recipient_refused();
-        return match emit(stream, action).await? {
-            Flow::Continue => Ok(Step::Continue),
-            Flow::Stop => Ok(Step::Close),
+        let decision = match transaction.as_ref() {
+            Some(txn) => sink.accepts_recipient(txn, path, &session.envelope().recipients),
+            // No transaction means no `MAIL FROM`, which the sequence check
+            // above has already excluded.
+            None => Recipient::Reject,
         };
+
+        match decision {
+            Recipient::Accept => {}
+            Recipient::Reject => {
+                tracing::debug!(recipient = %path, "recipient refused");
+                let action = session.recipient_refused();
+                return match emit(stream, action).await? {
+                    Flow::Continue => Ok(Step::Continue),
+                    Flow::Stop => Ok(Step::Close),
+                };
+            }
+            Recipient::Defer => {
+                // Not counted against the error budget: the address is not the
+                // problem and the sender is being told to send it separately,
+                // which is cooperation rather than probing.
+                tracing::debug!(recipient = %path, "recipient deferred to another transaction");
+                return match emit(stream, Action::Reply(reply::recipient_deferred())).await? {
+                    Flow::Continue => Ok(Step::Continue),
+                    Flow::Stop => Ok(Step::Close),
+                };
+            }
+        }
     }
 
+    // `MAIL FROM` opens a transaction and `RSET` — or any other reset of the
+    // state — closes it. Pinned *after* the command is accepted, so a refused
+    // `MAIL FROM` does not pin anything.
+    let starts_transaction = matches!(cmd, command::Command::Mail { .. });
     let action = session.advance(cmd);
     let begins_data = matches!(action, Action::ReadData(_));
+
+    match session.state() {
+        State::Mail if starts_transaction => *transaction = Some(sink.begin()),
+        State::Mail | State::Rcpt | State::Data => {}
+        // Anything else means there is no transaction in progress: `RSET`,
+        // a fresh `EHLO`, or a closed session.
+        _ => *transaction = None,
+    }
 
     match emit(stream, action).await? {
         Flow::Stop => Ok(Step::Close),
@@ -472,6 +561,7 @@ async fn step<S: MessageSink>(
 
 /// Hand a finished body to the sink and answer the client.
 async fn finish_data<S: MessageSink>(
+    transaction: Option<S::Transaction>,
     stream: &mut TcpStream,
     session: &mut Session,
     sink: &S,
@@ -494,13 +584,22 @@ async fn finish_data<S: MessageSink>(
         tracing::warn!(%peer, hops, "refusing message: too many trace hops, likely a loop");
         Err(DataError::TooManyHops)
     } else {
-        sink.deliver(Message {
-            peer: peer.ip(),
-            helo: session.peer_name().unwrap_or_default().to_string(),
-            envelope,
-            received,
-            body,
-        })
+        let Some(transaction) = transaction else {
+            // No pinned transaction means no `MAIL FROM`, which the session
+            // state machine has already refused — the body cannot be here.
+            tracing::error!(%peer, "message body without a transaction");
+            return Ok(Flow::Stop);
+        };
+        sink.deliver(
+            transaction,
+            Message {
+                peer: peer.ip(),
+                helo: session.peer_name().unwrap_or_default().to_string(),
+                envelope,
+                received,
+                body,
+            },
+        )
         .await
     };
 
