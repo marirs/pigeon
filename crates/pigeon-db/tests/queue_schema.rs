@@ -138,17 +138,13 @@ fn a_claim_and_delivering_are_the_same_fact() {
     // A complete claim on a row that is not delivering.
     let e = refused(
         &conn,
-        &format!(
-            "UPDATE delivery SET claimed_by='worker-1', lease_expires_at=60 WHERE id = {d}"
-        ),
+        &format!("UPDATE delivery SET claimed_by='worker-1', lease_expires_at=60 WHERE id = {d}"),
     );
     assert!(e.contains("CHECK"), "a claim without delivering: {e}");
 
     let e = refused(
         &conn,
-        &format!(
-            "UPDATE delivery SET state = 'delivering', next_attempt_at = NULL WHERE id = {d}"
-        ),
+        &format!("UPDATE delivery SET state = 'delivering', next_attempt_at = NULL WHERE id = {d}"),
     );
     assert!(e.contains("CHECK"), "delivering without a claim: {e}");
 

@@ -465,7 +465,12 @@ listen = "127.0.0.1:0"
         let started = start(&path, probe(ran.clone())).await.expect("start");
 
         assert_eq!(started.migration.from, 0);
-        assert_eq!(started.migration.to, 1);
+        // Whatever this build ships, rather than a number to edit per
+        // migration: the property is that startup migrates to current.
+        assert_eq!(
+            started.migration.to,
+            pigeon_db::migrate::MIGRATIONS.last().unwrap().version
+        );
         assert!(ran.load(Ordering::SeqCst), "the spool was never prepared");
 
         // The schema is really there, on the connection that was handed back.
