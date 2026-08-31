@@ -1282,6 +1282,9 @@ name = "pigeon-spool"
 version = "0.0.1"
 dependencies = [
  "pigeon-types",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

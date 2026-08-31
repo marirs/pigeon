@@ -30,4 +30,9 @@
 
 #![forbid(unsafe_code)]
 
-// M3: spool writer, lease-based claim, exponential backoff, bounce via SRS.
+pub mod store;
+
+pub use store::{InvalidSpoolId, Spool, SpoolError, SpoolId};
+
+// M3: lease-based claim, exponential backoff, bounce via SRS. The writer is
+// in `store`.

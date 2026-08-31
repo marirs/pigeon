@@ -11,3 +11,6 @@ publish.workspace      = true
 
 [dependencies]
 pigeon-types = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -382,6 +382,7 @@ struct Auth {
 
 struct SpoolSink<R: MxLookup> {
     dir: Arc<PathBuf>,
+    spool: pigeon_spool::Spool,
     /// Absent on the Milestone 0 environment path, where there is no database
     /// and so no policy, no keys and no SRS ring.
     auth: Option<Auth>,
@@ -402,6 +403,7 @@ impl<R: MxLookup> Clone for SpoolSink<R> {
     fn clone(&self) -> Self {
         Self {
             dir: Arc::clone(&self.dir),
+            spool: self.spool.clone(),
             auth: self.auth.clone(),
             accept: Arc::clone(&self.accept),
             counter: Arc::clone(&self.counter),
@@ -685,6 +687,14 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
                     let rotation = self.counter.load(Ordering::Relaxed);
                     let id2 = id.clone();
                     let dir = Arc::clone(&self.dir);
+                    let spool_for_delivery = self.spool.clone();
+                    let spool_id = match pigeon_spool::SpoolId::new(&id) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(%id, error = %e, "generated an unusable spool id");
+                            return Err(DataError::Temporary);
+                        }
+                    };
                     let envelope = envelope.clone();
 
                     // The task carries an identifier, not a message. It re-reads
@@ -710,7 +720,7 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
                             }
                         };
 
-                        let spooled = match tokio::fs::read(dir.join(format!("{id2}.eml"))).await {
+                        let spooled = match spool_for_delivery.read(&spool_id).await {
                             Ok(b) => b,
                             Err(e) => {
                                 tracing::error!(id = %id2, error = %e, "cannot re-read spooled message");
@@ -783,9 +793,15 @@ impl<R: MxLookup> SpoolSink<R> {
 
     /// Write the message so that it survives a crash.
     ///
-    /// Temporary file, fsync, atomic rename, then fsync the directory. Only
-    /// after all four is the caller entitled to answer 250 — a rename is not
-    /// durable until the directory entry itself has been flushed.
+    /// The message itself goes through `pigeon_spool::Spool`, which writes,
+    /// fsyncs, installs without clobbering, and fsyncs the directory. Only
+    /// after all four is the caller entitled to answer `250`.
+    ///
+    /// The envelope sidecar is still written here, by the older helper. It
+    /// exists because there is nowhere else yet to put the sender and the
+    /// recipients; the acceptance transaction replaces it with `message`,
+    /// `original_recipient` and `delivery` rows, and takes `write_durably`
+    /// with it.
     async fn write_message(
         &self,
         id: &str,
@@ -807,15 +823,28 @@ impl<R: MxLookup> SpoolSink<R> {
         );
 
         write_durably(&self.dir, &format!("{id}.envelope"), &[meta.as_bytes()]).await?;
+
         // Header then body, written in sequence rather than concatenated, so
         // the message is not copied to prepend a few hundred bytes to it.
-        write_durably(
-            &self.dir,
-            &format!("{id}.eml"),
-            &[received.as_bytes(), body],
-        )
-        .await?;
-        sync_dir(&self.dir).await
+        let spool_id = pigeon_spool::SpoolId::new(id).map_err(|e| {
+            // The identifier is generated a few lines above, so this is a bug
+            // rather than an input problem — and one worth failing loudly at
+            // rather than sanitising past.
+            io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+        })?;
+        self.spool
+            .install(&spool_id, &[received.as_bytes(), body])
+            .await
+            .map_err(|e| match e {
+                pigeon_spool::SpoolError::Collision(path) => io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "spool identifier collision: {} already exists",
+                        path.display()
+                    ),
+                ),
+                other => io::Error::other(other.to_string()),
+            })
     }
 }
 
@@ -1394,6 +1423,7 @@ async fn run() -> io::Result<()> {
     });
 
     let sink = SpoolSink {
+        spool: pigeon_spool::Spool::new(sink_dir.clone()),
         dir: Arc::new(sink_dir),
         auth,
         accept: Arc::new(accept),
@@ -1502,6 +1532,7 @@ mod tests {
     /// without ever being asked anything.
     fn sink(dir: &Path, accept: &[&str]) -> SpoolSink<pigeon_dns::FakeResolver> {
         SpoolSink {
+            spool: pigeon_spool::Spool::new(dir.to_path_buf()),
             auth: None,
             dir: Arc::new(dir.to_path_buf()),
             accept: Arc::new(accept.iter().map(|s| s.to_string()).collect()),
@@ -1770,6 +1801,7 @@ mod tests {
 
         let sink = SpoolSink {
             auth: None,
+            spool: pigeon_spool::Spool::new(spool.as_path()),
             dir: Arc::clone(&spool),
             accept: Arc::new(accept.iter().map(|s| s.to_string()).collect()),
             counter: Arc::new(AtomicU64::new(0)),
@@ -2078,6 +2110,7 @@ mod tests {
 
         let sink = SpoolSink {
             auth: Some(auth),
+            spool: pigeon_spool::Spool::new(spool.as_path()),
             dir: Arc::clone(&spool),
             accept: Arc::new(accept.iter().map(|a| a.to_string()).collect()),
             counter: Arc::new(AtomicU64::new(0)),
