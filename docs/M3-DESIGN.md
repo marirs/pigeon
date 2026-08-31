@@ -571,6 +571,31 @@ are constraints on this milestone, not references.
 a PID, which is reused, and not a timestamp alone, which collides across
 machines that boot together and after a clock step.
 
+### Settled by the measurements in §11
+
+**R-8 — no batching in the initial implementation. Ruled.** One transaction per
+submission. The measured ceiling is ~68 messages per second on the whole
+acceptance path, and group commit is a known ~9× lever if that ever binds.
+Building it now would add a latency knob and a partial-failure mode to buy
+throughput nothing needs.
+
+**R-9 — durability pragmas are part of the promise, not tuning.** `250` means
+the message survives, and the measurements show what each setting actually
+survives:
+
+| Setting | Survives a process crash | Survives power loss | Cost |
+|---|---|---|---|
+| `synchronous=NORMAL` | yes | **no** | 0.05 ms |
+| `synchronous=FULL`, `fullfsync=off` | yes | **not on macOS** | 0.08 ms |
+| `synchronous=FULL`, `fullfsync=ON` | yes | yes | 4.9 ms |
+
+Recommended: **`synchronous=FULL`, and `fullfsync=ON` where the platform has
+it**, with the cost stated in the operator documentation rather than discovered.
+A forwarder that loses acknowledged mail on a power cut has broken the one
+promise this milestone is about — and 68 messages a second is not a constraint
+worth trading it for. An operator who knowingly wants the weaker setting can
+have it, as a documented choice with the failure mode named.
+
 ---
 
 ## 11. Measurements
@@ -663,33 +688,6 @@ pressure — peak RSS above is three buffers of a 25 MB message.
 4. **Lease expiry under a stopped-world process** (`SIGSTOP`), which is the case
    a lease exists for and the one a graceful-shutdown test cannot produce.
    Needs the queue to exist.
-
----
-
-## 10b. Rulings the measurements settled
-
-**R-8 — no batching in the initial implementation. Ruled.** One transaction per
-submission. The measured ceiling is ~68 messages per second on the whole
-acceptance path, and group commit is a known ~9× lever if that ever binds.
-Building it now would add a latency knob and a partial-failure mode to buy
-throughput nothing needs.
-
-**R-9 — durability pragmas are part of the promise, not tuning.** `250` means
-the message survives, and the measurements show what each setting actually
-survives:
-
-| Setting | Survives a process crash | Survives power loss | Cost |
-|---|---|---|---|
-| `synchronous=NORMAL` | yes | **no** | 0.05 ms |
-| `synchronous=FULL`, `fullfsync=off` | yes | **not on macOS** | 0.08 ms |
-| `synchronous=FULL`, `fullfsync=ON` | yes | yes | 4.9 ms |
-
-Recommended: **`synchronous=FULL`, and `fullfsync=ON` where the platform has
-it**, with the cost stated in the operator documentation rather than discovered.
-A forwarder that loses acknowledged mail on a power cut has broken the one
-promise this milestone is about — and 68 messages a second is not a constraint
-worth trading it for. An operator who knowingly wants the weaker setting can
-have it, as a documented choice with the failure mode named.
 
 ---
 
