@@ -65,6 +65,17 @@ allow = [
     # below; it never was, and the claim contradicted both the ban list and the
     # manifest. Remove this line only if ring itself is dropped.
     "OpenSSL",
+
+    # `webpki-root-certs` — the Mozilla CA root bundle, which arrives with
+    # `rustls-platform-verifier` (mail-auth's `ring` feature enables it on
+    # hickory; see Cargo.toml).
+    #
+    # A *data* licence rather than a code one, which is why it is not on the
+    # list above: CDLA-Permissive-2.0 grants use, modification and
+    # redistribution of the data with no copyleft, no attribution requirement,
+    # and no obligation attaching to anything built alongside it. Nothing in it
+    # conflicts with shipping an Apache-2.0 binary.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

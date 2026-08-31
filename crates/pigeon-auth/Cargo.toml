@@ -12,6 +12,8 @@ publish.workspace      = true
 [dependencies]
 pigeon-types = { workspace = true }
 rsa = { workspace = true }
+mail-auth = { workspace = true }
+mail-parser = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }

@@ -68,7 +68,17 @@ bytes       = "1"
 # What actually holds the exception is a CI grep over the source tree for
 # decryption calls — a *use* guard, not an absence. See deny.toml.
 rsa         = { version = "0.9", default-features = false, features = ["std", "getrandom", "pem", "u64_digit"] }
-mail-auth   = "0.7"
+# default-features is off because the default set pulls `aws-lc-rs`, which
+# deny.toml bans: it is the cmake-requiring C crypto library `ring` was chosen
+# over. `report` is off too — DMARC *evaluation* is M2, but generating
+# aggregate XML reports for domain owners is a later milestone, and it costs
+# `zip` and `quick-xml`.
+#
+# `ring` here is not only a crypto selection: it also turns on
+# hickory-resolver's tls-ring, dnssec-ring and rustls-platform-verifier, which
+# feature-unify onto Pigeon's own resolver. That is where `openssl-probe`
+# enters the graph on Linux; see the note in deny.toml. M2-DESIGN.md §6.
+mail-auth   = { version = "0.12.1", default-features = false, features = ["ring", "arc"] }
 mail-parser = "0.11"
 
 # DNS

@@ -78,6 +78,24 @@ jobs:
           fi
           echo "No RSA decryption in the source tree."
 
+      # The same exception also rests on `rsa` being reachable only through
+      # key generation. `mail-auth` can pull it in through its `generate` or
+      # `rust-crypto` features, and enabling one would make the argument false
+      # without changing a line of Pigeon's own code — signing would silently
+      # move off `ring` and onto the crate with the advisory.
+      - name: Assert mail-auth does not reach rsa
+        run: |
+          if cargo tree --workspace --all-features --target all --invert rsa \
+             | grep -q 'mail-auth'; then
+            echo "::error::mail-auth is now a path to the rsa crate."
+            echo
+            echo "deny.toml ignores RUSTSEC-2023-0071 because rsa only ever"
+            echo "generates keys here. Signing must stay on ring. Check that"
+            echo "mail-auth's generate/rust-crypto features are still off."
+            exit 1
+          fi
+          echo "rsa is reachable only through pigeon-auth key generation."
+
       # SRS tag comparison must be constant-time (M2-DESIGN.md §5.2). No test
       # can catch this: a `==` comparison is functionally identical and only
       # differs in timing, so every SRS test passes with the property gone.

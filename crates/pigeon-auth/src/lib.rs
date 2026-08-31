@@ -34,6 +34,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dkim;
+pub mod normalize;
 pub mod srs;
 
 pub use dkim::{DkimError, KeyPair};
