@@ -17,8 +17,9 @@
 use std::net::IpAddr;
 
 use mail_auth::{
-    AuthenticatedMessage, AuthenticationResults, DkimResult, DmarcResult, MessageAuthenticator,
-    SpfResult, dmarc::Policy, dmarc::verify::DmarcParameters, spf::verify::SpfParameters,
+    ArcOutput, AuthenticatedMessage, AuthenticationResults, DkimOutput, DkimResult, DmarcOutput,
+    DmarcResult, MessageAuthenticator, SpfOutput, SpfResult, dmarc::Policy,
+    dmarc::verify::DmarcParameters, spf::verify::SpfParameters,
 };
 
 use crate::normalize;
@@ -281,7 +282,67 @@ impl Verifier {
     /// evaluated *from* their results; DMARC against the identities as
     /// received, never against an envelope Pigeon has rewritten — that would
     /// return a meaningless pass on a domain Pigeon controls.
-    pub async fn verify(&self, received: Received<'_>, envelope: &Envelope<'_>) -> Verdicts {
+    /// Authenticate a message that the caller has already parsed.
+    ///
+    /// The borrowed half of [`Verifier::verify`], separated so one scope can
+    /// hold the parse, the ARC output and the rendered results together —
+    /// sealing needs all three alive at once, and an owner-plus-borrow struct
+    /// to carry them would be self-referential. The pipeline holds them as
+    /// locals instead; see [`crate::pipeline`].
+    pub(crate) async fn authenticate<'x>(
+        &self,
+        message: &'x AuthenticatedMessage<'x>,
+        envelope: &'x Envelope<'x>,
+    ) -> Authenticated<'x> {
+        let spf = self
+            .authenticator
+            .verify_spf(SpfParameters::verify_mail_from(
+                envelope.client_ip,
+                envelope.helo,
+                envelope.host_domain,
+                envelope.mail_from,
+            ))
+            .await;
+
+        let dkim = self.authenticator.verify_dkim(message).await;
+
+        // Absent chain and failed chain are different facts, so an empty chain
+        // is never verified into a `Fail`.
+        let arc = if message.as_headers.is_empty() {
+            None
+        } else {
+            Some(self.authenticator.verify_arc(message).await)
+        };
+
+        let mail_from_domain = envelope
+            .mail_from
+            .rsplit_once('@')
+            .map_or(envelope.helo, |(_, d)| d);
+        let dmarc = self
+            .authenticator
+            .verify_dmarc(DmarcParameters::new(message, &dkim, mail_from_domain, &spf))
+            .await;
+
+        // Rendered here, while the borrows are alive. R-5: written whenever
+        // authentication was evaluated, not only when something failed.
+        let mut results = AuthenticationResults::new(envelope.host_domain)
+            .with_spf_mailfrom_result(&spf, envelope.client_ip, envelope.mail_from, envelope.helo)
+            .with_dkim_results(&dkim, dmarc.domain())
+            .with_dmarc_result(&dmarc);
+        if let Some(arc) = &arc {
+            results = results.with_arc_result(arc, envelope.client_ip);
+        }
+
+        Authenticated {
+            spf,
+            dkim,
+            arc,
+            dmarc,
+            results,
+        }
+    }
+
+    pub async fn verify<'x>(&self, received: Received<'x>, envelope: &'x Envelope<'x>) -> Verdicts {
         let spf = self
             .authenticator
             .verify_spf(SpfParameters::verify_mail_from(
@@ -322,43 +383,46 @@ impl Verifier {
         prioritise_signatures(&mut message, &from, MAX_DKIM_SIGNATURES);
         let verified = message.dkim_headers.len();
 
-        let dkim = self.authenticator.verify_dkim(&message).await;
+        let authenticated = self.authenticate(&message, envelope).await;
+        authenticated.into_verdicts(&from, (present, verified))
+    }
+}
 
-        // Absent chain and failed chain are different facts, so an empty chain
-        // is never verified into a `Fail`.
-        let arc = if message.as_headers.is_empty() {
-            None
-        } else {
-            Some(self.authenticator.verify_arc(&message).await)
-        };
+/// The borrowed outputs of one authentication pass.
+///
+/// Lives only as long as the parse it came from. Everything the rest of the
+/// pipeline needs afterwards is copied out by [`Authenticated::into_verdicts`];
+/// what stays borrowed is what sealing consumes — the ARC output and the
+/// rendered results — and the pipeline keeps those as locals beside the buffer
+/// they point into.
+pub(crate) struct Authenticated<'x> {
+    pub spf: SpfOutput,
+    pub dkim: Vec<DkimOutput<'x>>,
+    pub arc: Option<ArcOutput<'x>>,
+    pub dmarc: DmarcOutput,
+    pub results: AuthenticationResults<'x>,
+}
 
-        let mail_from_domain = envelope
-            .mail_from
-            .rsplit_once('@')
-            .map_or(envelope.helo, |(_, d)| d);
-        let dmarc = self
-            .authenticator
-            .verify_dmarc(DmarcParameters::new(
-                &message,
-                &dkim,
-                mail_from_domain,
-                &spf,
-            ))
-            .await;
+impl Authenticated<'_> {
+    pub(crate) fn into_verdicts(
+        self,
+        from_domains: &[String],
+        signature_counts: (usize, usize),
+    ) -> Verdicts {
+        self.verdicts(from_domains, signature_counts)
+    }
 
-        // Rendered here, while the borrows are alive. R-5: written whenever
-        // authentication was evaluated, not only when something failed.
-        let mut results = AuthenticationResults::new(envelope.host_domain)
-            .with_spf_mailfrom_result(&spf, envelope.client_ip, envelope.mail_from, envelope.helo)
-            .with_dkim_results(&dkim, dmarc.domain())
-            .with_dmarc_result(&dmarc);
-        if let Some(arc) = &arc {
-            results = results.with_arc_result(arc, envelope.client_ip);
-        }
-
+    /// The same, without consuming — the pipeline keeps the borrowed outputs
+    /// alive for sealing after it has taken the owned summary.
+    pub(crate) fn verdicts(
+        &self,
+        from_domains: &[String],
+        signature_counts: (usize, usize),
+    ) -> Verdicts {
         Verdicts {
-            spf: (&spf.result()).into(),
-            dkim: dkim
+            spf: (&self.spf.result()).into(),
+            dkim: self
+                .dkim
                 .iter()
                 .map(|d| {
                     let domain = d
@@ -366,27 +430,27 @@ impl Verifier {
                         .map(|s| s.d.to_ascii_lowercase())
                         .unwrap_or_default();
                     DkimVerdict {
-                        aligned: is_aligned(&domain, &from),
+                        aligned: is_aligned(&domain, from_domains),
                         domain,
                         outcome: d.result().into(),
                     }
                 })
                 .collect(),
             dmarc: DmarcVerdict {
-                domain: dmarc.domain().to_string(),
-                dkim: dmarc.dkim_result().into(),
-                spf: dmarc.spf_result().into(),
-                policy: dmarc.policy().into(),
+                domain: self.dmarc.domain().to_string(),
+                dkim: self.dmarc.dkim_result().into(),
+                spf: self.dmarc.spf_result().into(),
+                policy: self.dmarc.policy().into(),
             },
-            arc: arc.map(|a| a.result().into()),
-            authentication_results: results.to_string(),
-            dkim_signatures: (present, verified),
+            arc: self.arc.as_ref().map(|a| a.result().into()),
+            authentication_results: self.results.to_string(),
+            dkim_signatures: signature_counts,
         }
     }
 }
 
 /// The `RFC5322.From` domains, lowercased.
-fn from_domains(message: &AuthenticatedMessage<'_>) -> Vec<String> {
+pub(crate) fn from_domains(message: &AuthenticatedMessage<'_>) -> Vec<String> {
     message
         .from
         .iter()
@@ -422,7 +486,7 @@ fn is_aligned(signing_domain: &str, from_domains: &[String]) -> bool {
 ///
 /// Sorting is stable, so signatures that tie keep the order they arrived in,
 /// and a message under the cap is not reordered at all.
-fn prioritise_signatures(
+pub(crate) fn prioritise_signatures(
     message: &mut AuthenticatedMessage<'_>,
     from_domains: &[String],
     cap: usize,

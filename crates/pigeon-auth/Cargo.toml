@@ -14,6 +14,7 @@ pigeon-types = { workspace = true }
 rsa = { workspace = true }
 mail-auth = { workspace = true }
 mail-parser = { workspace = true }
+rustls-pki-types = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }

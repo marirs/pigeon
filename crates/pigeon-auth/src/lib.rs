@@ -35,6 +35,7 @@
 
 pub mod dkim;
 pub mod normalize;
+pub mod pipeline;
 pub mod srs;
 pub mod verify;
 

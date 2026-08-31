@@ -1188,6 +1188,7 @@ dependencies = [
  "mail-parser",
  "pigeon-types",
  "rsa",
+ "rustls-pki-types",
  "sha2",
  "subtle",
  "thiserror",
