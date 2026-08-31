@@ -581,6 +581,7 @@ Design and review records, kept because the reasoning outlives the diffs:
 - [Milestone 0 findings](docs/M0-FINDINGS.md)
 - [Milestone 1 findings](docs/M1-FINDINGS.md)
 - [Message authentication design](docs/M2-DESIGN.md)
+- [Durability design](docs/M3-DESIGN.md)
 
 ---
 
