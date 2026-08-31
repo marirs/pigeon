@@ -19,3 +19,6 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

@@ -36,6 +36,7 @@
 pub mod dkim;
 pub mod normalize;
 pub mod srs;
+pub mod verify;
 
 pub use dkim::{DkimError, KeyPair};
 pub use srs::{Day, KeyRing, Srs, SrsError};
