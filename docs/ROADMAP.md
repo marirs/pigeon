@@ -116,23 +116,24 @@ and `M1-FINDINGS.md` for why.
 
 ## Milestone 2 — Message authentication
 
-- [ ] SRS0 encode and decode
-- [ ] SRS1 for double-forward chains
-- [ ] SRS replay window
-- [ ] DKIM verification on receipt
-- [ ] payload preservation: a conforming message is relayed byte for byte;
+- [x] SRS0 encode and decode
+- [x] SRS1 for double-forward chains
+- [x] SRS replay window
+- [x] DKIM verification on receipt
+- [x] payload preservation: a conforming message is relayed byte for byte;
       bare CR/LF anywhere in the payload is transport-converted to CRLF before
       signing, and an unterminated final line gains the CRLF the end-of-data
       marker requires (`M2-DESIGN.md` §2)
-- [ ] SRS key ring, rotation, and the retirement barrier
-- [ ] DKIM signing for the `rewrite_from` path
-- [ ] Authentication-Results
-- [ ] ARC validation
-- [ ] ARC sealing
-- [ ] DMARC evaluation
-- [ ] `rewrite_from` fallback policy, per domain
-- [ ] loop detection
-- [ ] forwarding trace headers
+- [x] SRS key ring, rotation, and the retirement barrier (the `pigeon srs`
+      commands that print the safe deletion date are still to come)
+- [x] DKIM signing for the `rewrite_from` path
+- [x] Authentication-Results
+- [x] ARC validation
+- [x] ARC sealing
+- [x] DMARC evaluation
+- [x] `rewrite_from` fallback policy, per domain
+- [x] loop detection (the trace-header cap; delivery-side detection is M3)
+- [x] forwarding trace headers
 
 **This is the go/no-go milestone.** Everything before it is plumbing and everything after it is hardening. If forwarded mail does not land with `dmarc=pass`, nothing else matters.
 
@@ -141,6 +142,14 @@ It depends on Milestone 1 for more than configuration: ARC sealing needs a priva
 Exit criteria:
 
 Forwarded mail is accepted with passing authentication by every major receiving provider, verified against real mailboxes rather than local tests.
+
+**Everything except that criterion is done.** The pipeline is wired into the
+delivery path and its output is verified cryptographically rather than by
+inspection: the tests parse what the daemon actually transmitted and validate
+the ARC set and the DKIM signature against the test key, offline. What remains
+is the part no local test can stand in for — a real domain, real DNS records,
+and mail that arrives in somebody's inbox — plus the `pigeon srs` commands
+above.
 
 ---
 

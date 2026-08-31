@@ -2348,6 +2348,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sealing_that_fails_degrades_rather_than_losing_the_message() {
+        // §7's split, end to end. A missing ARC set drops a recovery path —
+        // the pre-ARC status quo, which most forwarded mail lives with — so
+        // the message still goes. Refusing here would turn a local key problem
+        // into refused mail, which is the trade the design refuses to make.
+        //
+        // The opposite rule, for an unsignable rewrite, is asserted separately:
+        // that one is never written and never sent.
+        let tmp = TempDir::new("e2e-unsealed");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (addr, spool) = spawn_authenticated(
+            tmp.path(),
+            peer_addr,
+            // Preserve with no key: nothing can seal, and nothing needs to sign.
+            e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, false),
+        )
+        .await;
+
+        let replies = submit(
+            addr,
+            "sender@remote.test",
+            "hello@example.com",
+            "From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n",
+        )
+        .await;
+        assert_eq!(replies[5].0, 250, "an unsealable message was refused");
+        assert!(wait_until_spool_is_empty(&spool).await, "never forwarded");
+
+        let sent = delivered(&transcript);
+        assert!(!sent.contains("ARC-Seal:"), "sealed after all:\n{sent}");
+        // Everything that does not need a key is still there, which is what
+        // makes this a degradation rather than a bypass.
+        assert!(sent.contains("Received: from"), "no trace header:\n{sent}");
+        assert!(
+            sent.contains("Authentication-Results: pigeon.test"),
+            "no authentication results:\n{sent}"
+        );
+        assert!(sent.contains("From: <sender@remote.test>"), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn the_return_path_on_the_wire_reverses_to_the_original_sender() {
+        // What SRS is *for*: a bounce sent to the address the receiver was
+        // given has to find its way back. Asserted on the address the daemon
+        // actually transmitted rather than on one the test computed, so a
+        // wiring bug between the rewrite and the socket is caught.
+        //
+        // Delivering that bounce is Milestone 3's job — it needs the queue to
+        // be safe. Reversing it is Milestone 2's, and it is what makes the
+        // Milestone 3 work possible.
+        let tmp = TempDir::new("e2e-srs-reverse");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let auth = e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true);
+        let srs = Arc::clone(&auth.srs);
+        let (addr, spool) = spawn_authenticated(tmp.path(), peer_addr, auth).await;
+
+        submit(
+            addr,
+            "Original.Sender@remote.test",
+            "hello@example.com",
+            "From: <Original.Sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n",
+        )
+        .await;
+        assert!(wait_until_spool_is_empty(&spool).await, "never forwarded");
+
+        let mail_from = transcript
+            .lines()
+            .into_iter()
+            .find(|l| l.to_ascii_uppercase().starts_with("MAIL FROM:"))
+            .expect("no MAIL FROM reached the peer");
+        let address = mail_from
+            .trim_start_matches(|c| c != '<')
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string();
+        let local = address.rsplit_once('@').expect("a full address").0;
+
+        let reversed = srs
+            .reverse(local, pigeon_auth::Day::now())
+            .expect("the address this host issued does not reverse");
+
+        // Case preserved on the local part: `Original.Sender` and
+        // `original.sender` are different mailboxes, and only the original
+        // domain gets to say whether they are the same.
+        assert_eq!(reversed.address, "Original.Sender@remote.test");
+    }
+
+    #[tokio::test]
     async fn a_reload_between_rcpt_and_data_does_not_change_the_policy() {
         // The pin, made falsifiable. The recipient is accepted under Preserve;
         // the configuration then changes to rewrite_from before the body

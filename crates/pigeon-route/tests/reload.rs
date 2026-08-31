@@ -649,3 +649,61 @@ fn a_status_this_build_cannot_read_is_invalid_not_transient() {
         Some("me@example.net")
     );
 }
+
+// ------------------------------------------------- publication that can fail
+
+/// A publisher that refuses, standing in for the daemon deriving signing keys
+/// from a snapshot and failing — a key file removed between reloads, say.
+struct RefusingPublisher {
+    attempts: std::cell::Cell<usize>,
+}
+
+impl pigeon_route::Publish for RefusingPublisher {
+    fn publish(&self, _snapshot: pigeon_route::Snapshot) -> Result<(), String> {
+        self.attempts.set(self.attempts.get() + 1);
+        Err("the signing key could not be derived".into())
+    }
+}
+
+#[test]
+fn a_publication_that_fails_is_treated_as_invalid_configuration() {
+    // The daemon publishes the routing table and the keys derived from it as
+    // one state, so publication itself can fail. When it does, the previous
+    // state must keep serving and the operator must be told once — the same
+    // handling a configuration that will not build gets, because from the
+    // detector's side it is the same event: this version cannot be served.
+    let f = Fixture::new("publishfail");
+    f.seed();
+    f.add_alias("hello", "me@example.net");
+
+    let publisher = RefusingPublisher {
+        attempts: std::cell::Cell::new(0),
+    };
+    let mut w = Watcher::new();
+
+    match w.tick(&f.daemon, &publisher) {
+        Tick::Invalid { logged, message } => {
+            assert!(logged, "the first failure was not logged");
+            assert!(message.contains("signing key"), "{message}");
+        }
+        other => panic!("a failed publication was not treated as invalid: {other:?}"),
+    }
+    assert_eq!(publisher.attempts.get(), 1);
+
+    // Backs off rather than rebuilding every poll, and does not log again.
+    assert_eq!(w.tick(&f.daemon, &publisher), Tick::Backoff);
+    assert_eq!(
+        publisher.attempts.get(),
+        1,
+        "a throttled version was rebuilt and republished anyway"
+    );
+
+    // And a *fix* is picked up promptly: the new version bypasses the backoff
+    // for the version that failed.
+    f.add_alias("second", "me@example.net");
+    assert!(
+        matches!(w.tick(&f.daemon, &publisher), Tick::Invalid { .. }),
+        "a new version was not attempted after a failed publication"
+    );
+    assert_eq!(publisher.attempts.get(), 2);
+}
