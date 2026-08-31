@@ -152,42 +152,59 @@ fn build_auth(
     hostname: &str,
 ) -> io::Result<Auth> {
     let checked = started.config.clone();
-    let cfg = checked.config();
-
-    let ring = pigeon_auth::KeyRing::load(&cfg.srs_secret_file).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "SRS key ring {} is unusable: {e}",
-                cfg.srs_secret_file.display()
-            ),
-        )
-    })?;
-    let srs = pigeon_auth::Srs::new(ring, hostname.to_string());
+    let ring_path = checked.config().srs_secret_file.clone();
+    let host = hostname.to_string();
 
     let verifier = pigeon_auth::verify::Verifier::from_system()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("resolver: {e}")))?;
-    let pipeline = pigeon_auth::pipeline::Pipeline::new(verifier, hostname.to_string());
+    let pipeline = pigeon_auth::pipeline::Pipeline::new(verifier, host.clone());
+
+    // Keys and the ring are derived by one closure, so every publication
+    // rebuilds both from the state on disk at that moment. `pigeon srs rotate`
+    // writes a new ring; a daemon holding the old one would keep issuing return
+    // paths under the key that was just displaced.
+    let ring_for_derive = ring_path.clone();
+    let derive: Deriver = Box::new(move |snapshot| {
+        let ring = pigeon_auth::KeyRing::load(&ring_for_derive)
+            .map_err(|e| format!("SRS key ring {}: {e}", ring_for_derive.display()))?;
+        Ok(Derived {
+            keys: load_keys(snapshot, &checked)?,
+            srs: Arc::new(pigeon_auth::Srs::new(ring, host.clone())),
+        })
+    });
 
     // The first publication happens here rather than through the reload path,
     // and it fails startup: a key that will not load at boot will not load at
     // the first message either, and the operator should hear about it once,
     // now, rather than per message.
-    let keys = load_keys(&snapshot, &checked)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    tracing::info!(domains = keys.len(), "loaded DKIM signing keys");
+    let derived = derive(&snapshot).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    tracing::info!(domains = derived.keys.len(), "loaded DKIM signing keys");
 
     Ok(Auth {
         pipeline: Arc::new(pipeline),
-        srs: Arc::new(srs),
         runtime: Arc::new(RuntimeState {
             current: std::sync::RwLock::new(Arc::new(Runtime {
                 snapshot: Arc::new(snapshot),
-                keys,
+                keys: derived.keys,
+                srs: derived.srs,
             })),
-            derive_keys: Box::new(move |snapshot| load_keys(snapshot, &checked)),
+            ring_fingerprint: std::sync::Mutex::new(ring_fingerprint(&ring_path)),
+            ring_path,
+            derive,
         }),
     })
+}
+
+/// A content hash of the SRS ring file, or `None` if it cannot be read.
+///
+/// An unreadable ring is deliberately *not* a change: it would otherwise flap
+/// between present and absent while an operator edits it, republishing on every
+/// poll. A ring that stays unreadable is caught the next time it is loaded,
+/// which reports the reason.
+fn ring_fingerprint(path: &Path) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(Sha256::digest(&bytes).into())
 }
 
 /// Parse every signing key the snapshot names.
@@ -245,6 +262,14 @@ struct Runtime {
     snapshot: Arc<pigeon_route::Snapshot>,
     /// Parsed signing keys, by domain, from the paths *this* snapshot names.
     keys: HashMap<String, pigeon_auth::pipeline::SigningKey>,
+    /// The SRS ring, as of this publication.
+    ///
+    /// In here rather than beside it because rotation is the same kind of event
+    /// as a key change: `pigeon srs rotate` writes a new ring, and a daemon
+    /// holding the old one would keep signing return paths with the key that
+    /// was just displaced — which verifies today and stops verifying when the
+    /// operator eventually deletes it.
+    srs: Arc<pigeon_auth::Srs>,
 }
 
 /// The published [`Runtime`], and what it takes to build one.
@@ -261,16 +286,28 @@ struct RuntimeState {
     /// is what has to happen on every publication and the configuration is only
     /// one of its inputs. It also lets a test publish a snapshot and see the
     /// keys rebuilt, which is the property this whole type exists for.
-    derive_keys: KeyLoader,
+    derive: Deriver,
+    /// What the SRS ring file looked like at the last publication.
+    ///
+    /// The database has `data_version` to say it changed; a file has nothing,
+    /// so the content is hashed. It is a handful of lines — hashing it once a
+    /// second is not a cost worth avoiding, and comparing modification times
+    /// would miss a rotation landing inside a timestamp's granularity.
+    ring_fingerprint: std::sync::Mutex<Option<[u8; 32]>>,
+    ring_path: PathBuf,
 }
 
-type KeyLoader = Box<
-    dyn Fn(
-            &pigeon_route::Snapshot,
-        ) -> Result<HashMap<String, pigeon_auth::pipeline::SigningKey>, String>
-        + Send
-        + Sync,
->;
+/// Derives everything a [`Runtime`] holds besides the table itself.
+///
+/// One closure rather than two, because the keys and the SRS ring are published
+/// together for the same reason they are published *with* the table: a state
+/// assembled from two moments is a state nobody configured.
+type Deriver = Box<dyn Fn(&pigeon_route::Snapshot) -> Result<Derived, String> + Send + Sync>;
+
+struct Derived {
+    keys: HashMap<String, pigeon_auth::pipeline::SigningKey>,
+    srs: Arc<pigeon_auth::Srs>,
+}
 
 impl std::fmt::Debug for RuntimeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -289,6 +326,32 @@ impl RuntimeState {
     fn pin(&self) -> Arc<Runtime> {
         Arc::clone(&self.current.read().expect("runtime lock poisoned"))
     }
+
+    /// Republish if the SRS ring file has changed since the last publication.
+    ///
+    /// Driven by the existing reload worker rather than by a watcher of its
+    /// own: a second publisher would be a second thing that can install a
+    /// runtime, and the ordering between the two would have to be reasoned
+    /// about every time either changed. One publisher, one order.
+    ///
+    /// `None` when nothing changed.
+    fn reconcile_ring(&self) -> Option<Result<(), String>> {
+        let current = ring_fingerprint(&self.ring_path);
+        if current == *self.ring_fingerprint.lock().expect("ring lock poisoned") {
+            return None;
+        }
+
+        // The table is republished as it stands: what has to be rebuilt is what
+        // is *derived* from it, which now includes the ring.
+        let snapshot = (*self.pin().snapshot).clone();
+        Some(pigeon_route::Publish::publish(self, snapshot))
+    }
+}
+
+impl reload::Reconcile for RuntimeState {
+    fn reconcile(&self) -> Option<Result<(), String>> {
+        self.reconcile_ring()
+    }
 }
 
 impl pigeon_route::Publish for RuntimeState {
@@ -296,10 +359,11 @@ impl pigeon_route::Publish for RuntimeState {
         // Keys first: a snapshot whose keys will not load is not installed at
         // all. The previous runtime keeps serving, which is the same rule the
         // detector applies to a configuration that will not build.
-        let keys = (self.derive_keys)(&snapshot)?;
+        let derived = (self.derive)(&snapshot)?;
         *self.current.write().expect("runtime lock poisoned") = Arc::new(Runtime {
             snapshot: Arc::new(snapshot),
-            keys,
+            keys: derived.keys,
+            srs: derived.srs,
         });
         Ok(())
     }
@@ -313,7 +377,6 @@ impl pigeon_route::Publish for RuntimeState {
 #[derive(Clone)]
 struct Auth {
     pipeline: Arc<pigeon_auth::pipeline::Pipeline>,
-    srs: Arc<pigeon_auth::Srs>,
     runtime: Arc<RuntimeState>,
 }
 
@@ -556,14 +619,14 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
         // it again at delivery would let a key rotation or a date change between
         // the two produce a return path that differs from the one a receiver was
         // given.
-        if let Some(auth) = &self.auth
+        if let Some(runtime) = transaction.as_ref()
             && !envelope.sender.is_empty()
         {
             let (local, domain) = envelope
                 .sender
                 .rsplit_once('@')
                 .unwrap_or((envelope.sender.as_str(), ""));
-            match auth.srs.forward(local, domain, pigeon_auth::Day::now()) {
+            match runtime.srs.forward(local, domain, pigeon_auth::Day::now()) {
                 Ok(rewritten) => envelope.sender = rewritten,
                 Err(e) => {
                     // The over-long case was refused at RCPT, before acceptance
@@ -1312,8 +1375,12 @@ async fn run() -> io::Result<()> {
     let auth_runtime = auth.as_ref().map(|a| Arc::clone(&a.runtime));
 
     let return_path = auth.as_ref().map(|a| {
-        let srs = Arc::clone(&a.srs);
+        // The published runtime rather than a captured ring: a rotation must
+        // change what this refuses as well as what the pipeline signs, and both
+        // read the same state.
+        let runtime = Arc::clone(&a.runtime);
         Arc::new(move |sender: &str| {
+            let srs = Arc::clone(&runtime.pin().srs);
             let (local, domain) = sender.rsplit_once('@').unwrap_or((sender, ""));
             match srs.forward(local, domain, pigeon_auth::Day::now()) {
                 Err(pigeon_auth::SrsError::TooLong { octets }) => Err(octets),
@@ -1773,6 +1840,8 @@ mod tests {
 
     // ------------------------------------------------------- authenticated e2e
 
+    static RING_SEQ: AtomicU64 = AtomicU64::new(0);
+
     /// One RSA key for every authenticated test: generation dominates the run
     /// otherwise.
     fn e2e_key() -> &'static str {
@@ -1825,51 +1894,55 @@ mod tests {
         .expect("the fixture configuration should build")
         .snapshot;
 
-        let mut keys = HashMap::new();
-        if with_key {
-            keys.insert(
-                domain.to_string(),
-                pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(e2e_key(), domain, "sel")
-                    .unwrap(),
-            );
-        }
+        // The fixture ring, written to a real file so the reconciliation path
+        // has something to hash and a rotation test has something to replace.
+        let ring_path = std::env::temp_dir().join(format!(
+            "pigeon-ring-{}-{}.key",
+            std::process::id(),
+            RING_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &ring_path,
+            "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\n",
+        )
+        .expect("write the fixture ring");
+
+        let derive_path = ring_path.clone();
+        let derive: Deriver = Box::new(move |snapshot| {
+            let mut keys = HashMap::new();
+            if with_key {
+                for domain in snapshot.domains() {
+                    keys.insert(
+                        domain.to_string(),
+                        pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(e2e_key(), domain, "sel")
+                            .unwrap(),
+                    );
+                }
+            }
+            let ring = pigeon_auth::KeyRing::load(&derive_path)
+                .map_err(|e| format!("fixture ring: {e}"))?;
+            Ok(Derived {
+                keys,
+                srs: Arc::new(pigeon_auth::Srs::new(ring, "pigeon.test")),
+            })
+        });
+
+        let derived = derive(&snapshot).expect("the fixture should derive");
 
         Auth {
             pipeline: Arc::new(pigeon_auth::pipeline::Pipeline::new(
                 pigeon_auth::verify::Verifier::from_system().unwrap(),
                 "pigeon.test",
             )),
-            srs: Arc::new(pigeon_auth::Srs::new(
-                pigeon_auth::KeyRing::parse(
-                    "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
-                )
-                .unwrap(),
-                "pigeon.test",
-            )),
             runtime: Arc::new(RuntimeState {
                 current: std::sync::RwLock::new(Arc::new(Runtime {
                     snapshot: Arc::new(snapshot),
-                    keys,
+                    keys: derived.keys,
+                    srs: derived.srs,
                 })),
-                // Rebuilt on every publication from the same fixture key, so a
-                // reload in a test installs keys the same way production does.
-                derive_keys: Box::new(move |snapshot| {
-                    let mut keys = HashMap::new();
-                    if with_key {
-                        for domain in snapshot.domains() {
-                            keys.insert(
-                                domain.to_string(),
-                                pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(
-                                    e2e_key(),
-                                    domain,
-                                    "sel",
-                                )
-                                .unwrap(),
-                            );
-                        }
-                    }
-                    Ok(keys)
-                }),
+                ring_fingerprint: std::sync::Mutex::new(ring_fingerprint(&ring_path)),
+                ring_path,
+                derive,
             }),
         }
     }
@@ -2333,7 +2406,9 @@ mod tests {
         // file that has been removed between reloads.
         let broken = Arc::new(RuntimeState {
             current: std::sync::RwLock::new(Arc::clone(&before)),
-            derive_keys: Box::new(|_| Err("the key file is gone".into())),
+            derive: Box::new(|_| Err("the key file is gone".into())),
+            ring_fingerprint: std::sync::Mutex::new(None),
+            ring_path: PathBuf::from("/nonexistent/ring.key"),
         });
 
         let published = broken.publish(pigeon_route::Snapshot::default());
@@ -2389,6 +2464,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rotated_ring_reaches_a_running_daemon() {
+        // `pigeon srs rotate` writes a new ring while the daemon runs. A daemon
+        // holding the one it started with would keep issuing return paths under
+        // the displaced key — which verify today and stop verifying the moment
+        // an operator deletes it, so the failure arrives weeks later as bounces
+        // that cannot be routed home.
+        let auth = e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true);
+        let runtime = Arc::clone(&auth.runtime);
+
+        // Nothing to reconcile until the file changes.
+        assert!(
+            runtime.reconcile_ring().is_none(),
+            "an unchanged ring was republished"
+        );
+
+        let before = runtime
+            .pin()
+            .srs
+            .forward("alice", "remote.test", pigeon_auth::Day::now())
+            .expect("the fixture ring signs");
+
+        // A rotation: a new key first, the old one kept for verification.
+        std::fs::write(
+            &runtime.ring_path,
+            "2 2026-06-01T00:00:00Z - //79/Pv6+fj39vX08/Lx8O/u7ezr6uno5+bl5OPi4eA=\n\
+             1 2026-01-01T00:00:00Z 2026-06-01T00:00:00Z AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\n",
+        )
+        .expect("write the rotated ring");
+
+        assert!(
+            matches!(runtime.reconcile_ring(), Some(Ok(()))),
+            "the rotated ring was not picked up"
+        );
+
+        let after = runtime
+            .pin()
+            .srs
+            .forward("alice", "remote.test", pigeon_auth::Day::now())
+            .expect("the rotated ring signs");
+        assert_ne!(
+            before, after,
+            "the daemon is still signing with the displaced key"
+        );
+
+        // And the address issued under the old key still reverses, which is the
+        // whole point of keeping it in the ring.
+        let local = before.rsplit_once('@').unwrap().0;
+        let reversed = runtime
+            .pin()
+            .srs
+            .reverse(local, pigeon_auth::Day::now())
+            .expect("an address issued before the rotation stopped reversing");
+        assert_eq!(reversed.address, "alice@remote.test");
+        assert_eq!(reversed.key_id, 1, "the wrong key verified it");
+    }
+
+    #[tokio::test]
+    async fn a_ring_that_cannot_be_read_keeps_the_previous_one() {
+        // The same rule the table follows: a state that will not load does not
+        // replace one that works. Signing return paths is the last thing that
+        // should stop because somebody mistyped a file.
+        let auth = e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true);
+        let runtime = Arc::clone(&auth.runtime);
+        let before = runtime.pin();
+
+        std::fs::write(&runtime.ring_path, "not a key ring at all\n").expect("write");
+        match runtime.reconcile_ring() {
+            Some(Err(e)) => assert!(e.contains("ring"), "{e}"),
+            other => panic!("an unusable ring was accepted: {other:?}"),
+        }
+
+        assert!(
+            Arc::ptr_eq(&before, &runtime.pin()),
+            "the previous ring was replaced by one that could not be loaded"
+        );
+    }
+
+    #[tokio::test]
     async fn the_return_path_on_the_wire_reverses_to_the_original_sender() {
         // What SRS is *for*: a bounce sent to the address the receiver was
         // given has to find its way back. Asserted on the address the daemon
@@ -2401,7 +2554,7 @@ mod tests {
         let tmp = TempDir::new("e2e-srs-reverse");
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
         let auth = e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true);
-        let srs = Arc::clone(&auth.srs);
+        let srs = Arc::clone(&auth.runtime.pin().srs);
         let (addr, spool) = spawn_authenticated(tmp.path(), peer_addr, auth).await;
 
         submit(

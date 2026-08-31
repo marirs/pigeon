@@ -91,6 +91,7 @@
 //! also stable — see `docs/CLI.md`.
 
 mod import;
+mod srs;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -178,6 +179,25 @@ enum Command {
         #[command(subcommand)]
         verb: Option<RouteVerb>,
     },
+    /// The SRS key ring that signs return paths.
+    Srs {
+        #[command(subcommand)]
+        verb: Option<SrsVerb>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SrsVerb {
+    /// Show the ring: which key signs, which still verify, and when each may
+    /// be deleted.
+    Keys,
+    /// Add a new signing key, keeping the old ones for verification.
+    ///
+    /// Never deletes. An SRS address issued before the rotation stays valid
+    /// until its window expires, and a bounce is often the last thing to
+    /// arrive — so the key that signed it has to outlive the mail, and only an
+    /// operator can know that it has.
+    Rotate,
 }
 
 #[derive(Subcommand)]
@@ -538,6 +558,17 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
             }
             Some(v) => import_cmd(cli, v),
         },
+        Command::Srs { verb } => {
+            let path = srs_ring_path(cli)?;
+            match verb {
+                None => {
+                    print_help("srs");
+                    Ok(exit::OK)
+                }
+                Some(SrsVerb::Keys) => srs::keys(&path, cli.json),
+                Some(SrsVerb::Rotate) => srs::rotate(&path, cli.json),
+            }
+        }
         Command::Route { verb } => match verb {
             None => {
                 print_help("route");
@@ -1515,6 +1546,24 @@ EXAMPLES
 /// Required for `domain add`, which is why this is separate from
 /// [`database_path`]: a command that generates a key has to know the one
 /// directory it is allowed to put it in, and `--db` alone does not say.
+/// Where the SRS ring lives.
+///
+/// From the configuration when there is one, because that is the file the
+/// daemon reads and rotating a different one would look like it worked. There
+/// is deliberately no guess: the keys directory can be inferred from the
+/// database's location, but a ring is a single file with no conventional name
+/// beside it, and rotating the wrong path writes a ring nothing will ever load.
+fn srs_ring_path(cli: &Cli) -> anyhow::Result<PathBuf> {
+    match &cli.config {
+        Some(p) => Ok(pigeon_config::Config::load(p)?.srs_secret_file),
+        None => anyhow::bail!(
+            "the SRS ring is named in the configuration, so --config is required here\n\n  \
+             It is one file with no conventional location beside the database, and\n  \
+             rotating the wrong path writes a ring the daemon will never load."
+        ),
+    }
+}
+
 fn keys_root(cli: &Cli) -> anyhow::Result<PathBuf> {
     if let Some(p) = &cli.config {
         return Ok(pigeon_config::Config::load(p)?.keys);

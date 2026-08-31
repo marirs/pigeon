@@ -8,6 +8,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use pigeon_route::{Publish, Tick, Watcher};
+
+/// State the detector cannot see, reconciled by the same worker.
+///
+/// The database announces its own changes through `data_version`. A file does
+/// not, so whatever watches for one has to look — and it must look from inside
+/// the single publication path, not beside it.
+pub trait Reconcile {
+    /// Republish if what is on disk has changed. `None` when nothing has.
+    fn reconcile(&self) -> Option<Result<(), String>>;
+}
+
+impl Reconcile for pigeon_route::Router {
+    /// A bare `Router` holds nothing derived from a file.
+    fn reconcile(&self) -> Option<Result<(), String>> {
+        None
+    }
+}
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -67,7 +84,7 @@ impl Reloader {
     ///
     /// The connection is opened inside the worker and owned by it, so it is
     /// closed when the worker ends rather than at process teardown.
-    pub fn start<P: Publish + Send + Sync + 'static>(
+    pub fn start<P: Publish + Reconcile + Send + Sync + 'static>(
         path: PathBuf,
         router: Arc<P>,
         watcher: Watcher,
@@ -104,6 +121,20 @@ impl Reloader {
                 // the signal a drop actually produces.
                 if *stopped.borrow_and_update() || stopped.has_changed().is_err() {
                     return;
+                }
+
+                // State that lives outside the database is reconciled by the
+                // same worker, in the same loop, through the same publisher.
+                // A watcher of its own would be a second thing that installs a
+                // runtime, and the ordering between the two would have to be
+                // reasoned about every time either changed.
+                match router.reconcile() {
+                    None => {}
+                    Some(Ok(())) => tracing::info!("SRS ring reloaded"),
+                    Some(Err(e)) => tracing::warn!(
+                        error = %e,
+                        "the SRS ring on disk cannot be used; the previous one is still in use"
+                    ),
                 }
 
                 match watcher.tick(&conn, router.as_ref()) {

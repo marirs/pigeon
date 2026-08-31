@@ -412,7 +412,8 @@ failure surfaces at a stranger's MTA as an unroutable address and nothing in
 Pigeon's logs says a key went missing.
 
 `pigeon srs rotate` prints the earliest safe deletion date for the key it
-displaces; `pigeon srs keys` shows it per key. Neither deletes. An operator
+displaces; `pigeon srs keys` shows it per key, and whether that date has
+passed. Neither deletes. An operator
 does, or does not, and the date is on record either way.
 
 **Queue retries reuse the address, not the algorithm.** The return path is

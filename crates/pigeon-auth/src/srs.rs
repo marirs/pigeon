@@ -155,6 +155,39 @@ pub struct Key {
     secret: Zeroizing<Vec<u8>>,
 }
 
+impl Key {
+    /// The secret, base64-encoded.
+    ///
+    /// Exists for exactly one caller: `pigeon srs rotate`, which rewrites the
+    /// ring file and must carry every existing key across unchanged. Anything
+    /// else that reaches for this is about to put key material somewhere it
+    /// does not belong — which is why `Debug` still refuses to print it.
+    pub fn secret_base64(&self) -> String {
+        base64_encode(&self.secret)
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 impl std::fmt::Debug for Key {
     /// Never the secret. `KeyPair` learned this the same way — a `Debug` that
     /// prints key material puts it in every error log that formats the value.

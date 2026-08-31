@@ -48,6 +48,44 @@ pub fn rfc5322_date(unix_seconds: i64) -> String {
 ///
 /// Howard Hinnant's `civil_from_days`, which is exact for the whole range and
 /// avoids the loop-over-years approach that gets leap centuries wrong.
+/// Format a Unix timestamp as RFC 3339, UTC.
+///
+/// For the SRS ring file, whose `created` column an operator reads. RFC 5322's
+/// form is for mail headers; this one sorts lexicographically, which is what a
+/// column of dates in a file wants.
+///
+/// ```text
+/// 2026-08-31T12:47:18Z
+/// ```
+pub fn rfc3339_utc(unix_seconds: i64) -> String {
+    const DAY: i64 = 86_400;
+    let days = unix_seconds.div_euclid(DAY);
+    let secs = unix_seconds.rem_euclid(DAY);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// Days since the Unix epoch for a civil date, the inverse of
+/// [`civil_from_days`].
+///
+/// For arithmetic on the dates in the SRS ring: "this key may be deleted thirty
+/// days after it stopped signing" is a question about days, and turning a
+/// stored timestamp into one is the only way to answer it.
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = i64::from((month + 9) % 12);
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     // Shift the epoch to 0000-03-01 so leap days land at the end of the cycle.
     let z = z + 719_468;

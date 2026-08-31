@@ -20,5 +20,5 @@ pub mod datetime;
 pub mod domain;
 
 pub use address::{Address, AddressBuf, AddressError};
-pub use datetime::rfc5322_date;
+pub use datetime::{days_from_civil, rfc3339_utc, rfc5322_date};
 pub use domain::{DeliveryMode, DomainGate, DomainStatus, ForwardPolicy};

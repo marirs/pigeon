@@ -124,8 +124,7 @@ and `M1-FINDINGS.md` for why.
       bare CR/LF anywhere in the payload is transport-converted to CRLF before
       signing, and an unterminated final line gains the CRLF the end-of-data
       marker requires (`M2-DESIGN.md` §2)
-- [x] SRS key ring, rotation, and the retirement barrier (the `pigeon srs`
-      commands that print the safe deletion date are still to come)
+- [x] SRS key ring, rotation, and the retirement barrier
 - [x] DKIM signing for the `rewrite_from` path
 - [x] Authentication-Results
 - [x] ARC validation
@@ -143,13 +142,24 @@ Exit criteria:
 
 Forwarded mail is accepted with passing authentication by every major receiving provider, verified against real mailboxes rather than local tests.
 
-**Everything except that criterion is done.** The pipeline is wired into the
-delivery path and its output is verified cryptographically rather than by
-inspection: the tests parse what the daemon actually transmitted and validate
-the ARC set and the DKIM signature against the test key, offline. What remains
-is the part no local test can stand in for — a real domain, real DNS records,
-and mail that arrives in somebody's inbox — plus the `pigeon srs` commands
-above.
+**Status: implementation complete, acceptance pending.**
+
+Every item above is built and tested. The pipeline is wired into the delivery
+path and its output is verified cryptographically rather than by inspection —
+the tests parse what the daemon actually transmitted and validate the ARC set
+and the DKIM signature against the test key, offline.
+
+What has *not* happened is the exit criterion itself: no message has been
+forwarded to a real mailbox at a real provider. That needs a domain, published
+DNS records and an internet-facing host, none of which exist yet.
+
+This milestone calls itself go/no-go, so the distinction matters. Nothing below
+this line should be treated as building on proven ground: every provider has
+acceptance behaviour that no local test reproduces, and finding out during
+Milestone 5 that Gmail dislikes something about the ARC set means unwinding
+work built on top of it. Proceeding to Milestone 3 before this is run is a
+deliberate risk, taken with the failure mode stated: **durability built around
+mail that providers reject.**
 
 ---
 
