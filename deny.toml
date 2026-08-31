@@ -98,7 +98,29 @@ deny = [
     { name = "openssl" },
     { name = "openssl-sys" },
     { name = "openssl-src" },
-    { name = "openssl-probe" },
+    # openssl-probe is deliberately NOT banned. Reviewed at version 0.2.1.
+    #
+    # It reaches this workspace on Linux only, through
+    # `mail-auth`'s `ring` feature -> `hickory-resolver/rustls-platform-verifier`
+    # -> `rustls-native-certs` -> `openssl-probe`.
+    #
+    # What it does: locates CA certificate files and directories by reading
+    # `SSL_CERT_FILE`/`SSL_CERT_DIR` and then stat-ing a compiled-in list of
+    # well-known system paths. It also exposes `try_init_openssl_env_vars`, an
+    # `unsafe` helper that *sets* those two variables — but nothing here calls
+    # it: `rustls-native-certs-0.8.4/src/unix.rs:4` calls `probe()`, and that is
+    # the only call site in the graph.
+    #
+    # Allowed because the ban above is about system-library coupling — locating
+    # a shared object, matching versions across hosts, inheriting a
+    # distribution's patch schedule — and this crate has none of it. No
+    # `build.rs`, no `links` key, no dependencies, no FFI. It is named after
+    # OpenSSL's filesystem conventions; it does not link, load, or require
+    # OpenSSL.
+    #
+    # RE-AUDIT on a version bump or a change of call path. If something in the
+    # graph starts calling the environment-mutating helper, this entry stops
+    # being justified and the crate goes back on the list.
     { name = "native-tls" },
     { name = "tokio-native-tls" },
     { name = "hyper-tls" },

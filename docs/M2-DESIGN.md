@@ -525,18 +525,31 @@ openssl-probe 0.2.1
         └── hickory-net 0.26.1 -> hickory-resolver 0.26.1
 ```
 
-`openssl-probe` is on `deny.toml`'s ban list, so **M2 cannot pass the dependency
-gate as the policy currently stands.** Inspected before proposing anything: the
-crate has no `build.rs`, no `links` key, no dependencies, and no FFI. It is a
-table of certificate directory paths and two environment-variable reads. It is
-named after OpenSSL's filesystem conventions; it does not link, load, or require
-OpenSSL.
+`openssl-probe` was on `deny.toml`'s ban list, so **M2 could not pass the
+dependency gate as the policy stood.** Inspected before proposing anything, and
+described precisely, because "two environment reads" undersells it:
+
+- `probe()` reads `SSL_CERT_FILE` and `SSL_CERT_DIR`, then **stats a
+  compiled-in list of well-known certificate files and directories** and
+  returns what exists.
+- The crate also exposes `try_init_openssl_env_vars`, an `unsafe` helper that
+  **sets** those two variables — process-global mutation, and the reason the
+  function is `unsafe`.
+- **Pigeon's path does not reach it.** `rustls-native-certs-0.8.4/src/unix.rs:4`
+  calls `probe()`, and that is the only call site anywhere in the graph. No
+  linking, no loading, no FFI, no environment mutation.
+- No `build.rs`, no `links` key, no dependencies.
 
 That matters because of *why* the ban exists. `deny.toml` says the concern "is
 not C code as such. It is the system-library coupling that comes with it" —
 locating a shared object, matching versions across hosts, inheriting a
 distribution's patch schedule. `openssl-probe` has none of those properties, so
-it is caught by a rule whose stated rationale does not apply to it. See R-9.
+it was caught by a rule whose stated rationale does not apply to it.
+
+**Ruled (R-9): removed from the ban list, alone.** Every actual OpenSSL,
+native-TLS and AWS-LC name stays. The review is recorded beside the entry in
+`deny.toml`, including the call path and the re-audit trigger — a version bump,
+or anything in the graph starting to call the environment-mutating helper.
 
 ---
 
@@ -631,9 +644,9 @@ and must be answered by experiment, not by reading documentation.
 
 ---
 
-## 9. Rulings — settled
+## 9. Rulings — settled, and the design is frozen
 
-All eight are ruled. What follows is the decision, not the argument for it;
+All nine are ruled. What follows is the decision, not the argument for it;
 where a ruling came with conditions, the conditions are in the section named.
 
 **R-1 — normalise after verification. Approved, widened.** Bare CR and bare LF
@@ -700,10 +713,15 @@ named after OpenSSL's filesystem conventions. The ban's own stated rationale is
 "not C code as such… the system-library coupling that comes with it", and this
 crate has none of that coupling.
 
-**Recommended:** remove `openssl-probe` from the ban list, with the inspection
-recorded beside the entry, and keep every other name. The alternative —
-abandoning `ring` — means `aws-lc-rs`, which is banned for reasons that *do*
-apply. **This one is not yet ruled and needs an answer before implementation.**
+**Ruled: `openssl-probe` is removed from the ban list, and nothing else is.**
+Every actual OpenSSL, native-TLS and AWS-LC name stays — the alternative to
+`ring` is `aws-lc-rs`, which is banned for reasons that genuinely apply.
+
+The justification recorded in `deny.toml` states the call path rather than a
+character reference for the crate: `rustls-native-certs` calls `probe()`, not
+the `unsafe` environment-mutating helper, and that distinction is what the
+allowance rests on. It is therefore re-auditable, and marked to be re-audited on
+a version bump or a change of call path.
 
 ## 10. Tests
 
