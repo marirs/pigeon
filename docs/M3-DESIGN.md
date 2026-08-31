@@ -551,9 +551,25 @@ left to implementation:
 **Measured and now frozen** (§11.2): `AuthenticatedMessage::parse` takes a
 `&[u8]`, so the raw file is **mapped** — a chunked reader cannot satisfy it. A
 map removes the 50 MB heap allocation and does not remove working-set pressure,
-which is why the semaphore is part of the ruling rather than a tuning knob, and
-why it is **sized from CPU count rather than connection count**: the worst case
-is ~23 ms of CPU per megabyte and about twice the message in resident memory.
+which is why the semaphore is part of the ruling rather than a tuning knob.
+
+**The limit is the smaller of two bounds, not the CPU one alone:**
+
+```text
+permits = min(CPU-derived limit, memory_budget / worst_case_resident_bytes)
+```
+
+CPU count bounds how fast the work goes; it does not bound how much of it is
+resident at once. At roughly twice the message size per permit, a 64-core host
+sizing purely from cores would allow ~64 × 2 × `max_message_size` — several
+gigabytes at a 50 MB ceiling — and the map does not help, because mapped pages
+that are being hashed are resident pages.
+
+`memory_budget` is configured, not inferred: a host's total memory is not
+Pigeon's to spend, and inferring a fraction of it would make the limit change
+when an unrelated service is installed. `worst_case_resident_bytes` is derived
+from `max_message_size`, so lowering the message ceiling raises concurrency
+rather than being a separate knob to keep consistent.
 
 **R-6 — one coordinator. Ruled.** C-3's two options were a coordinator or a
 composite `(lineage, revision)` epoch; the coordinator wins because the epoch's
@@ -583,18 +599,33 @@ throughput nothing needs.
 the message survives, and the measurements show what each setting actually
 survives:
 
-| Setting | Survives a process crash | Survives power loss | Cost |
+| Setting | Survives a process crash | Survives power loss | Cost, this machine |
 |---|---|---|---|
 | `synchronous=NORMAL` | yes | **no** | 0.05 ms |
-| `synchronous=FULL`, `fullfsync=off` | yes | **not on macOS** | 0.08 ms |
-| `synchronous=FULL`, `fullfsync=ON` | yes | yes | 4.9 ms |
+| `synchronous=FULL`, no `fullfsync` | yes | **not on macOS** | 0.08 ms |
+| `synchronous=FULL` + `fullfsync` | yes | yes, here | 4.9 ms |
 
-Recommended: **`synchronous=FULL`, and `fullfsync=ON` where the platform has
-it**, with the cost stated in the operator documentation rather than discovered.
+**The contract is `synchronous=FULL` plus the strongest barrier the platform
+offers**, not "`fullfsync=ON`". `fullfsync` is a macOS-specific pragma mapping
+to `F_FULLFSYNC`; on other platforms setting it is inert, and there the question
+becomes whether `fsync` reaches stable media at all — which is a property of the
+filesystem, the device and its write cache, not of SQLite. Linux `fsync` on a
+consumer SSD with a volatile cache and barriers disabled is exactly as unsafe as
+`fullfsync=off` here, and nothing in the pragma reports that.
+
+So the ruling has two halves:
+
+- **Configure** `synchronous=FULL`, plus `fullfsync` where it exists.
+- **Verify per platform.** The durability claim is not established by setting a
+  pragma; it needs a power-loss test, or an explicit statement that the operator
+  has satisfied themselves about the storage stack. Until that verification
+  exists for a platform, the documentation says what was measured and where —
+  not "acknowledged mail survives power loss" as though it were universal.
+
 A forwarder that loses acknowledged mail on a power cut has broken the one
-promise this milestone is about — and 68 messages a second is not a constraint
-worth trading it for. An operator who knowingly wants the weaker setting can
-have it, as a documented choice with the failure mode named.
+promise this milestone is about, and the local ceiling in §11.1 is not a
+constraint worth trading it for. An operator who knowingly wants the weaker
+setting can have it, as a documented choice with the failure mode named.
 
 ---
 
@@ -604,7 +635,7 @@ Two of the four are done, on an Apple-silicon laptop with an NVMe SSD, release
 build. Absolute numbers are machine-specific; the *shapes* are not, and the
 shapes are what the design turns on.
 
-### 11.1 Acceptance-path cost is barriers, not rows
+### 11.1 Acceptance cost is barriers, not rows — and acceptance is not the bottleneck
 
 ```text
 transaction only, WAL
@@ -626,11 +657,18 @@ rate (205 vs 205); a 5 MB body costs 4.6 ms more than a 50 KB one across the
 whole path, against ~15 ms of barriers. Acceptance is three durability barriers
 — the spool file, its directory, the WAL commit — and everything else is noise.
 
-**So batching does not belong in the initial implementation.** At ~68 messages
-per second the ceiling is ~5.9 million a day, which is not the constraint for
-the deployments this is being built for. Group commit is the lever if it ever
-becomes one, and it is worth ~9× (205 → 1,876) because it amortises the barrier
-rather than the work. Recorded here so nobody has to re-derive it; **R-8** below
+**So batching does not belong in the initial implementation.** ~68 messages per
+second is a **local acceptance-path ceiling on this machine** — what one process
+can make durable and acknowledge — and it is neither an end-to-end rate nor a
+daily capacity. Real throughput is governed by what happens after the `250`: DNS,
+connection setup, remote servers, their rate limits, and retries against
+destinations that are slow or down. Those dominate, and none of them is helped
+by committing faster.
+
+The finding is therefore narrow and sufficient: **acceptance is not the
+bottleneck**, so building batching now would optimise the one stage that is not
+the constraint. Group commit is the lever if that ever changes, and it is worth
+~9× (205 → 1,876) because it amortises the barrier rather than the work. Recorded here so nobody has to re-derive it; **R-8** below
 defers it explicitly rather than leaving it unmentioned.
 
 **The durability knob is worth more than the batching one, and it is a
@@ -674,11 +712,14 @@ per signature — but body hashing was already bounded by the library, at roughl
 
 **Worst case per message is therefore about 23 ms/MB** (4 body hashes on
 receipt, normalise, sign, seal), so a 50 MB message is a bit over a second of
-CPU. Concurrency has to be bounded by that, not by connection count: 256
-connections each entitled to a second of CPU and ~2× the message in working set
-is the denial of service R-5 exists to prevent. **The semaphore is sized from
-CPU count**, and the mapped raw file removes the heap copy without removing the
-pressure — peak RSS above is three buffers of a 25 MB message.
+CPU and about twice its size resident. 256 connections each entitled to that is
+the denial of service R-5 exists to prevent.
+
+Both quantities bound the semaphore, and **the CPU one alone does not** — see
+R-5: cores decide how fast the work runs, and nothing about them limits how much
+of it is resident at once. A large-core host sized from cores would permit
+gigabytes of pressure, and the map does not help because pages being hashed are
+resident pages. Peak RSS above is three buffers of a 25 MB message.
 
 ### 11.3 Still to measure, before the parts that need them
 
