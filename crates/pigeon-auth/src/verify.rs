@@ -79,6 +79,54 @@ impl Relayable {
         self.was_converted
     }
 
+    /// Remove every field with this name from the header block.
+    ///
+    /// Returns how many were removed. Folded continuation lines go with the
+    /// field they belong to — a header is not a line, and removing only the
+    /// first line of a folded `From:` leaves its continuation behind as a
+    /// syntactically valid field of its own.
+    ///
+    /// Scoped to the header block: the terminating blank line stops the scan,
+    /// so a body line that happens to read like a header is left alone.
+    pub fn remove_headers(&mut self, name: &str) -> usize {
+        let mut out = Vec::with_capacity(self.bytes.len());
+        let mut removed = 0;
+        let mut rest: &[u8] = &self.bytes;
+        let mut dropping = false;
+
+        while !rest.is_empty() {
+            let (line, tail) = split_line(rest);
+            rest = tail;
+
+            // The blank line ends the header block; everything after it is
+            // body and is copied verbatim.
+            if line == b"\r\n" || line == b"\n" || line.is_empty() {
+                out.extend_from_slice(line);
+                out.extend_from_slice(rest);
+                break;
+            }
+
+            let continuation = line.first().is_some_and(|b| *b == b' ' || *b == b'\t');
+            if continuation {
+                if dropping {
+                    continue;
+                }
+            } else {
+                dropping = field_name_is(line, name);
+                if dropping {
+                    removed += 1;
+                }
+            }
+
+            if !dropping {
+                out.extend_from_slice(line);
+            }
+        }
+
+        self.bytes = out;
+        removed
+    }
+
     /// Prepend header lines, topmost first.
     ///
     /// Existing headers are never touched — not reordered, refolded, re-encoded
@@ -97,6 +145,34 @@ impl Relayable {
         out.extend_from_slice(&self.bytes);
         self.bytes = out;
     }
+}
+
+/// Split off one line, keeping its terminator.
+fn split_line(input: &[u8]) -> (&[u8], &[u8]) {
+    match input.iter().position(|&b| b == b'\n') {
+        Some(i) => input.split_at(i + 1),
+        None => (input, &[]),
+    }
+}
+
+/// Whether a header line starts the named field.
+///
+/// Compared case-insensitively, and only up to the colon: RFC 5322 allows
+/// whitespace before it, and a sender that writes `From :` is naming the same
+/// field as one that writes `From:`.
+fn field_name_is(line: &[u8], name: &str) -> bool {
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    let field = &line[..colon];
+    let trimmed: &[u8] = {
+        let end = field
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map_or(0, |i| i + 1);
+        &field[..end]
+    };
+    trimmed.eq_ignore_ascii_case(name.as_bytes())
 }
 
 // ------------------------------------------------------------------ envelope
@@ -526,6 +602,81 @@ mod tests {
         let relayable = Received::new(CONFORMING).normalise();
         assert!(!relayable.was_converted());
         assert_eq!(relayable.as_bytes(), CONFORMING);
+    }
+
+    // ------------------------------------------------------ header removal
+
+    fn removed(message: &[u8], name: &str) -> (String, usize) {
+        let mut r = Received::new(message).normalise();
+        let n = r.remove_headers(name);
+        (String::from_utf8(r.as_bytes().to_vec()).unwrap(), n)
+    }
+
+    #[test]
+    fn every_matching_field_is_removed_with_its_continuations() {
+        let (out, n) = removed(
+            b"From: <a@x.example>\r\nTo: <b@y.example>\r\nFrom: \"Folded\"\r\n <c@z.example>\r\n\r\nbody\r\n",
+            "From",
+        );
+        assert_eq!(n, 2);
+        assert!(!out.contains("a@x.example"), "{out}");
+        assert!(!out.contains("c@z.example"), "{out}");
+        assert!(!out.contains("Folded"), "{out}");
+        assert!(out.contains("To: <b@y.example>"), "{out}");
+        assert!(out.ends_with("\r\nbody\r\n"), "{out}");
+    }
+
+    #[test]
+    fn removal_stops_at_the_body() {
+        // A body line that reads like a header is body. Scanning past the
+        // blank line would let a quoted email in the text of a message delete
+        // part of it — silent corruption, and only for messages that quote
+        // mail, which is most of them.
+        let (out, n) = removed(
+            b"From: <a@x.example>\r\nSubject: hi\r\n\r\nQuoting you:\r\nFrom: <someone@else.example>\r\nregards\r\n",
+            "From",
+        );
+        assert_eq!(n, 1, "a body line was counted as a header");
+        assert!(
+            out.contains("From: <someone@else.example>"),
+            "a body line was deleted:\n{out}"
+        );
+        assert!(out.contains("regards"), "{out}");
+    }
+
+    #[test]
+    fn a_similarly_named_field_is_left_alone() {
+        // `From-Original:` and `X-From:` are different fields. Matching by
+        // prefix would delete headers a forwarder is often the one to add.
+        let (out, n) = removed(
+            b"From-Original: <a@x.example>\r\nX-From: <b@y.example>\r\nFrom: <c@z.example>\r\n\r\nbody\r\n",
+            "From",
+        );
+        assert_eq!(n, 1);
+        assert!(out.contains("From-Original: <a@x.example>"), "{out}");
+        assert!(out.contains("X-From: <b@y.example>"), "{out}");
+        assert!(!out.contains("c@z.example"), "{out}");
+    }
+
+    #[test]
+    fn whitespace_before_the_colon_still_names_the_field() {
+        // RFC 5322 allows it, and a sender that writes `From :` is naming the
+        // same field. Missing it would leave the author's header in place
+        // beside Pigeon's.
+        let (out, n) = removed(
+            b"From : <a@x.example>\r\nSubject: hi\r\n\r\nbody\r\n",
+            "From",
+        );
+        assert_eq!(n, 1, "`From :` was not recognised:\n{out}");
+        assert!(!out.contains("a@x.example"), "{out}");
+    }
+
+    #[test]
+    fn removing_a_field_that_is_not_there_changes_nothing() {
+        let original = b"To: <b@y.example>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let (out, n) = removed(original, "From");
+        assert_eq!(n, 0);
+        assert_eq!(out.as_bytes(), original);
     }
 
     #[test]

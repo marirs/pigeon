@@ -25,15 +25,16 @@
 //!                                             Outbound { owns its bytes }
 //! ```
 
+use std::sync::Arc;
+
 use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
-use zeroize::Zeroizing;
 
 use mail_auth::{
     AuthenticatedMessage,
     arc::ArcSealer,
     common::{
-        crypto::{RsaKey, Sha256},
-        headers::HeaderWriter,
+        crypto::{Algorithm, RsaKey, Sha256, SigningKey as MailAuthSigningKey},
+        headers::{HeaderWriter, Writable},
     },
     dkim::DkimSigner,
 };
@@ -72,9 +73,36 @@ const SIGNED_HEADERS: [&str; 8] = [
 /// exception rests on `rsa` being used only to *generate* keys, and signing
 /// stays entirely on `ring` (`M2-DESIGN.md` §6.1).
 pub struct SigningKey {
-    der: Zeroizing<Vec<u8>>,
+    key: SharedKey,
     domain: String,
     selector: String,
+}
+
+/// A parsed key that can be handed to `mail-auth` more than once.
+///
+/// `DkimSigner::from_key` and `ArcSealer::from_key` each take a key **by
+/// value**, and `RsaKey` is neither `Clone` nor implemented for references. The
+/// obvious workaround — keep the DER and parse per use — signs and seals with
+/// two freshly parsed keys per message, which puts two more copies of the
+/// private components in memory that nothing zeroizes, and hands an attacker a
+/// per-message RSA key parse for free.
+///
+/// So the key is parsed once, at startup, and shared. The wrapper is what makes
+/// that possible: it implements `mail-auth`'s public `SigningKey` trait by
+/// forwarding to the `Arc`, so a clone costs a refcount.
+#[derive(Clone)]
+struct SharedKey(Arc<RsaKey<Sha256>>);
+
+impl MailAuthSigningKey for SharedKey {
+    type Hasher = Sha256;
+
+    fn sign(&self, input: impl Writable) -> mail_auth::Result<Vec<u8>> {
+        self.0.sign(input)
+    }
+
+    fn algorithm(&self) -> Algorithm {
+        self.0.algorithm()
+    }
 }
 
 impl std::fmt::Debug for SigningKey {
@@ -91,6 +119,11 @@ impl std::fmt::Debug for SigningKey {
 
 impl SigningKey {
     /// Load from the PKCS#8 PEM that `dkim::KeyPair::generate` writes.
+    ///
+    /// Parsed here and only here, so a key that cannot sign is a startup
+    /// failure rather than a per-message one — and so the DER, which is the
+    /// form the private components arrive in, is dropped before this returns
+    /// rather than kept for re-parsing.
     pub fn from_pkcs8_pem(
         pem: &str,
         domain: impl Into<String>,
@@ -98,23 +131,13 @@ impl SigningKey {
     ) -> Result<Self, PipelineError> {
         let der = PrivatePkcs8KeyDer::from_pem_slice(pem.as_bytes())
             .map_err(|e| PipelineError::Key(e.to_string()))?;
-        let key = Self {
-            der: Zeroizing::new(der.secret_pkcs8_der().to_vec()),
+        let key = RsaKey::<Sha256>::from_key_der(PrivateKeyDer::Pkcs8(der))
+            .map_err(|e| PipelineError::Key(e.to_string()))?;
+        Ok(Self {
+            key: SharedKey(Arc::new(key)),
             domain: domain.into(),
             selector: selector.into(),
-        };
-        // Parsed once here so a bad key is a startup failure rather than a
-        // per-message one: a key that cannot sign is a configuration problem,
-        // and finding out at delivery time means finding out per message.
-        key.rsa()?;
-        Ok(key)
-    }
-
-    fn rsa(&self) -> Result<RsaKey<Sha256>, PipelineError> {
-        RsaKey::<Sha256>::from_key_der(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            self.der.as_slice(),
-        )))
-        .map_err(|e| PipelineError::Key(e.to_string()))
+        })
     }
 }
 
@@ -122,6 +145,9 @@ impl SigningKey {
 pub enum PipelineError {
     #[error("the signing key could not be read: {0}")]
     Key(String),
+
+    #[error("the rewritten From: address is not usable: {0}")]
+    InvalidRewrite(String),
 
     /// R-8, and the one failure that must not be forwarded.
     ///
@@ -141,7 +167,65 @@ pub enum Rewrite {
     Preserve,
     /// Replace it with an address in a Pigeon-controlled domain, which **must**
     /// then be signed by that domain.
-    From { header: String },
+    From(FromAddress),
+}
+
+/// A validated address for a rewritten `From:`.
+///
+/// A plain `String` was wrong twice over. It let a caller pass a whole header
+/// line, so a value containing CRLF would inject headers of its own — the
+/// message is assembled by concatenation, and a newline in a field value is
+/// indistinguishable from the end of that field. And it invited the caller to
+/// build the header text, which is this module's job.
+///
+/// Constructed only through [`FromAddress::new`], which parses the address with
+/// the same code the envelope uses, so CR, LF, angle brackets and everything
+/// else structural are refused rather than escaped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FromAddress {
+    address: String,
+    display: Option<String>,
+}
+
+impl FromAddress {
+    pub fn new(address: &str) -> Result<Self, PipelineError> {
+        pigeon_types::Address::parse(address)
+            .map_err(|e| PipelineError::InvalidRewrite(e.to_string()))?;
+        Ok(Self {
+            address: address.to_string(),
+            display: None,
+        })
+    }
+
+    /// Add a display name, which is also validated.
+    ///
+    /// Anything structural in a display name — a quote, a CR, a LF — would
+    /// change what the header means, so it is refused rather than quoted.
+    /// Quoting correctly is possible; refusing is checkable.
+    pub fn with_display_name(mut self, display: &str) -> Result<Self, PipelineError> {
+        if display
+            .bytes()
+            .any(|b| b == b'"' || b == b'\\' || b == b'\r' || b == b'\n' || b == b'<' || b == b'>')
+        {
+            return Err(PipelineError::InvalidRewrite(
+                "the display name contains a character that would change the header".into(),
+            ));
+        }
+        self.display = Some(display.to_string());
+        Ok(self)
+    }
+
+    pub fn domain(&self) -> &str {
+        self.address.rsplit_once('@').map_or("", |(_, d)| d)
+    }
+
+    /// The header line, built here rather than by the caller.
+    fn header(&self) -> String {
+        match &self.display {
+            Some(name) => format!("From: \"{name}\" <{}>", self.address),
+            None => format!("From: <{}>", self.address),
+        }
+    }
 }
 
 /// The finished message, owning its bytes.
@@ -264,15 +348,26 @@ impl Pipeline {
         payload.prepend_headers(&headers);
 
         let mut signed = false;
-        if let Rewrite::From { header } = rewrite {
-            payload.prepend_headers(std::slice::from_ref(header));
+        if let Rewrite::From(from) = rewrite {
+            // Replaced, not prepended. Leaving the author's `From:` below a new
+            // one produces a message with two of a field RFC 5322 permits once,
+            // and receivers disagree about which one counts — a `h=from`
+            // signature ordinarily covers the *last* occurrence, so Pigeon
+            // would sign the original and display its own.
+            let replaced = payload.remove_headers("From");
+            payload.prepend_headers(&[from.header()]);
+            debug_assert!(
+                replaced <= 1 || cfg!(test),
+                "a message carried {replaced} From: fields"
+            );
+            let _ = replaced;
 
             // R-8: a rewritten From: is never forwarded unsigned.
             let key = self
                 .signing
                 .as_ref()
                 .ok_or_else(|| PipelineError::UnsignedRewrite("no signing key".into()))?;
-            let signature = DkimSigner::from_key(key.rsa()?)
+            let signature = DkimSigner::from_key(key.key.clone())
                 .domain(&key.domain)
                 .selector(&key.selector)
                 .headers(SIGNED_HEADERS)
@@ -329,10 +424,7 @@ impl Pipeline {
         let default_arc = mail_auth::ArcOutput::default();
         let arc = arc_output.unwrap_or(&default_arc);
 
-        let Ok(rsa) = key.rsa() else {
-            return (false, Some(SealSkipped::Failed));
-        };
-        match ArcSealer::from_key(rsa)
+        match ArcSealer::from_key(key.key.clone())
             .domain(&key.domain)
             .selector(&key.selector)
             .headers(SIGNED_HEADERS)
@@ -481,9 +573,7 @@ mod tests {
                 MESSAGE,
                 &envelope(),
                 RECEIVED,
-                &Rewrite::From {
-                    header: "From: <forward@pigeon.test>".to_string(),
-                },
+                &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
             )
             .await
             .unwrap();
@@ -504,6 +594,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rewrite_replaces_the_original_from_rather_than_adding_one() {
+        // Prepending leaves a message with two From: fields, which RFC 5322
+        // permits once. Receivers then disagree about which one counts, and a
+        // `h=from` signature ordinarily covers the last occurrence — so Pigeon
+        // would sign the author's header and display its own.
+        let out = pipeline(true)
+            .process(
+                MESSAGE,
+                &envelope(),
+                RECEIVED,
+                &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let body = text(&out);
+        assert_eq!(
+            body.matches("\r\nFrom:").count() + usize::from(body.starts_with("From:")),
+            1,
+            "the message carries more than one From: field:\n{body}"
+        );
+        assert!(body.contains("From: <forward@pigeon.test>"));
+        assert!(
+            !body.contains("alice@sender.example>\r\n"),
+            "the author's From: survived:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folded_from_is_removed_whole() {
+        // A header is not a line. Removing only the first line of a folded
+        // From: leaves its continuation behind, which then parses as a field
+        // of its own — and one that starts with whitespace, so it attaches to
+        // whatever Pigeon prepended above it.
+        let folded = b"From: \"A Long Display Name\"\r\n <alice@sender.example>\r\n                       To: <bob@example.com>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let out = pipeline(true)
+            .process(
+                folded,
+                &envelope(),
+                RECEIVED,
+                &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let body = text(&out);
+        // Scoped to the continuation line itself. The author's address still
+        // appears legitimately inside `Authentication-Results` as
+        // `smtp.mailfrom=`, which is a record of the envelope and not a header
+        // that survived — an assertion on the bare address would have been
+        // green for the wrong reason, or red for a correct one.
+        assert!(
+            !body.contains(" <alice@sender.example>"),
+            "the folded continuation survived as its own field:\n{body}"
+        );
+        assert!(
+            !body.contains("A Long Display Name"),
+            "the first line of the folded From: survived:\n{body}"
+        );
+        assert!(body.contains("From: <forward@pigeon.test>"));
+    }
+
+    #[test]
+    fn a_rewrite_address_containing_crlf_is_refused() {
+        // The reason the value is a type rather than a String: the message is
+        // assembled by concatenation, so a newline in a field value is
+        // indistinguishable from the end of that field.
+        for bad in [
+            "a@b.example\r\nBcc: victim@example.com",
+            "a@b.example\nX-Injected: yes",
+            "a@b.example\rX",
+            "<a@b.example>",
+        ] {
+            assert!(
+                FromAddress::new(bad).is_err(),
+                "{bad:?} was accepted as a rewrite address"
+            );
+        }
+    }
+
+    #[test]
+    fn a_display_name_containing_structure_is_refused() {
+        let ok = FromAddress::new("a@b.example").unwrap();
+        for bad in ["has \"quotes\"", "has\r\nnewline", "has <brackets>"] {
+            assert!(
+                ok.clone().with_display_name(bad).is_err(),
+                "{bad:?} was accepted as a display name"
+            );
+        }
+        assert!(ok.with_display_name("Perfectly Fine").is_ok());
+    }
+
+    #[tokio::test]
     async fn a_rewrite_without_a_key_is_refused_rather_than_sent_unsigned() {
         // The one local failure that must not degrade. An unsigned rewrite
         // fails DMARC on a domain Pigeon controls, which is worse than not
@@ -513,9 +696,7 @@ mod tests {
                 MESSAGE,
                 &envelope(),
                 RECEIVED,
-                &Rewrite::From {
-                    header: "From: <forward@pigeon.test>".to_string(),
-                },
+                &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
             )
             .await
             .unwrap_err();

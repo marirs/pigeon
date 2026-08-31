@@ -196,9 +196,20 @@ ARC-Seal: i=N                     <- added last, signs the set below
 ARC-Message-Signature: i=N        <- signs the message including everything below
 ARC-Authentication-Results: i=N   <- what step 2-3 measured
 Received: by pigeon ...           <- this hop
-Authentication-Results: ...       <- optional, R-5
+Authentication-Results: ...       <- always, when authentication ran (R-5)
 <original message, untouched>
 ```
+
+Under `rewrite_from` the author's `From:` is **replaced**, not preceded. Every
+existing `From:` field is removed — folded continuations included, since a
+header is not a line — and exactly one generated field is inserted. Prepending
+would leave a message with two of a field RFC 5322 permits once, receivers
+disagree about which one counts, and a `h=from` signature ordinarily covers the
+*last* occurrence: Pigeon would sign the author's header and display its own.
+
+The address is a validated type rather than a header string, so a caller cannot
+supply a value containing CRLF. The message is assembled by concatenation, which
+makes a newline in a field value indistinguishable from the end of that field.
 
 The `Received:` header is inserted before sealing, so the ARC-Message-Signature
 covers it. That is deliberate: it is part of the message Pigeon relays, and a

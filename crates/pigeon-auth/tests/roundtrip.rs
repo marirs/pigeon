@@ -23,7 +23,7 @@ use mail_auth::{
 };
 use pigeon_auth::{
     dkim::KeyPair,
-    pipeline::{Pipeline, Rewrite, SigningKey},
+    pipeline::{FromAddress, Pipeline, Rewrite, SigningKey},
     verify::{Envelope, Verifier},
 };
 
@@ -153,9 +153,7 @@ async fn pigeons_own_signature_verifies_against_the_message_it_sent() {
             MESSAGE,
             &envelope(),
             RECEIVED,
-            &Rewrite::From {
-                header: format!("From: <forward@{DOMAIN}>"),
-            },
+            &Rewrite::From(FromAddress::new(&format!("forward@{DOMAIN}")).unwrap()),
         )
         .await
         .unwrap();
@@ -210,9 +208,7 @@ async fn the_arc_set_verifies_against_the_message_it_sent() {
             MESSAGE,
             &envelope(),
             RECEIVED,
-            &Rewrite::From {
-                header: format!("From: <forward@{DOMAIN}>"),
-            },
+            &Rewrite::From(FromAddress::new(&format!("forward@{DOMAIN}")).unwrap()),
         )
         .await
         .unwrap();
@@ -290,4 +286,84 @@ async fn a_chain_that_arrived_failed_is_not_extended() {
         1,
         "a second set was added"
     );
+}
+
+#[tokio::test]
+async fn tampering_with_the_rewritten_from_breaks_the_signature() {
+    // The point of signing a rewritten From: at all. If the header can be
+    // changed after signing and the signature still verifies, the rewrite is
+    // decoration — anyone between here and the receiver could put a different
+    // sender on a message Pigeon vouched for.
+    //
+    // Also the assertion that proves the *replacement* is the signed header:
+    // the message carries exactly one From:, and it is the one being altered.
+    let pair = KeyPair::generate(2048).unwrap();
+    let stub = TxtStub::with_key(
+        &pigeon_auth::dkim::record_name(SELECTOR, DOMAIN),
+        &pair.txt_record(),
+    );
+
+    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN).with_signing_key(
+        SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap(),
+    );
+
+    let out = pipeline
+        .process(
+            MESSAGE,
+            &envelope(),
+            RECEIVED,
+            &Rewrite::From(FromAddress::new(&format!("forward@{DOMAIN}")).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    let good = String::from_utf8(out.payload.as_bytes().to_vec()).unwrap();
+    assert_eq!(
+        good.matches("\r\nFrom:").count() + usize::from(good.starts_with("From:")),
+        1,
+        "the message carries more than one From: field"
+    );
+
+    let tampered = good.replace(
+        &format!("From: <forward@{DOMAIN}>"),
+        &format!("From: <attacker@{DOMAIN}>"),
+    );
+    assert_ne!(
+        tampered, good,
+        "the From: header was not found to tamper with"
+    );
+
+    let authenticator = MessageAuthenticator::new_system_conf().unwrap();
+    // The failure *kind* is mail-auth's business; what matters here is only
+    // that it stops being a pass.
+    for (label, message) in [
+        ("as sent", good.as_bytes()),
+        ("tampered", tampered.as_bytes()),
+    ] {
+        let parsed = AuthenticatedMessage::parse(message).unwrap();
+        let results = authenticator
+            .verify_dkim(Parameters {
+                params: &parsed,
+                cache_txt: Some(&stub),
+                cache_mx: None::<&TxtStub>,
+                cache_ptr: None::<&TxtStub>,
+                cache_ipv4: None::<&TxtStub>,
+                cache_ipv6: None::<&TxtStub>,
+            })
+            .await;
+
+        let ours = results
+            .iter()
+            .find(|r| r.signature().is_some_and(|s| s.d == DOMAIN))
+            .unwrap_or_else(|| panic!("Pigeon's signature is missing ({label})"));
+
+        match (label, ours.result()) {
+            ("as sent", DkimResult::Pass) => {}
+            ("as sent", other) => panic!("the message as sent does not verify: {other:?}"),
+            ("tampered", DkimResult::Pass) => {
+                panic!("the signature still verifies after the From: was changed")
+            }
+            _ => {}
+        }
+    }
 }
