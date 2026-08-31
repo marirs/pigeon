@@ -47,7 +47,11 @@ jobs:
 
       - name: Assert no OpenSSL
         run: |
-          if grep -Eiq '(^|[^a-z-])(openssl|openssl-sys|openssl-src|openssl-probe|native-tls|tokio-native-tls|hyper-tls|aws-lc-rs|aws-lc-sys)([^a-z-]|$)' /tmp/tree.txt; then
+          # openssl-probe is deliberately absent from this list, matching
+          # deny.toml: it locates certificate files and has no OpenSSL
+          # system-library coupling. See the note there, including the call
+          # path the allowance depends on.
+          if grep -Eiq '(^|[^a-z-])(openssl|openssl-sys|openssl-src|native-tls|tokio-native-tls|hyper-tls|aws-lc-rs|aws-lc-sys)([^a-z-]|$)' /tmp/tree.txt; then
             echo "::error::A banned TLS backend entered the dependency graph."
             echo
             echo "Offending paths:"
@@ -73,6 +77,22 @@ jobs:
             exit 1
           fi
           echo "No RSA decryption in the source tree."
+
+      # SRS tag comparison must be constant-time (M2-DESIGN.md §5.2). No test
+      # can catch this: a `==` comparison is functionally identical and only
+      # differs in timing, so every SRS test passes with the property gone.
+      # Mutation-checked and confirmed uncatchable, which is exactly when a
+      # source guard is the right instrument.
+      - name: Assert constant-time SRS tag comparison
+        run: |
+          if ! grep -q 'ct_eq' crates/pigeon-auth/src/srs.rs; then
+            echo "::error::SRS tag comparison is no longer constant-time."
+            echo
+            echo "A byte-at-a-time compare leaks the tag prefix to anyone who"
+            echo "can time a bounce, turning 2^40 guesses into 8 x 32."
+            exit 1
+          fi
+          echo "SRS tag comparison uses a constant-time equality."
 
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2

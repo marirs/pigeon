@@ -103,6 +103,14 @@ rusqlite = { version = "0.40", features = ["bundled", "backup", "hooks"] }
 # Migration checksums (M1-SCHEMA.md I2). Pure Rust, RustCrypto.
 sha2 = "0.10"
 
+# SRS tags: HMAC-SHA-256 truncated to 40 bits (M2-DESIGN.md §5.2).
+hmac = "0.12"
+
+# Constant-time comparison of those tags. A byte-at-a-time compare of an
+# 8-character tag leaks its prefix to anyone who can measure a bounce, which
+# turns 2^40 guesses into 8 x 32.
+subtle = "2"
+
 # Zeroizing<String> for DKIM private key material. Already in the graph via rsa;
 # named directly so the dependency is visible where it is relied on.
 zeroize = { version = "1", features = ["std"] }

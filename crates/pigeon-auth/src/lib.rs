@@ -34,7 +34,9 @@
 #![forbid(unsafe_code)]
 
 pub mod dkim;
+pub mod srs;
 
 pub use dkim::{DkimError, KeyPair};
+pub use srs::{Day, KeyRing, Srs, SrsError};
 
-// M2: SRS0/SRS1 encode+decode with replay window, DKIM verify/sign, ARC seal.
+// M2: DKIM verify/sign and ARC seal. SRS is in `srs`.
