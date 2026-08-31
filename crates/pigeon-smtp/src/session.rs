@@ -94,6 +94,14 @@ impl Envelope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub envelope: Envelope,
+    /// The client's address, and the name it gave in EHLO.
+    ///
+    /// Carried on the message because SPF is evaluated against the connecting
+    /// IP, and the sink is where authentication happens. Recovering them by
+    /// parsing the `Received:` header back would mean trusting a header this
+    /// process just wrote for a fact it already had.
+    pub peer: std::net::IpAddr,
+    pub helo: String,
     /// The `Received:` header, already CRLF-terminated.
     pub received: String,
     /// The body exactly as it arrived, dot-unstuffed and otherwise untouched.

@@ -30,7 +30,7 @@
 mod reload;
 mod startup;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -138,8 +138,120 @@ impl std::fmt::Display for ForwardError {
 }
 
 /// Where mail lands, and what is allowed to arrive.
+/// Resolve the authentication machinery once, at startup.
+///
+/// Everything here is a *local* configuration question, so every failure stops
+/// the process rather than being discovered one message at a time. A missing
+/// SRS ring means every forwarded message loses its return path; a `rewrite_from`
+/// domain with no usable key means every message for it would have to be
+/// refused at delivery, after acceptance — which is the outcome R-4 exists to
+/// avoid, arrived at from the other side.
+fn build_auth(
+    started: &startup::Started,
+    router: Arc<pigeon_route::Router>,
+    hostname: &str,
+) -> io::Result<Auth> {
+    use pigeon_auth::pipeline::SigningKey;
+
+    let checked = &started.config;
+    let cfg = checked.config();
+
+    let ring = pigeon_auth::KeyRing::load(&cfg.srs_secret_file).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "SRS key ring {} is unusable: {e}",
+                cfg.srs_secret_file.display()
+            ),
+        )
+    })?;
+    let srs = pigeon_auth::Srs::new(ring, hostname.to_string());
+
+    let verifier = pigeon_auth::verify::Verifier::from_system()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("resolver: {e}")))?;
+    let pipeline = pigeon_auth::pipeline::Pipeline::new(verifier, hostname.to_string());
+
+    // Keys are loaded from the paths the snapshot named, resolved against the
+    // configured root — the row is operator-editable, so without containment it
+    // could name any file the daemon can read.
+    let snapshot = router.for_transaction();
+    let mut keys = HashMap::new();
+    for domain in snapshot.domains() {
+        let Some(forwarding) = snapshot.forwarding(domain) else {
+            continue;
+        };
+        let Some(identity) = &forwarding.dkim else {
+            // A domain that rewrites `From:` and cannot sign it would have to
+            // be refused per message. Refuse to start instead: it is one
+            // message either way, and this one names the domain.
+            if forwarding.policy == pigeon_types::ForwardPolicy::RewriteFrom {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "domain {domain} is set to rewrite_from and has no active DKIM key; \
+                         a rewritten From: that cannot be signed fails DMARC on a domain \
+                         Pigeon controls"
+                    ),
+                ));
+            }
+            continue;
+        };
+
+        let path = checked
+            .resolve_key(&identity.private_key_path)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("DKIM key for {domain}: {e}"),
+                )
+            })?;
+        let pem = std::fs::read_to_string(&path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("DKIM key for {domain} at {}: {e}", path.display()),
+            )
+        })?;
+        let key = SigningKey::from_pkcs8_pem(&pem, domain, &identity.selector).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("DKIM key for {domain}: {e}"),
+            )
+        })?;
+        keys.insert(domain.to_string(), key);
+    }
+
+    tracing::info!(domains = keys.len(), "loaded DKIM signing keys");
+
+    Ok(Auth {
+        pipeline: Arc::new(pipeline),
+        keys: Arc::new(keys),
+        srs: Arc::new(srs),
+        router,
+    })
+}
+
+/// Everything the authentication pipeline needs, resolved at startup.
+///
+/// One `Pipeline` for the process, one parsed key per domain, one `Srs`. All
+/// shared: the keys and the SRS ring are key material, and a copy per message
+/// would be a copy of the key material per message.
+#[derive(Clone)]
+struct Auth {
+    pipeline: Arc<pigeon_auth::pipeline::Pipeline>,
+    /// Parsed signing keys, by domain. Loaded once, from the paths the snapshot
+    /// named, resolved against the configured key root.
+    keys: Arc<HashMap<String, pigeon_auth::pipeline::SigningKey>>,
+    srs: Arc<pigeon_auth::Srs>,
+    /// The routing table, for the forwarding policy and the key selection. The
+    /// same table the accept decision came from.
+    router: Arc<pigeon_route::Router>,
+}
+
 struct SpoolSink<R: MxLookup> {
     dir: Arc<PathBuf>,
+    /// Absent on the Milestone 0 environment path, where there is no database
+    /// and so no policy, no keys and no SRS ring.
+    auth: Option<Auth>,
     /// Recipients to accept. Empty means accept anything, which is only
     /// reasonable while there is no real routing table.
     accept: Arc<HashSet<String>>,
@@ -157,12 +269,71 @@ impl<R: MxLookup> Clone for SpoolSink<R> {
     fn clone(&self) -> Self {
         Self {
             dir: Arc::clone(&self.dir),
+            auth: self.auth.clone(),
             accept: Arc::clone(&self.accept),
             counter: Arc::clone(&self.counter),
             boot: self.boot,
             forwarding: self.forwarding.clone(),
         }
     }
+}
+
+/// Run the authentication pipeline for this message.
+///
+/// The forwarding policy and the signing key come from the snapshot the
+/// routing decision was made against, selected by the recipient's domain —
+/// the domain Pigeon accepted the mail *for*, which is the identity it
+/// forwards under and the one an ARC seal should carry.
+///
+/// One recipient decides it, because fan-out does not exist yet: a message
+/// to several domains is Milestone 3's problem, where each destination gets
+/// independently durable state. Until then the first recipient is the
+/// policy, and that is a documented narrowing rather than an oversight.
+async fn authenticate(
+    auth: &Auth,
+    peer: std::net::IpAddr,
+    helo: &str,
+    envelope: &Envelope,
+    received: &str,
+    body: &[u8],
+) -> Result<pigeon_auth::pipeline::Outbound, pigeon_auth::pipeline::PipelineError> {
+    use pigeon_auth::pipeline::Rewrite;
+
+    // Pinned for the whole transaction, so the policy that decides how this
+    // message is signed is the one that accepted it.
+    let snapshot = auth.router.for_transaction();
+
+    let recipient_domain = envelope
+        .recipients
+        .first()
+        .and_then(|r| pigeon_types::Address::parse(r).ok())
+        .map(|a| a.domain().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let forwarding = snapshot.forwarding(&recipient_domain);
+    let signing = auth.keys.get(&recipient_domain);
+
+    let rewrite = match forwarding.map(|f| f.policy) {
+        Some(pigeon_types::ForwardPolicy::RewriteFrom) => {
+            // The rewritten address is in the domain that signs it, which is
+            // what makes the DMARC pass aligned. Anything else would sign
+            // one domain's mail with another's key.
+            let address = format!("srs@{recipient_domain}");
+            Rewrite::From(pigeon_auth::pipeline::FromAddress::new(&address)?)
+        }
+        _ => Rewrite::Preserve,
+    };
+
+    let envelope_view = pigeon_auth::verify::Envelope {
+        client_ip: peer,
+        helo,
+        mail_from: &envelope.sender,
+        host_domain: "",
+    };
+
+    auth.pipeline
+        .process(body, &envelope_view, received, &rewrite, signing)
+        .await
 }
 
 impl<R: MxLookup + 'static> MessageSink for SpoolSink<R> {
@@ -189,12 +360,71 @@ impl<R: MxLookup + 'static> MessageSink for SpoolSink<R> {
     async fn deliver(&self, message: Message) -> Result<String, DataError> {
         let id = self.next_id();
         let Message {
-            envelope,
+            mut envelope,
+            peer,
+            helo,
             received,
             body,
         } = message;
 
-        match self.write_message(&id, &envelope, &received, &body).await {
+        // Authentication happens here, before anything is written, because the
+        // spooled bytes must be the bytes that go on the wire: a retry that
+        // re-derived the relay form would be a second chance to derive it
+        // differently, and the ARC set signs one of the two.
+        //
+        // `received` comes from the SMTP layer, which already built it for this
+        // hop — trace headers are the only cross-system loop guard there is,
+        // and a second generator here would be a second answer to "which host
+        // handled this?".
+        let processed = match &self.auth {
+            Some(auth) => {
+                match authenticate(auth, peer, &helo, &envelope, &received, &body).await {
+                    Ok(out) => Some(out),
+                    Err(e) => {
+                        // R-8. A rewritten `From:` that cannot be signed fails DMARC
+                        // on a domain Pigeon controls, which is worse than not
+                        // rewriting — so it is never written or sent. 451: the key
+                        // is a local problem and the sender may usefully retry once
+                        // an operator has fixed it.
+                        tracing::error!(%id, error = %e, "refusing a message that cannot be signed");
+                        return Err(DataError::Temporary);
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // The envelope sender is rewritten **once**, here, and carried. Deriving
+        // it again at delivery would let a key rotation or a date change between
+        // the two produce a return path that differs from the one a receiver was
+        // given.
+        if let Some(auth) = &self.auth
+            && !envelope.sender.is_empty()
+        {
+            let (local, domain) = envelope
+                .sender
+                .rsplit_once('@')
+                .unwrap_or((envelope.sender.as_str(), ""));
+            match auth.srs.forward(local, domain, pigeon_auth::Day::now()) {
+                Ok(rewritten) => envelope.sender = rewritten,
+                Err(e) => {
+                    // The over-long case was refused at RCPT, before acceptance
+                    // (R-4). Anything reaching here is a local fault, and the
+                    // message still forwards — with SPF failing at the receiver,
+                    // which is the pre-SRS status quo rather than lost mail.
+                    tracing::error!(%id, error = %e, "forwarding without an SRS return path");
+                }
+            }
+        }
+
+        let (received, body) = match &processed {
+            // One buffer: the pipeline's output already carries the trace
+            // header, the authentication results and the ARC set.
+            Some(out) => ("", out.payload.as_bytes()),
+            None => (received.as_str(), body.as_slice()),
+        };
+
+        match self.write_message(&id, &envelope, received, body).await {
             Ok(()) => {
                 let from = display_sender(&envelope);
                 tracing::info!(
@@ -202,8 +432,26 @@ impl<R: MxLookup + 'static> MessageSink for SpoolSink<R> {
                     %from,
                     to = ?envelope.recipients,
                     bytes = received.len() + body.len(),
+                    sealed = processed.as_ref().map(|p| p.sealed),
+                    signed = processed.as_ref().map(|p| p.signed),
                     "accepted"
                 );
+                if let Some(out) = &processed
+                    && let Some(reason) = out.seal_skipped
+                {
+                    // A missing ARC set degrades to the pre-ARC status quo,
+                    // which is survivable — but silently, which is why it is an
+                    // error and not a debug line. `ChainAlreadyFailed` is the
+                    // exception: that one is correct behaviour, not a fault.
+                    match reason {
+                        pigeon_auth::pipeline::SealSkipped::ChainAlreadyFailed => {
+                            tracing::debug!(%id, "not extending a chain that arrived cv=fail");
+                        }
+                        other => {
+                            tracing::error!(%id, reason = ?other, "forwarded without an ARC seal")
+                        }
+                    }
+                }
 
                 // Acknowledge now that the message is durable, and forward
                 // separately. Holding the SMTP session open for the length of
@@ -877,12 +1125,16 @@ async fn run() -> io::Result<()> {
         Err(e) => tracing::warn!(error = %e, "could not read the spool directory"),
     }
 
-    let sink = SpoolSink {
-        dir: Arc::new(sink_dir),
-        accept: Arc::new(accept),
-        counter: Arc::new(AtomicU64::new(0)),
-        boot: std::process::id(),
-        forwarding,
+    // Everything the authentication pipeline needs, resolved once here rather
+    // than per message: the SRS ring, the per-domain signing keys, and the
+    // routing table the policy is read from.
+    //
+    // The ring is loaded once and shared by both users below. Loading it twice
+    // would put two copies of the secret in memory and, worse, allow them to
+    // disagree after a rotation.
+    let auth = match &booted {
+        Some((b, (_, router, _))) => Some(build_auth(b, Arc::clone(router), &hostname)?),
+        None => None,
     };
 
     // R-4: a sender whose rewritten return path would not fit in a 64-octet
@@ -893,34 +1145,28 @@ async fn run() -> io::Result<()> {
     //
     // Absent configuration, no check: a Pigeon with no SRS ring refuses nobody
     // for this reason.
-    let return_path = match &booted {
-        Some((b, _)) => {
-            let path = b.config.config().srs_secret_file.clone();
-            let ring = pigeon_auth::KeyRing::load(&path).map_err(|e| {
-                // Local, unambiguous misconfiguration: an unreadable ring means
-                // every forwarded message would lose its return path, which is
-                // not something to discover one bounce at a time.
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("SRS key ring {} is unusable: {e}", path.display()),
-                )
-            })?;
-            let srs = pigeon_auth::Srs::new(ring, hostname.clone());
-            Some(Arc::new(move |sender: &str| {
-                let (local, domain) = sender.rsplit_once('@').unwrap_or((sender, ""));
-                match srs.forward(local, domain, pigeon_auth::Day::now()) {
-                    Err(pigeon_auth::SrsError::TooLong { octets }) => Err(octets),
-                    // Every other failure is about this host — no signing key,
-                    // a ring that stopped signing — and is not the sender's
-                    // fault. Refusing their mail for it would be blaming them
-                    // for a local fault, and the message still forwards with
-                    // whatever the delivery path can do.
-                    _ => Ok(()),
-                }
-            })
-                as Arc<pigeon_smtp::server::SharedReturnPathCheck>)
-        }
-        None => None,
+    let return_path = auth.as_ref().map(|a| {
+        let srs = Arc::clone(&a.srs);
+        Arc::new(move |sender: &str| {
+            let (local, domain) = sender.rsplit_once('@').unwrap_or((sender, ""));
+            match srs.forward(local, domain, pigeon_auth::Day::now()) {
+                Err(pigeon_auth::SrsError::TooLong { octets }) => Err(octets),
+                // Every other failure is about this host — no signing key, a
+                // ring that stopped signing — and is not the sender's fault.
+                // Refusing their mail for it would be blaming them for a local
+                // fault.
+                _ => Ok(()),
+            }
+        }) as Arc<pigeon_smtp::server::SharedReturnPathCheck>
+    });
+
+    let sink = SpoolSink {
+        dir: Arc::new(sink_dir),
+        auth,
+        accept: Arc::new(accept),
+        counter: Arc::new(AtomicU64::new(0)),
+        boot: std::process::id(),
+        forwarding,
     };
 
     let config = ServerConfig {
@@ -1017,6 +1263,7 @@ mod tests {
     /// without ever being asked anything.
     fn sink(dir: &Path, accept: &[&str]) -> SpoolSink<pigeon_dns::FakeResolver> {
         SpoolSink {
+            auth: None,
             dir: Arc::new(dir.to_path_buf()),
             accept: Arc::new(accept.iter().map(|s| s.to_string()).collect()),
             counter: Arc::new(AtomicU64::new(0)),
@@ -1277,6 +1524,7 @@ mod tests {
         );
 
         let sink = SpoolSink {
+            auth: None,
             dir: Arc::clone(&spool),
             accept: Arc::new(accept.iter().map(|s| s.to_string()).collect()),
             counter: Arc::new(AtomicU64::new(0)),
@@ -1343,6 +1591,400 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
+    }
+
+    // ------------------------------------------------------- authenticated e2e
+
+    /// One RSA key for every authenticated test: generation dominates the run
+    /// otherwise.
+    fn e2e_key() -> &'static str {
+        static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| {
+            pigeon_auth::dkim::KeyPair::generate(2048)
+                .unwrap()
+                .private_pem()
+                .to_string()
+        })
+    }
+
+    /// Build the authentication machinery a wired daemon would build at
+    /// startup, without a database: the snapshot is constructed directly, which
+    /// is the same type `load` produces.
+    ///
+    /// `with_key` false is how the "signing fails at runtime" case is reached —
+    /// startup validation makes it unreachable in production, so a test has to
+    /// assemble it deliberately.
+    fn e2e_auth(domain: &str, policy: pigeon_types::ForwardPolicy, with_key: bool) -> Auth {
+        use pigeon_route::snapshot::{DkimIdentity, DomainInput, Forwarding as RouteForwarding};
+
+        let snapshot = pigeon_route::Snapshot::build(vec![DomainInput {
+            name: domain.into(),
+            gate: pigeon_types::DomainGate {
+                status: pigeon_types::DomainStatus::Active,
+                inbound_enabled: true,
+                outbound_enabled: false,
+            },
+            plus_addressing: true,
+            forwarding: RouteForwarding {
+                policy,
+                dkim: Some(DkimIdentity {
+                    selector: "sel".into(),
+                    private_key_path: "unused-in-test".into(),
+                    algorithm: "rsa2048".into(),
+                }),
+            },
+            default_destination: Some(pigeon_route::snapshot::Destination {
+                local: "me".into(),
+                domain: "example.net".into(),
+            }),
+            aliases: vec![pigeon_route::snapshot::AliasInput {
+                pattern: "hello".into(),
+                reject: false,
+                destinations: vec![],
+            }],
+            catchall: None,
+        }])
+        .expect("the fixture configuration should build")
+        .snapshot;
+
+        let mut keys = HashMap::new();
+        if with_key {
+            keys.insert(
+                domain.to_string(),
+                pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(e2e_key(), domain, "sel")
+                    .unwrap(),
+            );
+        }
+
+        Auth {
+            pipeline: Arc::new(pigeon_auth::pipeline::Pipeline::new(
+                pigeon_auth::verify::Verifier::from_system().unwrap(),
+                "pigeon.test",
+            )),
+            keys: Arc::new(keys),
+            srs: Arc::new(pigeon_auth::Srs::new(
+                pigeon_auth::KeyRing::parse(
+                    "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                )
+                .unwrap(),
+                "pigeon.test",
+            )),
+            router: Arc::new(pigeon_route::Router::new(snapshot)),
+        }
+    }
+
+    async fn spawn_authenticated(
+        dir: &Path,
+        peer_addr: SocketAddr,
+        auth: Auth,
+    ) -> (SocketAddr, Arc<PathBuf>) {
+        use pigeon_dns::{FakeResolver, MxRecord};
+
+        let spool = Arc::new(dir.to_path_buf());
+        let resolver = FakeResolver::new().with(
+            "example.net",
+            vec![MxRecord::new(10, peer_addr.ip().to_string())],
+        );
+
+        let sink = SpoolSink {
+            auth: Some(auth),
+            dir: Arc::clone(&spool),
+            accept: Arc::new(["hello@example.com".to_string()].into_iter().collect()),
+            counter: Arc::new(AtomicU64::new(0)),
+            boot: 0x0bad_cafe,
+            forwarding: Some(Forwarding {
+                resolver: Arc::new(resolver),
+                ehlo_name: "pigeon.test".into(),
+                destination: "dest@example.net".into(),
+                limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
+                port: peer_addr.port(),
+                budget: TOTAL_FORWARD_BUDGET,
+            }),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let config = ServerConfig {
+            hostname: "pigeon.test".into(),
+            ..ServerConfig::default()
+        };
+        tokio::spawn(async move {
+            let _ = pigeon_smtp::serve(listener, config, sink).await;
+        });
+        (addr, spool)
+    }
+
+    /// The single line the peer recorded that carries the message body.
+    fn delivered(transcript: &pigeon_testkit::Transcript) -> String {
+        transcript
+            .lines()
+            .into_iter()
+            .find(|l| l.contains("body line"))
+            .expect("the message never reached the peer")
+    }
+
+    #[tokio::test]
+    async fn preserve_forwards_signed_by_nobody_and_sealed_by_pigeon() {
+        // The whole path: listener, pipeline, spool, scripted peer.
+        let tmp = TempDir::new("e2e-preserve");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (addr, spool) = spawn_authenticated(
+            tmp.path(),
+            peer_addr,
+            e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true),
+        )
+        .await;
+
+        // Captured before the spool is cleaned, so the two can be compared.
+        let replies = submit(
+            addr,
+            "sender@remote.test",
+            "hello@example.com",
+            "From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n",
+        )
+        .await;
+        assert_eq!(replies[5].0, 250, "not accepted: {:?}", replies[5]);
+        assert!(wait_until_spool_is_empty(&spool).await, "never forwarded");
+
+        let sent = delivered(&transcript);
+
+        // The envelope sender is the SRS return path, not the original.
+        assert!(
+            transcript.saw("MAIL FROM:<SRS0="),
+            "the envelope sender was not rewritten: {:?}",
+            transcript.lines()
+        );
+        assert!(
+            !transcript.saw("MAIL FROM:<sender@remote.test>"),
+            "the original sender went out unrewritten"
+        );
+
+        // Everything the pipeline is supposed to have added.
+        assert!(sent.contains("Received: from"), "no trace header:\n{sent}");
+        assert!(
+            sent.contains("Authentication-Results: pigeon.test"),
+            "no authentication results:\n{sent}"
+        );
+        assert!(sent.contains("ARC-Seal:"), "not sealed:\n{sent}");
+        assert!(sent.contains("ARC-Message-Signature:"), "no AMS:\n{sent}");
+        assert!(
+            sent.contains("ARC-Authentication-Results:"),
+            "no AAR:\n{sent}"
+        );
+
+        // Preserve does not add a DKIM signature of Pigeon's own: DMARC is
+        // supposed to pass on the *author's* signature, and adding one here
+        // would be an unaligned pass that changes nothing.
+        assert!(
+            !sent.contains("DKIM-Signature:"),
+            "Preserve signed the message:\n{sent}"
+        );
+
+        // And the original message is still under it all.
+        assert!(sent.contains("From: <sender@remote.test>"), "{sent}");
+        assert!(sent.contains("Subject: hi"), "{sent}");
+    }
+
+    /// A peer that takes the whole transaction and then refuses at the end, so
+    /// the spooled copy survives for comparison.
+    fn refusing_peer() -> pigeon_testkit::Peer {
+        pigeon_testkit::Peer::new()
+            .send("220 test.invalid ESMTP")
+            .read_line() // EHLO
+            .send("250 test.invalid")
+            .read_line() // MAIL FROM
+            .send("250 Ok")
+            .read_line() // RCPT TO
+            .send("250 Ok")
+            .read_line() // DATA
+            .send("354 Go ahead")
+            .read_body()
+            .send("451 4.3.0 try later")
+            .read_line() // QUIT
+            .send("221 Bye")
+            .close()
+    }
+
+    #[tokio::test]
+    async fn what_is_spooled_is_what_is_transmitted() {
+        // A retry must send the same bytes, and the ARC set signs exactly one
+        // of the two forms — so if the spooled copy and the transmitted copy
+        // can differ, one of them is unverifiable and nothing says which.
+        //
+        // The peer refuses at the end of DATA, which leaves the spool file in
+        // place to compare against what it recorded.
+        let tmp = TempDir::new("e2e-spooled");
+        let (peer_addr, transcript) = refusing_peer().spawn().await;
+        let (addr, spool) = spawn_authenticated(
+            tmp.path(),
+            peer_addr,
+            e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true),
+        )
+        .await;
+
+        submit(
+            addr,
+            "sender@remote.test",
+            "hello@example.com",
+            "From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n",
+        )
+        .await;
+
+        // Wait for the peer to have seen the body.
+        let sent = {
+            let mut found = None;
+            for _ in 0..200 {
+                if let Some(line) = transcript
+                    .lines()
+                    .into_iter()
+                    .find(|l| l.contains("body line"))
+                {
+                    found = Some(line);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            found.expect("the message never reached the peer")
+        };
+
+        let spooled = {
+            let mut entries = tokio::fs::read_dir(spool.as_path()).await.expect("spool");
+            let mut eml = None;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().extension().is_some_and(|e| e == "eml") {
+                    eml = Some(tokio::fs::read(entry.path()).await.expect("read spooled"));
+                }
+            }
+            String::from_utf8(eml.expect("the message was not spooled")).expect("utf8")
+        };
+
+        // The wire form is the spooled form, dot-stuffed, plus the end-of-data
+        // marker — which the peer's scan records along with the body, since it
+        // reads *through* the delimiter. Nothing in this message begins a line
+        // with a dot, so stuffing is the identity here and the comparison is
+        // byte-for-byte.
+        assert_eq!(
+            sent,
+            format!("{spooled}.\r\n"),
+            "the transmitted bytes differ from the spooled bytes"
+        );
+        assert!(
+            spooled.ends_with("\r\n"),
+            "the spooled form is unterminated"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_from_replaces_the_sender_and_signs_with_the_domains_key() {
+        // The other policy, end to end. The rewritten address is in the domain
+        // that signs it — that alignment is the entire point, since an
+        // unaligned pass changes nothing for DMARC.
+        let tmp = TempDir::new("e2e-rewrite");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (addr, spool) = spawn_authenticated(
+            tmp.path(),
+            peer_addr,
+            e2e_auth(
+                "example.com",
+                pigeon_types::ForwardPolicy::RewriteFrom,
+                true,
+            ),
+        )
+        .await;
+
+        submit(
+            addr,
+            "sender@remote.test",
+            "hello@example.com",
+            "From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n",
+        )
+        .await;
+        assert!(wait_until_spool_is_empty(&spool).await, "never forwarded");
+
+        let sent = delivered(&transcript);
+
+        // Exactly one From:, and it is Pigeon's.
+        assert_eq!(
+            sent.matches("\r\nFrom:").count() + usize::from(sent.starts_with("From:")),
+            1,
+            "the relayed message has more than one From:\n{sent}"
+        );
+        assert!(
+            sent.contains("From: <srs@example.com>"),
+            "the From: was not rewritten:\n{sent}"
+        );
+        assert!(
+            !sent.contains("From: <sender@remote.test>"),
+            "the author's From: survived:\n{sent}"
+        );
+
+        // Signed by the domain the rewritten address is in, and sealed above
+        // that signature.
+        assert!(
+            sent.contains("DKIM-Signature:") && sent.contains("d=example.com"),
+            "the rewrite was not signed by the domain:\n{sent}"
+        );
+        let seal = sent.find("ARC-Seal:").expect("not sealed");
+        let dkim = sent.find("DKIM-Signature:").expect("not signed");
+        assert!(seal < dkim, "the seal does not cover Pigeon's signature");
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_that_cannot_be_signed_reaches_neither_the_spool_nor_the_peer() {
+        // R-8's runtime half. Startup validation refuses a `rewrite_from`
+        // domain with no usable key, so this state is unreachable in
+        // production — which is exactly why a test has to assemble it: the
+        // rule is that an unsigned rewrite is never written and never sent,
+        // and a rule with no failing case is an assumption.
+        let tmp = TempDir::new("e2e-unsigned");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (addr, spool) = spawn_authenticated(
+            tmp.path(),
+            peer_addr,
+            e2e_auth(
+                "example.com",
+                pigeon_types::ForwardPolicy::RewriteFrom,
+                false,
+            ),
+        )
+        .await;
+
+        let replies = submit(
+            addr,
+            "sender@remote.test",
+            "hello@example.com",
+            "From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n",
+        )
+        .await;
+
+        // Refused at end-of-data, transiently: the key is a local problem and
+        // the sender may usefully retry once an operator has fixed it.
+        assert_eq!(
+            replies[5].0 / 100,
+            4,
+            "an unsignable rewrite was not refused: {:?}",
+            replies[5]
+        );
+
+        // Nothing was written.
+        let mut entries = tokio::fs::read_dir(spool.as_path()).await.expect("spool");
+        let mut spooled = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            spooled.push(entry.file_name());
+        }
+        assert!(
+            spooled.is_empty(),
+            "an unsignable rewrite reached the spool: {spooled:?}"
+        );
+
+        // And nothing was sent. Given a moment, in case the delivery task was
+        // spawned before the refusal.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !transcript.lines().iter().any(|l| l.contains("body line")),
+            "an unsignable rewrite reached the peer: {:?}",
+            transcript.lines()
+        );
     }
 
     #[tokio::test]

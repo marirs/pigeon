@@ -495,6 +495,8 @@ async fn finish_data<S: MessageSink>(
         Err(DataError::TooManyHops)
     } else {
         sink.deliver(Message {
+            peer: peer.ip(),
+            helo: session.peer_name().unwrap_or_default().to_string(),
             envelope,
             received,
             body,

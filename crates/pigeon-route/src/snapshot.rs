@@ -449,6 +449,15 @@ impl Snapshot {
     /// saw the base. Catch-all waits until both forms have been tried
     /// everywhere else, so tagged mail on a catch-all domain still finds its
     /// alias.
+    /// Every domain this table carries, folded.
+    ///
+    /// For startup work that has to touch each one — loading signing keys, for
+    /// instance. Ordering is unspecified, because a `HashMap` has none and
+    /// pretending otherwise invites a caller to depend on it.
+    pub fn domains(&self) -> impl Iterator<Item = &str> {
+        self.domains.keys().map(String::as_str)
+    }
+
     /// How this domain's mail is rewritten and signed on the way out.
     ///
     /// `None` for a domain this table does not carry — the same answer
