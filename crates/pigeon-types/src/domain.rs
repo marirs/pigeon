@@ -114,19 +114,30 @@ pub enum DeliveryMode {
 /// How much of the original message is preserved when forwarding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ForwardPolicy {
-    /// Relay the body byte for byte so the original DKIM signature survives,
-    /// rewriting only the envelope sender via SRS and adding an ARC seal.
-    /// This is the default and the only policy that preserves DMARC alignment
-    /// on the original `From:` domain.
+    /// Relay a *conforming* payload byte for byte so the original DKIM
+    /// signature survives, rewriting only the envelope sender via SRS and
+    /// adding an ARC seal. This is the default and the only policy that
+    /// preserves DMARC alignment on the original `From:` domain.
     ///
-    /// One exception, forced by the protocol rather than chosen: a body whose
-    /// final line is unterminated, or terminated with a bare LF, gains a CRLF
-    /// before the end-of-data marker. The marker only counts at the start of a
-    /// line, so the alternative is a `.` written mid-line that no receiver
-    /// recognises as end-of-data. It is DKIM-safe — RFC 6376 §3.4.3 has the
-    /// signer add the same CRLF during body canonicalisation — but it is not
-    /// literally byte-for-byte, and the difference is worth knowing before
-    /// someone diffs a spooled message against what arrived.
+    /// "Conforming" is load-bearing, and there are two departures.
+    ///
+    /// A payload containing a **bare CR or bare LF anywhere — headers
+    /// included — is transport-converted to CRLF before anything is signed or
+    /// stored**. Relaying those bytes unchanged would hand a lax downstream
+    /// server a message-injection primitive, and a forwarder is the ideal
+    /// amplifier for it: a machine that takes bytes from a stranger and
+    /// re-emits them from a trusted host. RFC 6376 §5.3 puts transport
+    /// conversion before signing, which is where this sits. If the original
+    /// signature covered the nonconforming bytes it will fail downstream —
+    /// recorded as having passed here, which is what the ARC set is for.
+    ///
+    /// And a payload whose final line is unterminated gains a CRLF before the
+    /// end-of-data marker, because the marker only counts at the start of a
+    /// line. It is DKIM-safe — RFC 6376 §3.4.3 has the signer add the same
+    /// CRLF during body canonicalisation.
+    ///
+    /// Both are worth knowing before someone diffs a spooled message against
+    /// what arrived. See `M2-DESIGN.md` §2.
     #[default]
     Preserve,
     /// Replace the `From:` header with a Pigeon-owned address and set

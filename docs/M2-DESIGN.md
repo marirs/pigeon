@@ -40,7 +40,7 @@ why they never learned a message was undeliverable.
 
 ---
 
-## 2. The body contract
+## 2. The payload contract
 
 `ForwardPolicy::Preserve` currently promises the body is relayed "byte for
 byte", and `pigeon-auth`'s module docs repeat it. That is not achievable, and
@@ -55,9 +55,16 @@ statement of which bytes cross which boundary unchanged.
 |---|---|
 | **Wire → receipt** | dot-unstuffed; terminator removed; every other byte as sent |
 | **Receipt → verification** | *exactly* the receipt bytes, unmodified |
-| **Verification → relay form** | receipt bytes + normalisation (R-1) + prepended headers |
+| **Verification → normalised** | bare CR and bare LF → CRLF, **across the whole payload, headers included** |
+| **Normalised → relay form** | + envelope rewrite, prepended headers, Pigeon's DKIM signature, ARC set |
 | **Relay form → spool** | byte-identical to the relay form |
 | **Spool → wire** | dot-stuffed; CRLF added before the marker if not at a line start |
+
+**Nonconforming input is not byte-preserved, and the promise says so.** A payload
+containing a bare CR or bare LF — anywhere, header or body — is transport-
+converted before Pigeon signs or stores anything. RFC 6376 §5.3 puts that
+conversion *before* signing, which is where this sits. What is preserved
+byte-for-byte is a conforming payload: CRLF line endings throughout.
 
 The middle row is the only one that changes bytes, and it changes them *once*,
 before anything is signed or stored. Everything downstream of it — spooling,
@@ -77,7 +84,7 @@ Read from `crates/pigeon-smtp/src/codec.rs`, not from its comments:
 - Over `max_message_size` the bytes are dropped while scanning continues, so the
   session is still answered properly rather than desynchronised.
 
-### 2.3 The bare-LF problem is outbound, not inbound
+### 2.3 Headers are part of the problem, not just the body
 
 Pigeon cannot be smuggled *into*: the reader accepts only `CRLF.CRLF`. What it
 can do is *carry* a smuggling primitive. A body containing `LF . LF` relayed
@@ -89,7 +96,12 @@ This is the 2023–24 SMTP smuggling class, and a forwarder is the ideal
 amplifier for it: it is precisely a machine that takes bytes from a stranger and
 re-emits them from a trusted host.
 
-Three responses, and they are not equally good — see R-1.
+**And the header block is not exempt.** A bare CR or LF inside a header is read
+as a line break by some parsers and as an ordinary octet by others, which makes
+the same bytes two different header sets depending on who reads them — header
+injection by disagreement rather than by an unescaped newline. Normalisation
+therefore covers the entire DATA payload, not the body alone. Restricting it to
+the body would leave the more interesting half untouched.
 
 ### 2.4 Dot-stuffing is not the place to fix it
 
@@ -120,13 +132,19 @@ destroys.
 1. receive              exact bytes, no modification
 2. verify               SPF, DKIM, ARC chain — against those exact bytes
 3. evaluate DMARC       against the ORIGINAL From:, using step 2's results
-4. record               build Authentication-Results / ARC-AAR from step 2-3
-5. mutate               normalise (R-1), rewrite envelope via SRS,
-                        prepend Received, prepend AAR
-6. seal                 ARC-Message-Signature over the mutated message,
-                        ARC-Seal over the chain
-7. spool                exactly what step 6 produced
+4. record               Authentication-Results / ARC-AAR from steps 2-3
+5. normalise            bare CR/LF -> CRLF across the whole payload (R-1)
+6. rewrite              envelope sender via SRS; From: if rewrite_from;
+                        prepend Received and Authentication-Results
+7. sign                 Pigeon's own DKIM signature — mandatory for rewrite_from
+8. seal                 ARC set over the finished outbound form
+9. spool                exactly what step 8 produced
 ```
+
+Steps 5-7 are all "Pigeon's changes", and **the seal comes after every one of
+them**, Pigeon's own DKIM signature included. RFC 8617 requires the ARC set to
+be computed over the message as it leaves; a seal taken before the DKIM
+signature is added covers a message that is not the one sent.
 
 **Verify before mutate.** Any header Pigeon prepends is a header the original
 DKIM signature did not cover, and an `h=` list that oversigns an absent header
@@ -139,14 +157,26 @@ would return a meaningless pass. DMARC alignment is computed against the
 `From:` domain as received, with the SPF and DKIM results from step 2.
 
 **Seal last, and seal what is sent.** The ARC set attests to the message Pigeon
-relays. Sealing before step 5 would sign a message that does not exist on the
+relays. Sealing before step 7 would sign a message that does not exist on the
 wire; sealing after spooling would mean the spooled bytes are not the signed
 bytes. There is exactly one correct position and it is between them.
 
-**The chain instance number** is `existing ARC sets + 1`, and a chain that
-already fails stays failed — `cv=fail` is sealed honestly rather than repaired.
-A forwarder that reports a chain as passing because it wants the message
-delivered is the reason receivers stopped trusting ARC from some sources.
+### 3.1 A chain that arrived failed is not extended
+
+The first draft said `cv=fail` is "sealed honestly rather than repaired". That
+is wrong, and the distinction it misses is in RFC 8617:
+
+- **The most recent ARC set already declares `cv=fail`.** The chain is
+  terminally broken. Pigeon **does not add a set** — appending to a dead chain
+  produces a longer dead chain and nothing else.
+- **Pigeon evaluates the chain and finds it invalid** where the previous hop did
+  not. Here Pigeon *does* append, with the prescribed failure set, because that
+  record is the one piece of information the next hop cannot reconstruct.
+
+`mail-auth` enforces this already: `ArcSealer::seal` returns
+`Error::Arc(ArcError::InvalidCV)` when `arc_output.can_be_sealed()` is false.
+That is a refusal to be handled, not an error to log — reaching it means the
+chain arrived dead and the message is forwarded without a new set.
 
 ---
 
@@ -195,12 +225,26 @@ block is a signature break with extra steps.
 | Header count | 1000 | bounded work in the parser and the signer |
 | `Received:` hops | 100 (`MAX_HOPS`, existing) | loop backstop, already in `pigeon-smtp` |
 | ARC sets | 50 | RFC 8617 §4.2.1 |
-| DKIM signatures verified | 10 | each is a DNS lookup and a body hash |
+| DKIM signatures verified | 10, **aligned first** | each is a DNS lookup and a body hash |
 
-The last one matters more than it looks: DKIM verification is attacker-triggered
-work. A message carrying two hundred `DKIM-Signature` headers is a request for
-two hundred DNS lookups and two hundred body hashes, from anyone who can send
-mail.
+The last one matters more than it looks, and a plain "first ten" is a hole
+rather than a limit. DKIM verification is attacker-triggered work — two hundred
+`DKIM-Signature` headers is a request for two hundred DNS lookups and two
+hundred body hashes from anyone who can send mail — but capping by *position*
+lets an attacker prepend ten bogus signatures and push the one that matters
+past the cap. The DMARC-aligned signature is the only one whose result changes
+the outcome, so it must not be the one dropped.
+
+So the work is ordered before it is bounded:
+
+1. Parse all `DKIM-Signature` headers cheaply — `d=`, `s=`, `a=` only, no DNS,
+   no hashing. This is bounded by the header-count limit above.
+2. Sort: signatures whose `d=` aligns with the `RFC5322.From` domain first,
+   relaxed alignment included, then the rest in order of appearance.
+3. Verify at most 10, in that order.
+
+An unaligned signature that goes unverified costs nothing that matters: it
+cannot produce a DMARC pass. Dropping the aligned one loses the message.
 
 ---
 
@@ -220,7 +264,57 @@ SRS1=HHHHHHHH=firsthop==HHHHHHHH=TT=origdomain=origlocal@forward.example
 would bury the original sender one layer deeper on every hop, and the address
 would grow without bound.
 
-### 5.2 The key ring
+### 5.2 What the HMAC covers, exactly
+
+Classic SRS concatenates timestamp, domain and local part and hashes the
+result. That is ambiguous: `a@b.c` and `a=b@c` can produce the same input, and
+an ambiguous MAC input is a forgery primitive rather than a style question.
+
+**Covered bytes**, in this order and no other:
+
+```text
+HMAC-SHA-256( key, TT || 0x00 || lowercase(origdomain) || 0x00 || origlocal )
+```
+
+- `TT` is the timestamp characters exactly as they appear in the address.
+- The domain is lowercased; it is authoritative-case per RFC 5321 §2.4, and the
+  same rule `M1-SCHEMA.md` C5 applies to routing.
+- The local part is **raw bytes, case preserved** — folding it would make
+  `User@x` and `user@x` interchangeable in a return path, which is a decision
+  the original domain gets to make and Pigeon does not.
+- `0x00` is the separator because it cannot occur in either field, which makes
+  the encoding injective without length prefixes.
+
+The first **5 bytes** of the MAC become 8 Base32 characters (RFC 4648 alphabet,
+uppercase, no padding).
+
+**Comparison is constant-time.** A byte-at-a-time comparison of an 8-character
+tag leaks its prefix to anyone who can measure a bounce, and 40 bits recovered
+one character at a time is 8 × 32 attempts rather than 2⁴⁰. `subtle::ConstantTimeEq`,
+which is pure Rust and already the standard answer.
+
+### 5.3 Field encoding, and escaping the separators
+
+`=` is valid in a local part (RFC 5321 atext), so a raw local part can forge a
+field boundary. Fields are therefore escaped before assembly and unescaped
+after:
+
+| Byte | Encoded as |
+|---|---|
+| `%` | `%25` |
+| `=` | `%3D` |
+| `@` | `%40` |
+| anything outside atext | `%XX` |
+
+`%` is escaped first, which is what makes the transform reversible. After
+escaping, no field contains a raw `=`, so decoding splits on `=` unambiguously
+and the parser needs no lookahead.
+
+The MAC covers the **unescaped** bytes, so a change in escaping cannot alter a
+tag, and a re-encoding by an intermediate that normalises `%3D` to `=` fails
+verification rather than silently rewriting the sender.
+
+### 5.4 The key ring
 
 `srs_secret_file` is currently a single `0600` file, validated at startup. That
 is enough to sign and not enough to rotate: a secret that cannot be rotated
@@ -230,74 +324,109 @@ rotated.
 The file becomes a small ring, newest first:
 
 ```text
-# id  created (RFC 3339)  secret (base64, 32 bytes)
-2  2026-08-01T00:00:00Z  4f...==
-1  2026-02-01T00:00:00Z  9a...==
+# id  created              stopped_signing_at   secret (base64, 32 bytes)
+2     2026-08-01T00:00:00Z -                    4f...==
+1     2026-02-01T00:00:00Z 2026-08-01T00:00:00Z 9a...==
 ```
 
-- **Signing** always uses the first entry.
-- **Verification** tries every entry and accepts on the first match. The classic
-  SRS wire format carries no key identifier, so this is not a design choice —
-  it is what the format leaves available. The cost is one HMAC per key, bounded
-  by the ring size.
-- **Ordering is by position, not by parsed date.** The date is documentation for
-  the operator; making it load-bearing would mean a mistyped year could silently
-  change which key signs.
+- **Signing** always uses the first entry, which must have no
+  `stopped_signing_at`.
+- **Verification** tries every entry and accepts on the first match. The wire
+  format carries no key identifier, so this is not a design choice — it is what
+  the format leaves available.
+- **`stopped_signing_at` is recorded, not inferred.** Deletion eligibility is
+  measured from when a key stopped *signing*, and `created` cannot express that:
+  a key created two years ago and displaced yesterday is a key whose addresses
+  are still arriving.
+- **At most 8 keys.** Every verification is one HMAC per key, and a ring is an
+  attacker-visible work multiplier for anything that can trigger a verification.
+  A ninth entry is a refusal at startup, not a warning.
+- **Ordering is by position, not by parsed date.** The dates are for the
+  operator; making them load-bearing would let a mistyped year change which key
+  signs.
 
-### 5.3 Hash length
+### 5.5 The timestamp, the window, the wrap, and the clock
 
-**8 base32 characters (40 bits)**, not the classic 4.
+Classic SRS uses two Base32 characters: days since the SRS epoch modulo 1024.
+**Pigeon uses three** — modulo 32768, about 89 years. See R-3.
 
-Nobody else has to verify these addresses, so the length is Pigeon's to choose,
-and 20 bits is forgeable at a few hundred thousand attempts — which buys an
-attacker the ability to send mail *through* the forwarder to any original
-sender, with Pigeon's reputation attached. The cost of the extra four characters
-is address length, which §5.6 has to bound anyway.
+Two characters wrap every 2.8 years, and the consequence is not a rejected
+address but an accepted one: a captured SRS address becomes *current again* on
+its wrap anniversary, and if any key that could verify it is still in the ring,
+it verifies. The window does not save it, because the window is computed on the
+wrapped value. Three characters cost one octet of an already tight budget
+(§5.7) and remove the replay class outright.
 
-### 5.4 The timestamp, the window, and the clock
+- **Window**: 21 days, comfortably exceeding the ~5 day retry schedule
+  `pigeon-spool` documents. A return path must outlive the queue that might
+  still be using it.
+- **Modular comparison regardless**: `(now - then) mod 32768 <= window`. The
+  arithmetic is the same shape at either width, and a plain subtraction is
+  wrong at both. Tested by injecting the day number, never by waiting.
+- **Clock**: UTC wall clock, deliberately — it must agree with itself across
+  restarts, and a monotonic clock does not. **One day of future tolerance** for
+  a peer whose clock is behind.
+- A clock that jumps backwards past the tolerance rejects addresses Pigeon
+  itself issued, and is logged distinctly: the operator's fix is NTP, not mail.
 
-`TT` is two base32 characters: days since the SRS epoch, modulo 1024.
+### 5.6 Rotation and retirement
 
-- **Window**: 21 days by default, matching the convention and comfortably
-  exceeding the ~5 day retry schedule `pigeon-spool` documents. A return path
-  must outlive the queue that might still be trying to use it.
-- **Wrap-around is not optional to handle.** 1024 days is under three years, and
-  the comparison is modular: `(now - then) mod 1024 <= window`. A naive
-  subtraction rejects every address for 21 days once every 2.8 years, which is
-  the kind of bug that ships because nobody runs a test for three years. It is
-  tested by injecting the day number, not by waiting.
-- **Clock**: UTC wall clock, deliberately, because it must agree with itself
-  across restarts and a monotonic clock does not. A **1 day future tolerance**
-  is allowed, for a receiver whose clock is behind ours.
-- A clock that jumps *backwards* by more than the tolerance rejects addresses
-  Pigeon itself issued. That is logged distinctly rather than as a generic
-  verification failure, because the operator's fix is NTP, not mail.
+Rotation state is advanced **before any address is generated**, not lazily on
+first use. A signer that rotates as a side effect of signing has a window in
+which two processes disagree about which key is current, and the addresses they
+produce are both valid and unattributable.
 
-### 5.5 Retirement safety
-
-A key may stop signing at any time. It may only be **deleted** once
+A key may be **deleted** only once
 
 ```text
 now > stopped_signing_at + verification_window + max_queue_lifetime
 ```
 
-which with the defaults above is 21 + 5 = 26 days, rounded up to **30 days** as
-the documented rule. Deleting earlier silently breaks bounces for mail already
-in flight — silently, because the failure appears at a stranger's MTA as an
-unroutable address, and nothing in Pigeon's logs says a key went missing.
+which with the defaults is 21 + 5 = 26 days, documented as **30**. Deleting
+earlier breaks bounces for mail already in flight — silently, because the
+failure surfaces at a stranger's MTA as an unroutable address and nothing in
+Pigeon's logs says a key went missing.
 
-`pigeon srs rotate` therefore prints the earliest safe deletion date for the key
-it displaces, and `pigeon srs keys` shows it per key. The tool does not delete;
-an operator does, or does not, and either way the date is on record.
+`pigeon srs rotate` prints the earliest safe deletion date for the key it
+displaces; `pigeon srs keys` shows it per key. Neither deletes. An operator
+does, or does not, and the date is on record either way.
 
-### 5.6 The 64-octet problem
+**Queue retries reuse the address, not the algorithm.** The return path is
+computed once, at acceptance, and stored with the message. A retry that
+recomputed it would produce a different address — a newer timestamp, possibly a
+newer key — while a bounce generated against the *first* one is still in
+flight. One message has one return path for its whole life, including across a
+rotation.
 
-`SRS0=HHHHHHHH=TT=` is 15 octets before the original address, and RFC 5321
-limits a local part to 64. An original sender of
-`some.very.long.address@a-long-domain.example` overflows it.
+### 5.7 The 64-octet budget, computed
 
-Not a rare edge: it is a normal address at a company with a long domain. The
-options are recorded in R-4, because none of them is free.
+Fixed overhead, counted rather than estimated:
+
+```text
+"SRS0="  5
+hash     8   -> 13
+"="      1   -> 14
+TT       3   -> 17
+"="      1   -> 18      <- octets before origdomain
+origdomain
+"="      1              <- separator before origlocal
+origlocal
+```
+
+**18 octets before the original domain, 19 fixed in total.** (The first draft
+said 15, which was simply wrong arithmetic; with the classic two-character
+timestamp it would be 17 and 18.)
+
+RFC 5321 caps a local part at 64 octets, so:
+
+```text
+len(origdomain) + len(origlocal escaped) <= 45
+```
+
+That is a real constraint, not a corner: `firstname.lastname@a-department.example.edu`
+is 43 and fits with two octets to spare; one escaped character pushes it over.
+R-4 settles what happens then, and §7 makes it a refusal *before* acceptance
+rather than a problem discovered after Pigeon has already said `250`.
 
 ---
 
@@ -331,47 +460,83 @@ cargo tree -e features --invert rsa | grep -q mail-auth && exit 1
 That belongs beside the existing decryption grep, and it is the same kind of
 guard: a *use* check, not an absence check.
 
-### 6.2 `mail-auth` features
+### 6.2 `mail-auth` 0.12.1, not 0.7
 
 ```toml
-mail-auth = { version = "0.7", default-features = false,
-              features = ["ring", "rustls-pemfile"] }
+mail-auth = { version = "0.12.1", default-features = false,
+              features = ["ring", "arc"] }
 ```
 
-Dropping the default `report` feature removes `quick-xml` and `zip`. DMARC
-*aggregate report* parsing and generation is not Milestone 2 — evaluating a
-DMARC policy and producing an XML report for a domain owner are different jobs,
-and only the first one is needed to make forwarded mail land. When reporting
-arrives, the feature comes back with it.
+The 0.7 analysis in the first draft was correct about 0.7 and wrong about what
+to use. Resolved and inspected here rather than assumed:
 
-`rustls-pemfile` stays: DKIM private keys are stored as PEM under the `keys`
-root, and that is what reads them.
-
-### 6.3 The duplicate DNS stack — measured
-
-| Crate | hickory | features |
+| Property | 0.7 | **0.12.1 with `ring`, `arc`** |
 |---|---|---|
-| `pigeon-dns` | 0.26 | `tokio`, `system-config`, defaults off |
-| `mail-auth` 0.7 | **0.25**, not optional | `tls-ring`, `dnssec-ring` |
+| hickory | 0.25, not optional | **0.26.1** — one DNS stack |
+| `rsa` in the graph | no | **no** |
+| `zip` / `quick-xml` | via default `report` | **no** |
+| `rustls-pemfile` feature | exists | **gone**; keys load via `RsaKey::from_rsa_pem` |
+| edition | 2021 | 2024 (needs ≥ 1.85; MSRV stays 1.88) |
 
-`MessageAuthenticator` is `pub struct MessageAuthenticator(pub TokioResolver)` —
-a public newtype over hickory's resolver, with no trait seam for supplying DNS
-answers from elsewhere. So the choice is not whether to have hickory 0.25; it is
-whether to *also* keep 0.26. See R-6.
+`default-features = false` is **mandatory, not tidiness**: 0.12.1's default
+feature set is `["aws-lc-rs", "report", "dns-hickory"]`, and `aws-lc-rs` is on
+`deny.toml`'s ban list — it is the cmake-requiring C crypto library `ring` was
+chosen over. Taking the defaults would fail the dependency gate.
 
-Two facts that bear on it, both checked rather than assumed:
+**Downgrading to 0.25 is now a security regression, not just duplication.** Two
+advisories in the local RustSec database:
 
-- `deny.toml` sets `multiple-versions = "warn"`, so two hickory versions do not
-  fail CI today. They do mean two resolvers, two caches, two sets of timeouts,
-  and an operator question — "which one made that query?" — with two answers.
-- Finding 13's fix reads `response_code` off `hickory_resolver::net::DnsError`.
-  Hickory 0.25 carries the same `NoRecordsFound { response_code, .. }` data at a
-  different path, so unifying is a rewrite of one function — small, and
-  **exactly the function that was already wrong once**. It does not get moved
-  without re-running the NXDOMAIN-versus-NODATA test against a real resolver.
+| Advisory | Affects | Patched |
+|---|---|---|
+| RUSTSEC-2026-0119 (`hickory-proto`) | 0.25.x | `>= 0.26.1` |
+| RUSTSEC-2026-0118 (`hickory-proto`) | 0.25.x | **none** — unaffected only `< 0.25.0-alpha.3` or `>= 0.26.0-beta.1` |
 
-MSRV: 1.88 is pinned *by* hickory 0.26. Dropping to 0.25 may permit a lower
-MSRV; it does not require one, and this design does not lower it.
+So R-6 resolves to 0.12.1 and one hickory: the unification the first draft
+wanted, without the downgrade it wrongly proposed to get there.
+
+**What this does not establish.** The probe here fetched the graph and read the
+lock and the feature map; the user separately reports a successful compile on
+1.88. Neither is evidence about resolver *semantics*. The NXDOMAIN-versus-NODATA
+classification tests still run against a real resolver, and the full workspace
+gates still run, before this is adopted — finding 13 was a semantics bug that a
+successful build would have hidden.
+
+### 6.3 `ring` pulls a certificate probe onto the deny list
+
+Found while verifying the above, and it blocks the milestone until settled.
+
+`mail-auth`'s `ring` feature is not only a crypto selection. It expands to:
+
+```text
+ring = ["dep:ring", "dns-hickory",
+        "hickory-resolver/tls-ring",
+        "hickory-resolver/dnssec-ring",
+        "hickory-resolver/rustls-platform-verifier"]
+```
+
+Feature unification then applies those to *Pigeon's* resolver too, and the
+workspace comment claiming `default-features = false` keeps a TLS stack out of
+the DNS layer stops being true. On the Linux target the chain is:
+
+```text
+openssl-probe 0.2.1
+└── rustls-native-certs 0.8.4
+    └── rustls-platform-verifier 0.7.0
+        └── hickory-net 0.26.1 -> hickory-resolver 0.26.1
+```
+
+`openssl-probe` is on `deny.toml`'s ban list, so **M2 cannot pass the dependency
+gate as the policy currently stands.** Inspected before proposing anything: the
+crate has no `build.rs`, no `links` key, no dependencies, and no FFI. It is a
+table of certificate directory paths and two environment-variable reads. It is
+named after OpenSSL's filesystem conventions; it does not link, load, or require
+OpenSSL.
+
+That matters because of *why* the ban exists. `deny.toml` says the concern "is
+not C code as such. It is the system-library coupling that comes with it" —
+locating a shared object, matching versions across hosts, inheriting a
+distribution's patch schedule. `openssl-probe` has none of those properties, so
+it is caught by a rule whose stated rationale does not apply to it. See R-9.
 
 ---
 
@@ -387,26 +552,50 @@ to verify something loses mail for a stranger's DNS outage.
 | DKIM key DNS lookup fails transiently | `dkim=temperror` | accept | debug |
 | DKIM key absent / malformed | `dkim=permerror` | accept | debug |
 | SPF fail on the inbound hop | `spf=fail` | accept | debug |
-| ARC chain already `cv=fail` | sealed as `cv=fail` | accept | debug |
-| DMARC evaluates to `reject` | recorded | accept in M2 (R-5) | info |
-| More than 10 DKIM signatures | verify first 10, rest ignored | accept | warn once |
+| Inbound chain already `cv=fail` | no new set (§3.1) | accept | debug |
+| Pigeon finds the chain invalid | failure set appended | accept | debug |
+| DMARC evaluates to `reject` | recorded in A-R | accept in M2 (R-5) | info |
+| More than 10 DKIM signatures | aligned verified first (§4.4) | accept | warn once |
 | Header block over limit | — | `552 5.3.4` | warn |
-| Pigeon's own key missing/unreadable | — | accept, forward **unsealed** | **error + alert** |
-| Sealing fails for any other reason | — | accept, forward **unsealed** | **error + alert** |
-| SRS encoding impossible (§5.6) | — | R-4 | error |
+| **SRS address would exceed 64 octets** | — | **`550` at RCPT, before acceptance** | error |
+| ARC sealing fails locally | forwarded **without** a new set | accept | error + alert |
+| **`rewrite_from` signing fails** | — | **never forwarded rewritten-and-unsigned** | error + alert |
 
-Two rows are the interesting ones.
+`Authentication-Results` is written **whenever authentication was evaluated**,
+not only when something failed. A recipient that accepts a message despite
+`p=reject` — which local disposition permits, RFC 7489 §6.7 — needs the verdict
+that led there, and a header present only on failure is a header nobody can
+rely on.
 
-**Pigeon's own signing failure does not reject the message.** Rejecting would
-convert a local configuration fault into refused mail; forwarding unsealed
-degrades to the pre-ARC behaviour, which is the status quo for most forwarded
-mail and is survivable. It is an `error` with an alert precisely because it is
-silent otherwise — the mail keeps flowing and the protection is gone.
+Three rows are load-bearing.
+
+**The over-long SRS address is refused before acceptance**, at `RCPT TO` where
+the forwarding domain is already known, with a permanent failure. The upstream
+MTA then owns the DSN, which is correct: it has the original message and a
+relationship with the sender. Pigeon generating its own DSN would mean
+generating mail, and bounce generation is Milestone 3 — it needs the queue to
+be safe. Discovering this *after* `250` would leave a message that cannot be
+forwarded and cannot be bounced.
+
+**ARC sealing failure degrades; `rewrite_from` signing failure does not.** These
+were one row in the first draft and they are not the same risk. A missing ARC
+set drops a recovery path — the pre-ARC status quo, survivable. A rewritten
+`From:` that goes out unsigned fails DMARC on a domain *Pigeon controls*, which
+is worse than not rewriting at all: it converts a message that would have been
+delivered on the original signature into one that is refused on Pigeon's own
+identity.
+
+So `rewrite_from` without a usable key is unreachable by construction — startup
+and reload validation refuse a configuration whose `rewrite_from` domains lack
+active keys, the same shape as M1's rule that no mutation commits a
+configuration that will not build. A runtime failure past that point retains or
+refuses the message, or falls back to an unchanged `Preserve` forward. It never
+sends the rewrite unsigned.
 
 **Nothing about an authentication result reaches the SMTP client.** Reply text
-is attacker-visible and, per finding 21, attacker-influenceable; the verdicts go
-to the log and to the headers, where they belong. A `550` that said
-"dkim=fail for example.com" would be a free oracle.
+is attacker-visible and, per finding 21, attacker-influenceable; verdicts go to
+the log and the headers. A `550` reading "dkim=fail for example.com" is a free
+oracle.
 
 ---
 
@@ -419,74 +608,102 @@ and must be answered by experiment, not by reading documentation.
    whether R-1's normalisation changes any verdict. Feed one message with
    interior bare LFs and a signature computed over the CRLF form, and both
    answers are informative.
-2. **Does `mail-auth` 0.7's ARC sealing accept a chain with `cv=fail` and seal
-   it honestly**, or refuse? Determines whether §3's "seal the failure" is a
-   configuration or a wrapper.
-3. **What exactly does hickory 0.25's error type look like** along the path
-   `classify` walks, and does the NXDOMAIN/NODATA distinction survive the move?
-   Blocking for R-6.
-4. **Does dropping `report` compile and pass mail-auth's own DMARC evaluation
-   path?** If DMARC evaluation is entangled with report generation, R-7 changes.
+2. ~~Does ARC sealing accept a chain with `cv=fail`?~~ **Answered while
+   reviewing.** `ArcSealer::seal` returns `Error::Arc(ArcError::InvalidCV)` when
+   `arc_output.can_be_sealed()` is false, which is RFC 8617's rule enforced by
+   the library. §3.1 handles the refusal; there is nothing left to measure.
+3. **Does `classify` still separate NXDOMAIN from NODATA** once `mail-auth`
+   shares the resolver? The version does not change (§6.2), but the feature set
+   does — `ring` forces `dnssec-ring` and `tls-ring` on, and a validating
+   resolver can turn a NODATA into a different error entirely. Re-run against a
+   real resolver, not a stub.
+4. **Does DMARC evaluation still work without `report`?** Compilation is not
+   the question — that is already established. The test evaluates a real policy
+   record end to end, because `report` gating an evaluation path would be
+   invisible to `cargo build`.
 5. **Measured size of a sealed message** versus the original, for the header
    block limit in §4.4.
 6. **A real `SRS0` round trip through a third-party bounce generator** — the
-   encoding is only correct if somebody else's MTA can send to it.
+   encoding is only correct if somebody else's MTA can send to it. Three-
+   character timestamps and percent-escaped fields are both departures from
+   what other implementations emit; nobody else parses them, but somebody
+   else's *address validator* sees them.
 
 ---
 
-## 9. Rulings required before implementation
+## 9. Rulings — settled
 
-**R-1 — the bare-LF body.** Three options:
+All eight are ruled. What follows is the decision, not the argument for it;
+where a ruling came with conditions, the conditions are in the section named.
 
-- **(a) Preserve.** Bytes are exactly what arrived. Ships the smuggling
-  primitive (§2.3) and makes Pigeon an amplifier.
-- **(b) Reject at DATA.** Refuse a body containing a bare LF or bare CR with a
-  permanent failure. Safest, and rejects mail that most receivers accept today.
-- **(c) Normalise once, after verification.** Bare LF → CRLF and bare CR → CRLF
-  at step 5, before anything is signed or spooled. Verification still describes
-  what arrived; the relay form is canonical; the primitive does not leave.
+**R-1 — normalise after verification. Approved, widened.** Bare CR and bare LF
+become CRLF across the **entire DATA payload, headers included** — not the body
+alone, because a bare CR inside a header is read as a line break by some parsers
+and as an octet by others, which is header injection by disagreement. Exactly
+once, after inbound authentication and before Pigeon adds or signs anything,
+which is where RFC 6376 §5.3 puts transport conversion. §2. The body-contract
+table, `ForwardPolicy::Preserve`, `pigeon-auth`'s module docs and the roadmap
+all now say that nonconforming input is not byte-preserved.
 
-**Recommended: (c).** It is the only one that both keeps the verdict honest and
-refuses to re-emit the attack. The cost is real and must be stated in
-`ForwardPolicy::Preserve`: a message that arrived with bare LFs is *not*
-forwarded byte-for-byte, and if its signature covered those bytes, it will fail
-downstream — having been recorded as passing in the ARC set, which is exactly
-what ARC is for.
+**R-2 — 8 Base32 characters, 40 bits. Approved with the five conditions
+specified in §5.2 and §5.3:** exact MAC input with `0x00` separators that cannot
+occur in either field, percent-escaping that makes the field split unambiguous,
+the MAC taken over unescaped bytes, constant-time tag comparison, and a hard
+ring cap of 8 keys.
 
-**R-2 — SRS hash length 8 (40 bits)** rather than the classic 4. §5.3.
+*Arithmetic corrected*: fixed overhead is **18 octets before the original
+domain, 19 in total** with the three-character timestamp — 17 and 18 with the
+classic two. The first draft's 15 was wrong. §5.7.
 
-**R-3 — SRS window 21 days, key deletion barred for 30.** §5.4, §5.5.
+**R-3 — 21-day window, 30-day deletion barrier. Approved, with the wrap
+closed.** `stopped_signing_at` is recorded per key, because `created` cannot
+express when a key stopped signing and deletion eligibility is measured from
+that. The two-character timestamp wraps every 1024 days, and a captured address
+becomes *current again* on its wrap anniversary while any key that can verify it
+remains — so the timestamp widens to **three characters** (32768 days). Rotation
+state advances **before** any address is generated. A queued message keeps the
+return path it was accepted with; retries never recompute it. §5.5, §5.6.
 
-**R-4 — over-long SRS addresses (§5.6).** Options: (a) refuse the forward
-permanently and DSN the original sender; (b) fall back to a database-stored
-opaque token, which needs a table and belongs with the M3 queue; (c) truncate,
-which is not an option — it silently forges a different sender.
-**Recommended: (a) for M2**, with (b) recorded as the M3 improvement, because a
-DSN to a sender who can read it beats a bounce address nobody can route.
+**R-4 — refuse before acceptance; no Pigeon-generated DSN in M2.** An SRS
+address that would exceed 64 octets is detected at `RCPT TO`, where the
+forwarding domain is known, and refused permanently. The upstream MTA owns the
+DSN. Opaque tokens are M3 work, with the queue that makes bounce generation
+safe. §5.7, §7.
 
-**R-5 — does an inbound DMARC `p=reject` verdict refuse the message?**
-**Recommended: no in M2** — evaluate and record only. Forwarding spoofed mail
-harms reputation, and enforcement is an abuse-policy decision with its own
-milestone; making it here would couple the go/no-go milestone to a policy call.
-The risk is explicit rather than deferred silently.
+**R-5 — record DMARC, do not enforce. Approved**, and
+`Authentication-Results` becomes **unconditional whenever authentication was
+evaluated** rather than optional: local disposition may differ from published
+policy (RFC 7489 §6.7), and a recipient accepting mail despite `p=reject` needs
+the recorded verdict. §7.
 
-**R-6 — the DNS stack.** (a) two hickory versions; (b) unify on 0.25 and share
-one resolver with `mail-auth`; (c) keep 0.26 and wait for `mail-auth` to move.
-**Recommended: (b)**, conditional on measurement 3 — one resolver, one cache,
-one place to answer "what did Pigeon ask DNS?". Not adopted before `classify` is
-re-verified against a real resolver, because that function has been wrong once
-and the failure mode was permanently refused mail.
+**R-6 — `mail-auth` 0.12.1, one hickory at 0.26.1.** Not a downgrade to 0.25:
+that would import RUSTSEC-2026-0119 and RUSTSEC-2026-0118, the second of which
+has no patched version. `default-features = false` is mandatory — the default
+set pulls `aws-lc-rs`, which `deny.toml` bans. §6.2.
 
-**R-7 — `mail-auth` without `report`.** §6.2, conditional on measurement 4.
+**R-7 — build without `report`. Approved**, with a real DMARC evaluation test
+rather than a compile as the evidence. §8.4.
 
-**R-8 — DKIM signing for the `rewrite_from` path.** When `forward_policy` is
-`rewrite_from`, the `From:` becomes a Pigeon-owned address, and an unsigned
-rewrite is strictly worse than no rewrite: it fails DMARC on a domain Pigeon
-controls. So `rewrite_from` requires signing with that domain's key.
-**Recommended: yes**, which makes DKIM signing part of M2 rather than a later
-addition, and is why §6.1's `ring` boundary has to be settled now.
+**R-8 — DKIM signing of a rewritten `From:` is mandatory M2 work. Approved.**
+The pipeline is verify → normalise → rewrite → sign → seal → spool, with the
+ARC set covering Pigeon's own DKIM signature. §3.
 
----
+**R-9 — NEW, and it blocks the milestone. `openssl-probe` on the deny list.**
+`mail-auth`'s `ring` feature forces `hickory-resolver/rustls-platform-verifier`,
+which on Linux reaches `openssl-probe` through `rustls-native-certs`. That crate
+is banned by name in `deny.toml`, so M2 cannot pass the dependency gate as the
+policy stands.
+
+Inspected rather than argued: no `build.rs`, no `links`, no dependencies, no
+FFI — a table of certificate directory paths and two environment-variable reads,
+named after OpenSSL's filesystem conventions. The ban's own stated rationale is
+"not C code as such… the system-library coupling that comes with it", and this
+crate has none of that coupling.
+
+**Recommended:** remove `openssl-probe` from the ban list, with the inspection
+recorded beside the entry, and keep every other name. The alternative —
+abandoning `ring` — means `aws-lc-rs`, which is banned for reasons that *do*
+apply. **This one is not yet ruled and needs an answer before implementation.**
 
 ## 10. Tests
 
@@ -497,10 +714,21 @@ addition, and is why §6.1's `ring` boundary has to be settled now.
 | Verify runs before any mutation | move the `Received:` prepend above verification |
 | DMARC uses the original `From:` | evaluate against the SRS envelope instead |
 | The ARC set seals the relayed form | seal before the header block is prepended |
-| A failed chain stays failed | seal `cv=pass` when the chain is broken |
-| Body bytes are unchanged apart from R-1 | drop a byte; flip a CRLF; refold a header |
+| A dead chain is not extended | append a set when the inbound chain says `cv=fail` |
+| A newly-detected failure IS recorded | skip the failure set when Pigeon finds the chain invalid |
+| Payload bytes are unchanged apart from R-1 | drop a byte; flip a CRLF; refold a header |
+| Normalisation covers headers too | normalise the body only |
+| The aligned signature is verified first | sort by position instead of alignment |
+| A rewritten `From:` is never sent unsigned | forward the rewrite when signing fails |
+| The seal covers Pigeon's DKIM signature | seal before signing |
+| An over-long SRS address is refused at RCPT | detect it after `250` instead |
 | The marker CRLF is added only when needed | append it unconditionally |
 | SRS timestamps compare modularly | replace with a plain subtraction |
+| The MAC input is unambiguous | drop the `0x00` separators and rely on concatenation |
+| Escaping is reversible | escape `=` before `%` |
+| Tag comparison is constant-time | replace with `==` |
+| A queued message keeps its original return path | recompute the address on retry |
+| Rotation happens before signing | advance the ring lazily, after the address is built |
 | Verification accepts any ring key | verify against the newest key only |
 | Signing uses the newest key | sign with the last entry |
 | A retired-but-undeleted key still verifies | drop retired keys from the ring at load |
@@ -529,8 +757,16 @@ Concretely, and each is a check somebody performs rather than a claim:
 1. A message from a strict-DMARC sender (`p=reject`, DKIM-signed), forwarded to
    **Gmail, Outlook, Yahoo and Proton**, lands in the inbox with `dmarc=pass`
    in the receiver's own `Authentication-Results`.
-2. The same message with its DKIM signature deliberately broken upstream lands
-   with the ARC chain evaluated and honoured at receivers that honour it.
+2. A message that arrives at Pigeon with **DKIM valid**, and whose signature is
+   then broken by the forwarding transformation itself, lands with Pigeon's ARC
+   set evaluated and honoured at receivers that honour ARC.
+
+   The first draft had this test start from an already-broken signature, which
+   cannot work: ARC attests to what authenticated *on arrival*, so a message
+   broken before Pigeon saw it has nothing for Pigeon to attest to. The only
+   other admissible form of this test starts with a valid upstream ARC chain
+   recording the earlier pass — worth adding as a second case, since a
+   list-then-forward path is exactly where real ARC chains come from.
 3. A bounce sent to the SRS return path arrives back at the original sender.
 4. An SRS address issued before a key rotation still verifies after it.
 5. A message with a `.` at the start of a body line arrives with exactly one.

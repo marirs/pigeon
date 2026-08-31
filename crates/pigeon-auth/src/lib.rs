@@ -11,16 +11,25 @@
 //! 1. **SRS** rewrites the envelope sender to a Pigeon-owned domain, so SPF is
 //!    evaluated against a domain that authorises this host. It also gives
 //!    bounces a return path back to the original sender.
-//! 2. **Byte-for-byte body preservation** keeps the author's DKIM signature
-//!    intact, which is what actually satisfies DMARC alignment on `From:`.
+//! 2. **Payload preservation** keeps the author's DKIM signature intact,
+//!    which is what actually satisfies DMARC alignment on `From:`. A
+//!    conforming payload is relayed byte for byte; one carrying a bare CR or
+//!    LF is transport-converted first, and one whose last line is
+//!    unterminated gains the CRLF the end-of-data marker requires. See
+//!    `ForwardPolicy::Preserve` and `M2-DESIGN.md` §2.
 //! 3. **ARC sealing** records that the message authenticated correctly on
 //!    arrival, which major receivers honour when DKIM breaks anyway.
 //!
-//! # Zero-copy contract
+//! # Copies
 //!
-//! `mail-parser` borrows from the input buffer rather than allocating, and body
-//! hashing is streamed. A message is canonicalised and hashed without ever
-//! materialising a second copy.
+//! `mail-parser` borrows from the input buffer rather than allocating, and
+//! hashing is streamed, so verification adds no copy of the message.
+//!
+//! It is not zero-copy end to end, and an earlier version of this comment said
+//! it was. `DataReader` already materialises the received payload, and R-1
+//! normalisation produces a second buffer — deliberately, since the normalised
+//! form is what gets signed, spooled and sent, and deriving it once is what
+//! makes a retry byte-identical to the first attempt.
 
 #![forbid(unsafe_code)]
 

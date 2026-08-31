@@ -120,8 +120,12 @@ and `M1-FINDINGS.md` for why.
 - [ ] SRS1 for double-forward chains
 - [ ] SRS replay window
 - [ ] DKIM verification on receipt
-- [ ] byte-for-byte body preservation, less the CRLF the end-of-data marker
-      requires before an unterminated final line
+- [ ] payload preservation: a conforming message is relayed byte for byte;
+      bare CR/LF anywhere in the payload is transport-converted to CRLF before
+      signing, and an unterminated final line gains the CRLF the end-of-data
+      marker requires (`M2-DESIGN.md` §2)
+- [ ] SRS key ring, rotation, and the retirement barrier
+- [ ] DKIM signing for the `rewrite_from` path
 - [ ] Authentication-Results
 - [ ] ARC validation
 - [ ] ARC sealing
