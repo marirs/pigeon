@@ -224,6 +224,28 @@ impl Spool {
     }
 }
 
+impl From<SpoolError> for io::Error {
+    /// Preserves the kind, which is the part a caller acts on.
+    ///
+    /// Flattening everything to `Other` loses the distinction between "the
+    /// directory is not writable" and "the disk is full", and startup gating
+    /// reports the difference to an operator who has to fix one of them.
+    fn from(e: SpoolError) -> Self {
+        match e {
+            SpoolError::Collision(path) => io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "spool identifier collision: {} already exists",
+                    path.display()
+                ),
+            ),
+            SpoolError::Io { context, source } => {
+                io::Error::new(source.kind(), format!("{context}: {source}"))
+            }
+        }
+    }
+}
+
 /// Flush a directory, so a name created or removed inside it is durable.
 async fn sync_dir(dir: &Path) -> io::Result<()> {
     let dir = dir.to_path_buf();

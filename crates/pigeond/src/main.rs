@@ -39,7 +39,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pigeon_dns::{LookupError, MxError, MxLookup, SystemResolver, order_hosts};
 use pigeon_smtp::{DataError, Envelope, Message, MessageSink, Recipient, ServerConfig};
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
@@ -380,9 +379,23 @@ struct Auth {
     runtime: Arc<RuntimeState>,
 }
 
+/// The database side of acceptance.
+///
+/// One connection, serialised: SQLite admits one writer anyway, and acceptance
+/// is a single commit. `path` is here for reconciliation, which must open its
+/// own connection — the one that failed may be unusable.
+#[derive(Clone)]
+struct Queue {
+    conn: Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    path: Arc<PathBuf>,
+}
+
 struct SpoolSink<R: MxLookup> {
     dir: Arc<PathBuf>,
     spool: pigeon_spool::Spool,
+    /// Absent on the Milestone 0 environment path, where there is no database
+    /// to queue into.
+    queue: Option<Queue>,
     /// Absent on the Milestone 0 environment path, where there is no database
     /// and so no policy, no keys and no SRS ring.
     auth: Option<Auth>,
@@ -404,6 +417,7 @@ impl<R: MxLookup> Clone for SpoolSink<R> {
         Self {
             dir: Arc::clone(&self.dir),
             spool: self.spool.clone(),
+            queue: self.queue.clone(),
             auth: self.auth.clone(),
             accept: Arc::clone(&self.accept),
             counter: Arc::clone(&self.counter),
@@ -617,6 +631,11 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
             None => None,
         };
 
+        // What the sender used, kept before SRS replaces it: the DSN and the
+        // log need the address a person would recognise, and the envelope no
+        // longer holds it after the rewrite.
+        let original_sender = envelope.sender.clone();
+
         // The envelope sender is rewritten **once**, here, and carried. Deriving
         // it again at delivery would let a key rotation or a date change between
         // the two produce a return path that differs from the one a receiver was
@@ -647,7 +666,70 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
             None => (received.as_str(), body.as_slice()),
         };
 
-        match self.write_message(&id, &envelope, received, body).await {
+        let spool_id = match pigeon_spool::SpoolId::new(&id) {
+            Ok(s) => s,
+            Err(e) => {
+                // Generated a few lines above, so this is a bug rather than an
+                // input problem, and one to fail loudly at.
+                tracing::error!(%id, error = %e, "generated an unusable spool identifier");
+                return Err(DataError::Temporary);
+            }
+        };
+
+        let installed = self.install(&spool_id, received, body).await;
+
+        // Queue admission is the acceptance boundary. The spool file is durable
+        // by the time this runs, so the only remaining question is whether the
+        // rows that refer to it exist — and on a failed commit that question is
+        // answered by reading the database back, never by assuming.
+        let admitted = match (&installed, &self.queue) {
+            (Ok(()), Some(queue)) => {
+                match self
+                    .admit(
+                        queue,
+                        &spool_id,
+                        &envelope,
+                        &original_sender,
+                        received.len() + body.len(),
+                        &self
+                            .forwarding
+                            .as_ref()
+                            .map(|f| f.destination.clone())
+                            .unwrap_or_default(),
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err((why, removable)) => {
+                        if removable {
+                            // Established non-commit: the file is an orphan and
+                            // removing it costs a sweep nothing.
+                            if let Err(e) = self.spool.remove(&spool_id).await {
+                                tracing::warn!(%id, error = %e, "could not remove an orphaned spool file");
+                            }
+                            tracing::error!(%id, error = %why, "nothing was queued");
+                        } else {
+                            // Unknown: the rows may exist and the body must
+                            // stay. Orphan recovery resolves it later; a
+                            // duplicate on retry is survivable and losing the
+                            // body is not.
+                            tracing::error!(
+                                %id,
+                                error = %why,
+                                "keeping the spooled message: the queue transaction's outcome is unknown"
+                            );
+                        }
+                        Err(io::Error::other(why))
+                    }
+                }
+            }
+            // No database: Milestone 0's environment path, where the spool
+            // write is all there is.
+            (Ok(()), None) => Ok(()),
+            (Err(_), _) => Ok(()),
+        };
+
+        match installed.and(admitted) {
             Ok(()) => {
                 let from = display_sender(&envelope);
                 tracing::info!(
@@ -791,60 +873,75 @@ impl<R: MxLookup> SpoolSink<R> {
         format!("{secs:010}-{boot:08x}-{n:06}", boot = self.boot)
     }
 
-    /// Write the message so that it survives a crash.
+    /// Put the message on disk so that a `250` can be promised.
     ///
-    /// The message itself goes through `pigeon_spool::Spool`, which writes,
-    /// fsyncs, installs without clobbering, and fsyncs the directory. Only
-    /// after all four is the caller entitled to answer `250`.
-    ///
-    /// The envelope sidecar is still written here, by the older helper. It
-    /// exists because there is nowhere else yet to put the sender and the
-    /// recipients; the acceptance transaction replaces it with `message`,
-    /// `original_recipient` and `delivery` rows, and takes `write_durably`
-    /// with it.
-    async fn write_message(
+    /// Writes, fsyncs, installs without clobbering, and fsyncs the directory.
+    /// The envelope is no longer written beside it: the sender and the
+    /// recipients live in `message`, `original_recipient` and `delivery` rows,
+    /// which is also what makes them queryable and retryable.
+    async fn install(
         &self,
-        id: &str,
-        envelope: &Envelope,
+        spool_id: &pigeon_spool::SpoolId,
         received: &str,
         body: &[u8],
     ) -> io::Result<()> {
-        // The envelope is kept beside the message rather than injected into it.
-        // Adding headers would invalidate the sender's DKIM signature, which is
-        // the one thing forwarding must not do.
-        let meta = format!(
-            "id: {id}\nfrom: {}\n{}",
-            display_sender(envelope),
-            envelope
-                .recipients
-                .iter()
-                .map(|r| format!("to: {r}\n"))
-                .collect::<String>()
-        );
-
-        write_durably(&self.dir, &format!("{id}.envelope"), &[meta.as_bytes()]).await?;
-
         // Header then body, written in sequence rather than concatenated, so
         // the message is not copied to prepend a few hundred bytes to it.
-        let spool_id = pigeon_spool::SpoolId::new(id).map_err(|e| {
-            // The identifier is generated a few lines above, so this is a bug
-            // rather than an input problem — and one worth failing loudly at
-            // rather than sanitising past.
-            io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
-        })?;
         self.spool
-            .install(&spool_id, &[received.as_bytes(), body])
+            .install(spool_id, &[received.as_bytes(), body])
             .await
-            .map_err(|e| match e {
-                pigeon_spool::SpoolError::Collision(path) => io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "spool identifier collision: {} already exists",
-                        path.display()
-                    ),
-                ),
-                other => io::Error::other(other.to_string()),
-            })
+            .map_err(io::Error::from)
+    }
+
+    /// Queue what was just spooled, and decide what the sender is told.
+    ///
+    /// The acceptance boundary: `250` means these rows are committed, not that
+    /// a forward was attempted. Returns whether the spool file may be removed
+    /// on failure — which only an *established* non-commit permits.
+    async fn admit(
+        &self,
+        queue: &Queue,
+        spool_id: &pigeon_spool::SpoolId,
+        envelope: &Envelope,
+        original_sender: &str,
+        size: usize,
+        destination: &str,
+    ) -> Result<(), (String, bool)> {
+        use pigeon_spool::accept::{Acceptance, Destination};
+
+        let acceptance = Acceptance {
+            spool_id: spool_id.clone(),
+            return_path: envelope.sender.clone(),
+            original_sender: original_sender.to_string(),
+            size_bytes: size as i64,
+            // Recorded, never re-resolved. Routing from the snapshot arrives
+            // with fan-out; until then there is one destination and the
+            // revision is what the pinned runtime said at acceptance.
+            routing_revision: 0,
+            routing_fingerprint: vec![0; 32],
+            original_recipients: envelope.recipients.clone(),
+            destinations: vec![Destination {
+                address: destination.to_string(),
+                // Every recipient reaches this destination today, because
+                // there is one. A DSN still names the address the sender
+                // wrote, which is the point of recording the mapping at all.
+                from_recipients: (0..envelope.recipients.len()).collect(),
+            }],
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut conn = queue.conn.lock().await;
+        match pigeon_spool::accept(&mut conn, &queue.path, &[acceptance], now) {
+            Ok(_) => Ok(()),
+            Err(failure) => {
+                let removable = failure.spool_may_be_removed();
+                Err((failure.to_string(), removable))
+            }
+        }
     }
 }
 
@@ -881,16 +978,14 @@ async fn survey_spool(dir: &Path) -> io::Result<SpoolSurvey> {
 
 /// Remove a spooled message once it is safely somewhere else.
 async fn discard_spooled(dir: &Path, id: &str) -> io::Result<()> {
-    // Missing files are not an error: the operator may have cleaned up, and
-    // failing here would only produce noise about work already done.
-    for name in [format!("{id}.eml"), format!("{id}.envelope")] {
-        match tokio::fs::remove_file(dir.join(&name)).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-    }
-    sync_dir(dir).await
+    // Through the spool, so removal is one implementation: unlink, then flush
+    // the directory, and a missing file is the desired state rather than an
+    // error — the operator may have cleaned up, or a crash may already have
+    // done the work.
+    let spool = pigeon_spool::Spool::new(dir.to_path_buf());
+    let id = pigeon_spool::SpoolId::new(id)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    spool.remove(&id).await.map_err(io::Error::from)
 }
 
 /// Send one message onward.
@@ -1031,62 +1126,6 @@ fn display_sender(envelope: &Envelope) -> &str {
     }
 }
 
-async fn write_durably(dir: &Path, name: &str, parts: &[&[u8]]) -> io::Result<()> {
-    let tmp = dir.join(format!(".{name}.partial"));
-    let final_path = dir.join(name);
-
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    // 0600, not whatever the umask happens to be. A spooled file is the
-    // plaintext body of somebody's mail; the default 0666 & ~umask is
-    // typically 0644, which makes every message on the host world-readable to
-    // any local account. `SECURITY.md` states this requirement and the code
-    // did not implement it.
-    #[cfg(unix)]
-    options.mode(0o600);
-
-    let mut f = options.open(&tmp).await?;
-    for part in parts {
-        f.write_all(part).await?;
-    }
-    f.sync_all().await?;
-    drop(f);
-
-    // Refuse to overwrite an existing message. A spooled file belongs to a
-    // message that was already acknowledged and may still be awaiting a
-    // delivery that failed; replacing it destroys mail the sender believes was
-    // accepted.
-    //
-    // `hard_link` rather than `rename`, because `rename` replaces its
-    // destination unconditionally — so `create_new` on the temporary file
-    // alone prevents nothing, and a prior `try_exists` check is a race with a
-    // window between the two calls. Linking fails with `AlreadyExists` if the
-    // destination is taken, atomically, which is the property actually wanted.
-    let link = tokio::fs::hard_link(&tmp, &final_path).await;
-
-    // The temporary file goes either way: on success it is a second name for
-    // content now reachable under the final one, and on failure it is a
-    // partial message nothing will ever read.
-    let removed = tokio::fs::remove_file(&tmp).await;
-
-    match link {
-        Ok(()) => {
-            if let Err(e) = removed {
-                tracing::warn!(path = %tmp.display(), error = %e, "could not remove spool temporary");
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "spool identifier collision: {} already exists",
-                final_path.display()
-            ),
-        )),
-        Err(e) => Err(e),
-    }
-}
-
 /// Create the spool directory and prove it is actually usable.
 ///
 /// `create_dir_all` succeeds on a directory that already exists and is
@@ -1116,23 +1155,23 @@ async fn prepare_spool(dir: &Path) -> io::Result<()> {
         }
     }
 
-    let probe = dir.join(".pigeon-writable-probe");
-    // Best effort: a probe stranded by an earlier crash must not make startup
-    // fail for a spool that is otherwise fine.
-    let _ = tokio::fs::remove_file(&probe).await;
-
-    write_durably(dir, ".pigeon-writable-probe", &[b"probe"]).await?;
-    sync_dir(dir).await?;
-    tokio::fs::remove_file(&probe).await?;
-    sync_dir(dir).await
-}
-
-/// Flush the directory entry, so the rename itself is durable.
-async fn sync_dir(dir: &Path) -> io::Result<()> {
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || std::fs::File::open(&dir)?.sync_all())
+    // Through the spool, by the same route a message takes — which is the
+    // whole point of a probe: it learns that the path is writable, that fsync
+    // works on it, and that the process is not out of space or inodes, using
+    // the code that will do it for real.
+    let spool = pigeon_spool::Spool::new(dir.to_path_buf());
+    let probe_id = pigeon_spool::SpoolId::new("pigeon-writable-probe")
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    // An earlier run that died between the write and the removal leaves this
+    // behind, and a probe that fails on its own leftovers is a daemon that
+    // will not start for a reason that no longer exists.
+    spool.remove(&probe_id).await.map_err(io::Error::from)?;
+    spool
+        .install(&probe_id, &[b"probe"])
         .await
-        .map_err(io::Error::other)?
+        .map_err(io::Error::from)?;
+    spool.remove(&probe_id).await.map_err(io::Error::from)?;
+    Ok(())
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -1422,7 +1461,28 @@ async fn run() -> io::Result<()> {
         }) as Arc<pigeon_smtp::server::SharedReturnPathCheck>
     });
 
+    // The queue's own connection. Opened here rather than shared with the
+    // reload worker's: that one is read-only by design, so that a detector
+    // cannot write, and acceptance needs to.
+    let queue = match &booted {
+        Some((b, (db_path, _, _))) => {
+            let conn = pigeon_db::open(db_path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("cannot open {} for queueing: {e}", db_path.display()),
+                )
+            })?;
+            let _ = b;
+            Some(Queue {
+                conn: Arc::new(tokio::sync::Mutex::new(conn)),
+                path: Arc::new(db_path.clone()),
+            })
+        }
+        None => None,
+    };
+
     let sink = SpoolSink {
+        queue,
         spool: pigeon_spool::Spool::new(sink_dir.clone()),
         dir: Arc::new(sink_dir),
         auth,
@@ -1532,6 +1592,7 @@ mod tests {
     /// without ever being asked anything.
     fn sink(dir: &Path, accept: &[&str]) -> SpoolSink<pigeon_dns::FakeResolver> {
         SpoolSink {
+            queue: None,
             spool: pigeon_spool::Spool::new(dir.to_path_buf()),
             auth: None,
             dir: Arc::new(dir.to_path_buf()),
@@ -1542,132 +1603,34 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn spooled_messages_are_written_durably_and_read_back_intact() {
-        let tmp = TempDir::new("write");
-        write_durably(tmp.path(), "m.eml", &[b"Received: x\r\n", b"body\r\n"])
-            .await
-            .expect("write");
-
-        assert_eq!(
-            tokio::fs::read(tmp.path().join("m.eml")).await.unwrap(),
-            b"Received: x\r\nbody\r\n",
-            "parts must land in order, with nothing between them"
-        );
-
-        // The temporary is a partial message under a name nothing reads. It
-        // must not survive to be counted as stranded mail at the next startup.
-        assert!(
-            !tmp.path().join(".m.eml.partial").exists(),
-            "temporary file left behind"
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
-    async fn spooled_messages_are_not_readable_by_other_local_users() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = TempDir::new("perms");
-        write_durably(tmp.path(), "m.eml", &[b"secret"])
-            .await
-            .expect("write");
-
-        // The default is 0666 & ~umask, typically 0644 — every message on the
-        // host readable by any local account. `SECURITY.md` requires otherwise.
-        let mode = tokio::fs::metadata(tmp.path().join("m.eml"))
-            .await
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "spool file mode is {mode:04o}, want 0600");
-    }
-
-    #[tokio::test]
-    async fn a_spool_collision_is_refused_without_destroying_the_original() {
-        let tmp = TempDir::new("collide");
-        write_durably(tmp.path(), "m.eml", &[b"first"])
-            .await
-            .expect("first write");
-
-        let err = write_durably(tmp.path(), "m.eml", &[b"second"])
-            .await
-            .expect_err("collision was not refused");
-        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-
-        // The point of refusing: the existing file is mail that was already
-        // acknowledged and may still be awaiting a delivery that failed.
-        assert_eq!(
-            tokio::fs::read(tmp.path().join("m.eml")).await.unwrap(),
-            b"first",
-            "an acknowledged message was overwritten"
-        );
-        assert!(
-            !tmp.path().join(".m.eml.partial").exists(),
-            "failed write left its temporary behind"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stranded_temporary_is_refused_rather_than_truncated() {
-        let tmp = TempDir::new("stranded");
-        // What a crash between create and link leaves behind.
-        tokio::fs::write(tmp.path().join(".m.eml.partial"), b"partial")
-            .await
-            .unwrap();
-
-        let err = write_durably(tmp.path(), "m.eml", &[b"body"])
-            .await
-            .expect_err("expected the temporary name to be taken");
-        assert_eq!(
-            err.kind(),
-            io::ErrorKind::AlreadyExists,
-            "must fail loudly rather than truncate a partial message"
-        );
-        // Answered 451, so the sender retries under a new identifier. The
-        // alternative — truncating — is silent.
-        //
-        // Stranded temporaries are not swept at startup, deliberately: nothing
-        // proves another instance is not writing one, and a sweep that races a
-        // live daemon destroys mail in flight. They are inert — no identifier
-        // from a later run reuses the name, because `boot` differs.
-    }
-
-    #[tokio::test]
-    async fn a_message_writes_both_files_and_discard_removes_both() {
-        let tmp = TempDir::new("message");
+    async fn a_spooled_message_is_the_bytes_that_will_be_sent() {
+        // The envelope no longer sits beside the message: the sender and the
+        // recipients are `message`, `original_recipient` and `delivery` rows,
+        // which is what makes them queryable and retryable. What is on disk is
+        // exactly what goes on the wire.
+        let tmp = TempDir::new("write");
         let s = sink(tmp.path(), &[]);
-        let envelope = Envelope {
-            sender: "sender@example.com".into(),
-            recipients: vec!["a@example.net".into(), "b@example.net".into()],
-        };
 
         let id = s.next_id();
-        s.write_message(&id, &envelope, "Received: here\r\n", b"body\r\n")
+        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
+        s.install(&spool_id, "Received: here\r\n", b"body\r\n")
             .await
-            .expect("write_message");
+            .expect("install");
 
         let eml = tokio::fs::read(tmp.path().join(format!("{id}.eml")))
             .await
             .unwrap();
         assert_eq!(eml, b"Received: here\r\nbody\r\n");
 
-        let meta = tokio::fs::read_to_string(tmp.path().join(format!("{id}.envelope")))
-            .await
-            .unwrap();
-        assert!(meta.contains("from: sender@example.com"), "{meta}");
-        assert!(meta.contains("to: a@example.net"), "{meta}");
-        assert!(meta.contains("to: b@example.net"), "{meta}");
-
-        assert_eq!(survey_spool(tmp.path()).await.unwrap().messages, 1);
-        discard_spooled(tmp.path(), &id).await.expect("discard");
-        assert_eq!(
-            survey_spool(tmp.path()).await.unwrap().messages,
-            0,
-            "a forwarded message was left in the spool"
-        );
-        assert!(!tmp.path().join(format!("{id}.envelope")).exists());
+        // And nothing beside it.
+        let mut entries: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![format!("{id}.eml")], "a sidecar was written");
     }
 
     #[tokio::test]
@@ -1680,24 +1643,156 @@ mod tests {
             .expect("discard");
     }
 
+    /// A sink with a real database behind it, for the acceptance path.
+    fn queued_sink(dir: &Path) -> (SpoolSink<pigeon_dns::FakeResolver>, PathBuf) {
+        let db = dir.join("pigeon.db");
+        let mut conn = pigeon_db::open(&db).unwrap();
+        pigeon_db::migrate(&mut conn, &db).unwrap();
+
+        let mut s = sink(dir, &[]);
+        s.queue = Some(Queue {
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            path: Arc::new(db.clone()),
+        });
+        (s, db)
+    }
+
     #[tokio::test]
-    async fn the_null_sender_is_recorded_as_a_bounce_not_as_nothing() {
+    async fn admission_writes_the_graph_the_dsn_will_need() {
+        // The envelope moved from a sidecar into rows, so what used to be a
+        // string in a file is now a graph: the return path, the address the
+        // sender actually used, every recipient they named, and which of them
+        // reaches each destination.
+        let tmp = TempDir::new("admit");
+        let (s, db) = queued_sink(tmp.path());
+        let id = s.next_id();
+        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
+
+        let envelope = Envelope {
+            // Already rewritten by the time admission runs.
+            sender: "SRS0=tag=AAA=remote.test=alice@pigeon.test".into(),
+            recipients: vec!["hello@example.com".into(), "sales@example.com".into()],
+        };
+
+        s.admit(
+            s.queue.as_ref().unwrap(),
+            &spool_id,
+            &envelope,
+            "alice@remote.test",
+            1234,
+            "mailbox@provider.example",
+        )
+        .await
+        .expect("admit");
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let (return_path, original, size): (String, String, i64) = conn
+            .query_row(
+                "SELECT return_path, original_sender, size_bytes FROM message WHERE spool_id = ?1",
+                [spool_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(return_path, "SRS0=tag=AAA=remote.test=alice@pigeon.test");
+        assert_eq!(original, "alice@remote.test");
+        assert_eq!(size, 1234);
+
+        // Both recipients, and both mapped to the destination — the mapping is
+        // what lets a report name the address the sender wrote rather than the
+        // mailbox they have never heard of.
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.address FROM original_recipient o
+                   JOIN recipient_delivery rd ON rd.original_recipient_id = o.id
+                   JOIN delivery d ON d.id = rd.delivery_id
+                  WHERE d.destination = ?1 ORDER BY o.address",
+            )
+            .unwrap();
+        let mapped: Vec<String> = stmt
+            .query_map(["mailbox@provider.example"], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(mapped, vec!["hello@example.com", "sales@example.com"]);
+    }
+
+    #[tokio::test]
+    async fn a_bounce_is_admitted_with_an_empty_return_path() {
+        // The null sender is a fact the queue has to carry: §9 owes no report
+        // for a message that is itself a bounce, and that rule reads
+        // `return_path`.
         let tmp = TempDir::new("bounce");
-        let s = sink(tmp.path(), &[]);
+        let (s, db) = queued_sink(tmp.path());
+        let id = s.next_id();
+        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
+
         let envelope = Envelope {
             sender: String::new(),
             recipients: vec!["a@example.net".into()],
         };
 
-        let id = s.next_id();
-        s.write_message(&id, &envelope, "", b"body\r\n")
-            .await
-            .unwrap();
+        s.admit(
+            s.queue.as_ref().unwrap(),
+            &spool_id,
+            &envelope,
+            "",
+            10,
+            "mailbox@provider.example",
+        )
+        .await
+        .expect("admit");
 
-        let meta = tokio::fs::read_to_string(tmp.path().join(format!("{id}.envelope")))
-            .await
+        let conn = pigeon_db::open(&db).unwrap();
+        let return_path: String = conn
+            .query_row(
+                "SELECT return_path FROM message WHERE spool_id = ?1",
+                [spool_id.as_str()],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(meta.contains("from: <>"), "truncated log line: {meta}");
+        assert!(return_path.is_empty(), "a bounce gained a return path");
+    }
+
+    #[tokio::test]
+    async fn an_admission_that_cannot_commit_says_whether_the_file_may_go() {
+        // The rule the acceptance path turns on. A collision is established
+        // non-commit, so the spool file is an orphan and may be removed.
+        let tmp = TempDir::new("collide");
+        let (s, _db) = queued_sink(tmp.path());
+        let id = s.next_id();
+        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
+        let envelope = Envelope {
+            sender: "SRS0=x@pigeon.test".into(),
+            recipients: vec!["a@example.net".into()],
+        };
+        let queue = s.queue.as_ref().unwrap();
+
+        s.admit(
+            queue,
+            &spool_id,
+            &envelope,
+            "a@remote.test",
+            10,
+            "m@provider.example",
+        )
+        .await
+        .expect("first admission");
+
+        let (why, removable) = s
+            .admit(
+                queue,
+                &spool_id,
+                &envelope,
+                "a@remote.test",
+                10,
+                "m@provider.example",
+            )
+            .await
+            .expect_err("a second admission of the same spool id should fail");
+        assert!(
+            removable,
+            "a collision was not established as non-commit: {why}"
+        );
     }
 
     #[test]
@@ -1800,6 +1895,7 @@ mod tests {
         );
 
         let sink = SpoolSink {
+            queue: None,
             auth: None,
             spool: pigeon_spool::Spool::new(spool.as_path()),
             dir: Arc::clone(&spool),
@@ -2109,6 +2205,7 @@ mod tests {
         );
 
         let sink = SpoolSink {
+            queue: None,
             auth: Some(auth),
             spool: pigeon_spool::Spool::new(spool.as_path()),
             dir: Arc::clone(&spool),
@@ -3082,8 +3179,8 @@ mod tests {
     #[tokio::test]
     async fn the_spool_survey_separates_messages_from_abandoned_temporaries() {
         let tmp = TempDir::new("survey");
-        write_durably(tmp.path(), "a.eml", &[b"one"]).await.unwrap();
-        write_durably(tmp.path(), "a.envelope", &[b"meta"])
+        pigeon_spool::Spool::new(tmp.path().to_path_buf())
+            .install(&pigeon_spool::SpoolId::new("a").unwrap(), &[b"one"])
             .await
             .unwrap();
         // What a crash between create and link leaves.

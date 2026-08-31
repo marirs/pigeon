@@ -30,7 +30,7 @@
 //! non-commit has been *established*, by reading the database back through a
 //! fresh connection. If that read itself fails, the file stays.
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::SpoolId;
 
@@ -175,7 +175,18 @@ pub enum Reconciled {
     Unknown(String),
 }
 
-/// Ask a fresh connection whether these messages exist.
+/// Ask a fresh connection whether these messages are there — *as attempted*.
+///
+/// "Present" means the whole persisted graph matches what acceptance tried to
+/// write: the message row and its identity fields, every original recipient,
+/// every deduplicated delivery, and every mapping edge between them. A message
+/// row alone proves only that *something* was written, and the reason to read
+/// the database back is to find out whether **this** submission is what it
+/// holds.
+///
+/// A mismatch is [`Reconciled::Unknown`] rather than either answer: it means
+/// something other than this transaction wrote, or the database is damaged, and
+/// neither deleting the spool file nor calling it accepted is defensible.
 pub fn reconcile(db_path: &std::path::Path, groups: &[Acceptance]) -> Reconciled {
     let conn = match Connection::open(db_path) {
         Ok(c) => c,
@@ -184,15 +195,10 @@ pub fn reconcile(db_path: &std::path::Path, groups: &[Acceptance]) -> Reconciled
 
     let mut present = 0usize;
     for group in groups {
-        let found: rusqlite::Result<i64> = conn.query_row(
-            "SELECT count(*) FROM message WHERE spool_id = ?1",
-            [group.spool_id.as_str()],
-            |r| r.get(0),
-        );
-        match found {
-            Ok(n) if n > 0 => present += 1,
-            Ok(_) => {}
-            Err(e) => return Reconciled::Unknown(e.to_string()),
+        match verify(&conn, group) {
+            Ok(true) => present += 1,
+            Ok(false) => {}
+            Err(e) => return Reconciled::Unknown(e),
         }
     }
 
@@ -208,6 +214,130 @@ pub fn reconcile(db_path: &std::path::Path, groups: &[Acceptance]) -> Reconciled
             groups.len()
         ))
     }
+}
+
+/// Whether this exact acceptance is in the database.
+///
+/// `Ok(false)` means the message is absent. `Err` means it is there and differs,
+/// which is never an answer worth acting on.
+fn verify(conn: &Connection, group: &Acceptance) -> Result<bool, String> {
+    let row: Option<(i64, String, String, i64, i64, Vec<u8>)> = conn
+        .query_row(
+            "SELECT id, return_path, original_sender, size_bytes, routing_revision,
+                    routing_fingerprint
+               FROM message WHERE spool_id = ?1",
+            [group.spool_id.as_str()],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let Some((id, return_path, original_sender, size_bytes, revision, fingerprint)) = row else {
+        return Ok(false);
+    };
+
+    // The envelope and identity fields. A message row carrying a different
+    // return path is not this message, and forwarding it would send somebody
+    // else's mail under a return path this submission chose.
+    let mismatch = |what: &str| Err(format!("message {} differs in {what}", group.spool_id));
+    if return_path != group.return_path {
+        return mismatch("its return path");
+    }
+    if original_sender != group.original_sender {
+        return mismatch("its sender");
+    }
+    if size_bytes != group.size_bytes {
+        return mismatch("its size");
+    }
+    if revision != group.routing_revision || fingerprint != group.routing_fingerprint {
+        return mismatch("the routing state it was accepted under");
+    }
+
+    // Every recipient the sender named, exactly.
+    let stored_recipients = strings(
+        conn,
+        "SELECT address FROM original_recipient WHERE message_id = ?1 ORDER BY address",
+        id,
+    )?;
+    let mut expected_recipients = group.original_recipients.clone();
+    expected_recipients.sort();
+    if stored_recipients != expected_recipients {
+        return mismatch("its recipients");
+    }
+
+    // Every delivery, exactly. Extra rows matter as much as missing ones: an
+    // unexpected delivery is mail going somewhere this submission did not ask
+    // for.
+    let stored_destinations = strings(
+        conn,
+        "SELECT destination FROM delivery WHERE message_id = ?1 ORDER BY destination",
+        id,
+    )?;
+    let mut expected_destinations: Vec<String> = group
+        .destinations
+        .iter()
+        .map(|d| d.address.clone())
+        .collect();
+    expected_destinations.sort();
+    if stored_destinations != expected_destinations {
+        return mismatch("its destinations");
+    }
+
+    // And every mapping edge, which is what a DSN reads to name the address the
+    // sender wrote.
+    for destination in &group.destinations {
+        let stored = strings_with(
+            conn,
+            "SELECT o.address
+               FROM original_recipient o
+               JOIN recipient_delivery rd ON rd.original_recipient_id = o.id
+               JOIN delivery d ON d.id = rd.delivery_id
+              WHERE d.message_id = ?1 AND d.destination = ?2
+              ORDER BY o.address",
+            id,
+            &destination.address,
+        )?;
+
+        let mut expected: Vec<String> = destination
+            .from_recipients
+            .iter()
+            .filter_map(|i| group.original_recipients.get(*i).cloned())
+            .collect();
+        expected.sort();
+
+        if stored != expected {
+            return mismatch(&format!("which recipients reach {}", destination.address));
+        }
+    }
+
+    Ok(true)
+}
+
+fn strings(conn: &Connection, sql: &str, id: i64) -> Result<Vec<String>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([id], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(|e| e.to_string())
+}
+
+fn strings_with(conn: &Connection, sql: &str, id: i64, arg: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![id, arg], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(|e| e.to_string())
 }
 
 /// One message, its recipients, its deliveries and the mapping between them.
@@ -422,6 +552,58 @@ mod tests {
         match reconcile(&path, &both) {
             Reconciled::Unknown(why) => assert!(why.contains("1 of 2"), "{why}"),
             other => panic!("a partial result was not treated as unknown: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconciliation_checks_the_whole_graph_not_just_a_row() {
+        // "Present" has to mean *this* submission is what the database holds.
+        // A message row alone proves only that something was written, and
+        // acting on that is how a mismatched graph becomes an acceptance.
+        let (path, mut conn) = db("graph");
+        let mut g = group("msg-a", &["a@provider.example", "b@provider.example"]);
+        g.original_recipients = vec!["hello@example.com".into(), "sales@example.com".into()];
+        g.destinations[0].from_recipients = vec![0, 1];
+        g.destinations[1].from_recipients = vec![1];
+
+        accept(&mut conn, &path, std::slice::from_ref(&g), 100).unwrap();
+        assert_eq!(
+            reconcile(&path, std::slice::from_ref(&g)),
+            Reconciled::Committed
+        );
+
+        // Each of these is a graph that is not the one acceptance attempted,
+        // and each must read as unknown rather than as committed or absent.
+        let cases: Vec<(&str, &str)> = vec![
+            ("a delivery removed", "DELETE FROM delivery WHERE destination = 'b@provider.example'"),
+            (
+                "a delivery added",
+                "INSERT INTO delivery(message_id, destination, next_attempt_at)
+                 SELECT id, 'elsewhere@provider.example', 0 FROM message",
+            ),
+            ("a recipient removed", "DELETE FROM original_recipient WHERE address = 'sales@example.com'"),
+            (
+                "a mapping edge removed",
+                "DELETE FROM recipient_delivery
+                  WHERE delivery_id = (SELECT id FROM delivery WHERE destination = 'b@provider.example')",
+            ),
+            ("the return path changed", "UPDATE message SET return_path = 'SRS0=other=AAA=x=y@z'"),
+            ("the size changed", "UPDATE message SET size_bytes = 999"),
+            (
+                "the routing state changed",
+                "UPDATE message SET routing_revision = routing_revision + 1",
+            ),
+        ];
+
+        for (what, sql) in cases {
+            let (path, mut conn) = db("graph-case");
+            accept(&mut conn, &path, std::slice::from_ref(&g), 100).unwrap();
+            conn.execute_batch(sql).unwrap();
+
+            match reconcile(&path, std::slice::from_ref(&g)) {
+                Reconciled::Unknown(_) => {}
+                other => panic!("{what} reconciled as {other:?}"),
+            }
         }
     }
 
