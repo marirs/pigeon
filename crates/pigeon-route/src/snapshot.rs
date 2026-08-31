@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pigeon_types::{Address, DomainGate};
+use pigeon_types::{Address, DomainGate, ForwardPolicy};
 
 use crate::fold;
 use crate::pattern::{PatternError, Wildcard};
@@ -88,12 +88,43 @@ struct WildcardRule {
 struct Domain {
     gate: DomainGate,
     plus_addressing: bool,
+    forwarding: Forwarding,
     /// Keyed by folded local part.
     exact: HashMap<String, (String, Rule)>,
     /// Pre-sorted by §2 precedence, so the first match is the winner and the
     /// ordering cannot be applied inconsistently at two call sites.
     wildcards: Vec<WildcardRule>,
     catchall: Option<Rule>,
+}
+
+/// How a domain's mail is rewritten on the way out, and what signs it.
+///
+/// Read from the same transaction-pinned snapshot as the routing decision, for
+/// the reason the snapshot exists at all: a message must be forwarded under the
+/// policy that was in force when it was accepted. Reading the policy from the
+/// database at delivery time would let a configuration change between the two
+/// produce a message signed under one identity and routed under another.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forwarding {
+    pub policy: ForwardPolicy,
+    /// The active key, if the domain has one. `None` means nothing here can
+    /// sign — which `Preserve` does not need and `RewriteFrom` cannot do
+    /// without.
+    pub dkim: Option<DkimIdentity>,
+}
+
+/// The active DKIM key for a domain, as the database records it.
+///
+/// The private key is *not* here: this names where it lives, and loading it is
+/// the daemon's job, against the configured key root. A snapshot that carried
+/// key material would put it in every clone of the routing table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DkimIdentity {
+    pub selector: String,
+    /// As stored. Resolved against the configured `keys` root by the caller,
+    /// which is where the containment rule lives (`M1-SCHEMA.md`).
+    pub private_key_path: String,
+    pub algorithm: String,
 }
 
 /// An immutable routing table.
@@ -110,6 +141,7 @@ pub struct DomainInput {
     pub name: String,
     pub gate: DomainGate,
     pub plus_addressing: bool,
+    pub forwarding: Forwarding,
     /// The default every inheriting alias resolves to.
     pub default_destination: Option<Destination>,
     pub aliases: Vec<AliasInput>,
@@ -388,6 +420,7 @@ impl Snapshot {
             Domain {
                 gate: input.gate,
                 plus_addressing: input.plus_addressing,
+                forwarding: input.forwarding,
                 exact,
                 wildcards,
                 catchall,
@@ -416,6 +449,16 @@ impl Snapshot {
     /// saw the base. Catch-all waits until both forms have been tried
     /// everywhere else, so tagged mail on a catch-all domain still finds its
     /// alias.
+    /// How this domain's mail is rewritten and signed on the way out.
+    ///
+    /// `None` for a domain this table does not carry — the same answer
+    /// [`Snapshot::resolve`] gives, so a caller cannot get a forwarding policy
+    /// for an address it would have refused.
+    pub fn forwarding(&self, domain: &str) -> Option<&Forwarding> {
+        let folded = fold::domain(domain)?;
+        self.domains.get(folded.as_str()).map(|d| &d.forwarding)
+    }
+
     pub fn resolve(&self, address: &Address<'_>) -> Decision<'_> {
         let Some(folded_domain) = fold::domain(address.domain()) else {
             return Decision::UnknownDomain;

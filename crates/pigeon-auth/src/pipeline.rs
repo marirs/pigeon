@@ -256,12 +256,17 @@ pub enum SealSkipped {
     Failed,
 }
 
-/// Verifier, host identity and (optionally) a signing key.
+/// Verifier and host identity.
+///
+/// Deliberately holds **no** signing key. Which key signs and seals is a
+/// property of the domain the message was accepted for, and that comes from the
+/// same transaction-pinned snapshot as the routing decision — so it is passed
+/// per message rather than baked in here. A pipeline that owned one key would
+/// quietly sign every domain's mail with it.
 #[derive(Debug)]
 pub struct Pipeline {
     verifier: Verifier,
     host_domain: String,
-    signing: Option<SigningKey>,
 }
 
 impl Pipeline {
@@ -269,13 +274,7 @@ impl Pipeline {
         Self {
             verifier,
             host_domain: host_domain.into(),
-            signing: None,
         }
-    }
-
-    pub fn with_signing_key(mut self, key: SigningKey) -> Self {
-        self.signing = Some(key);
-        self
     }
 
     /// Run the whole pipeline over one received payload.
@@ -289,6 +288,7 @@ impl Pipeline {
         envelope: &Envelope<'_>,
         received_header: &str,
         rewrite: &Rewrite,
+        signing: Option<&SigningKey>,
     ) -> Result<Outbound, PipelineError> {
         // The host domain is borrowed by `AuthenticationResults`, so the
         // envelope handed to authentication must borrow from something that
@@ -363,10 +363,8 @@ impl Pipeline {
             let _ = replaced;
 
             // R-8: a rewritten From: is never forwarded unsigned.
-            let key = self
-                .signing
-                .as_ref()
-                .ok_or_else(|| PipelineError::UnsignedRewrite("no signing key".into()))?;
+            let key =
+                signing.ok_or_else(|| PipelineError::UnsignedRewrite("no signing key".into()))?;
             let signature = DkimSigner::from_key(key.key.clone())
                 .domain(&key.domain)
                 .selector(&key.selector)
@@ -379,7 +377,7 @@ impl Pipeline {
 
         // 5. Seal, over the finished outbound form, using the still-live
         //    inbound chain.
-        let (sealed, seal_skipped) = self.seal(&mut payload, results, arc_output);
+        let (sealed, seal_skipped) = seal(signing, &mut payload, results, arc_output);
 
         // 6. Every inbound borrow dies here.
         Ok(Outbound {
@@ -390,52 +388,55 @@ impl Pipeline {
             signed,
         })
     }
+}
 
-    /// Add an ARC set, or say why not.
-    ///
-    /// A chain that arrived `cv=fail` is terminally broken: RFC 8617 does not
-    /// allow extending it, and `mail-auth` enforces that by refusing to seal.
-    /// That is a correct outcome, not a fault — distinct from having no key, or
-    /// from sealing being attempted and failing, which are local problems.
-    fn seal(
-        &self,
-        payload: &mut Relayable,
-        results: &mail_auth::AuthenticationResults<'_>,
-        arc_output: Option<&mail_auth::ArcOutput<'_>>,
-    ) -> (bool, Option<SealSkipped>) {
-        let Some(key) = self.signing.as_ref() else {
-            return (false, Some(SealSkipped::NoKey));
-        };
+/// Add an ARC set, or say why not.
+///
+/// A chain that arrived `cv=fail` is terminally broken: RFC 8617 does not allow
+/// extending it, and `mail-auth` enforces that by refusing to seal. That is a
+/// correct outcome, not a fault — distinct from having no key, or from sealing
+/// being attempted and failing, which are local problems.
+///
+/// A free function rather than a method: it needs the key it was handed, not
+/// the pipeline, and taking `&self` would have invited the key to live there.
+fn seal(
+    signing: Option<&SigningKey>,
+    payload: &mut Relayable,
+    results: &mail_auth::AuthenticationResults<'_>,
+    arc_output: Option<&mail_auth::ArcOutput<'_>>,
+) -> (bool, Option<SealSkipped>) {
+    let Some(key) = signing else {
+        return (false, Some(SealSkipped::NoKey));
+    };
 
-        if arc_output.is_some_and(|a| !a.can_be_sealed()) {
-            return (false, Some(SealSkipped::ChainAlreadyFailed));
+    if arc_output.is_some_and(|a| !a.can_be_sealed()) {
+        return (false, Some(SealSkipped::ChainAlreadyFailed));
+    }
+
+    // Parsed again, because the ARC set signs what is *sent*: the message
+    // including the Received header, the Authentication-Results and any
+    // rewrite made above.
+    let bytes = payload.as_bytes().to_vec();
+    let Some(outbound) = AuthenticatedMessage::parse(&bytes) else {
+        return (false, Some(SealSkipped::Failed));
+    };
+
+    // An absent inbound chain seals as i=1 with cv=none, which is what a
+    // default `ArcOutput` expresses.
+    let default_arc = mail_auth::ArcOutput::default();
+    let arc = arc_output.unwrap_or(&default_arc);
+
+    match ArcSealer::from_key(key.key.clone())
+        .domain(&key.domain)
+        .selector(&key.selector)
+        .headers(SIGNED_HEADERS)
+        .seal(&outbound, results, arc)
+    {
+        Ok(set) => {
+            payload.prepend_headers(&[set.to_header().trim_end().to_string()]);
+            (true, None)
         }
-
-        // Parsed again, because the ARC set signs what is *sent*: the message
-        // including the Received header, the Authentication-Results and any
-        // rewrite made above.
-        let bytes = payload.as_bytes().to_vec();
-        let Some(outbound) = AuthenticatedMessage::parse(&bytes) else {
-            return (false, Some(SealSkipped::Failed));
-        };
-
-        // An absent inbound chain seals as i=1 with cv=none, which is what a
-        // default `ArcOutput` expresses.
-        let default_arc = mail_auth::ArcOutput::default();
-        let arc = arc_output.unwrap_or(&default_arc);
-
-        match ArcSealer::from_key(key.key.clone())
-            .domain(&key.domain)
-            .selector(&key.selector)
-            .headers(SIGNED_HEADERS)
-            .seal(&outbound, results, arc)
-        {
-            Ok(set) => {
-                payload.prepend_headers(&[set.to_header().trim_end().to_string()]);
-                (true, None)
-            }
-            Err(_) => (false, Some(SealSkipped::Failed)),
-        }
+        Err(_) => (false, Some(SealSkipped::Failed)),
     }
 }
 
@@ -471,16 +472,11 @@ mod tests {
         SigningKey::from_pkcs8_pem(key(), "pigeon.test", "sel").unwrap()
     }
 
-    fn pipeline(with_key: bool) -> Pipeline {
-        // `from_system` reads /etc/resolv.conf and performs no lookup, so this
-        // is not a network dependency. Nothing below reaches DNS: every path
-        // under test either has no signatures to verify or fails to parse.
-        let p = Pipeline::new(Verifier::from_system().unwrap(), "pigeon.test");
-        if with_key {
-            p.with_signing_key(signing_key())
-        } else {
-            p
-        }
+    /// `from_system` reads /etc/resolv.conf and performs no lookup, so this is
+    /// not a network dependency. Nothing below reaches DNS: every path under
+    /// test either has no signatures to verify or fails to parse.
+    fn pipeline() -> Pipeline {
+        Pipeline::new(Verifier::from_system().unwrap(), "pigeon.test")
     }
 
     fn envelope() -> Envelope<'static> {
@@ -516,8 +512,14 @@ mod tests {
     async fn the_seal_is_the_topmost_header() {
         // RFC 8617: the ARC set covers the message as it leaves, so nothing
         // Pigeon adds may appear above it.
-        let out = pipeline(true)
-            .process(MESSAGE, &envelope(), RECEIVED, &Rewrite::Preserve)
+        let out = pipeline()
+            .process(
+                MESSAGE,
+                &envelope(),
+                RECEIVED,
+                &Rewrite::Preserve,
+                Some(&signing_key()),
+            )
             .await
             .unwrap();
 
@@ -531,8 +533,14 @@ mod tests {
 
     #[tokio::test]
     async fn the_original_message_is_untouched_below_the_added_headers() {
-        let out = pipeline(true)
-            .process(MESSAGE, &envelope(), RECEIVED, &Rewrite::Preserve)
+        let out = pipeline()
+            .process(
+                MESSAGE,
+                &envelope(),
+                RECEIVED,
+                &Rewrite::Preserve,
+                Some(&signing_key()),
+            )
             .await
             .unwrap();
         assert!(
@@ -543,8 +551,14 @@ mod tests {
 
     #[tokio::test]
     async fn added_headers_are_ordered_seal_then_results_then_received() {
-        let out = pipeline(true)
-            .process(MESSAGE, &envelope(), RECEIVED, &Rewrite::Preserve)
+        let out = pipeline()
+            .process(
+                MESSAGE,
+                &envelope(),
+                RECEIVED,
+                &Rewrite::Preserve,
+                Some(&signing_key()),
+            )
             .await
             .unwrap();
         let at = header_order(
@@ -568,12 +582,13 @@ mod tests {
         // R-8, and the ordering that makes it meaningful: sealing after signing
         // means the ARC set commits to Pigeon's own DKIM signature. Sealing
         // first would sign a message that never goes on the wire.
-        let out = pipeline(true)
+        let out = pipeline()
             .process(
                 MESSAGE,
                 &envelope(),
                 RECEIVED,
                 &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
+                Some(&signing_key()),
             )
             .await
             .unwrap();
@@ -599,12 +614,13 @@ mod tests {
         // permits once. Receivers then disagree about which one counts, and a
         // `h=from` signature ordinarily covers the last occurrence — so Pigeon
         // would sign the author's header and display its own.
-        let out = pipeline(true)
+        let out = pipeline()
             .process(
                 MESSAGE,
                 &envelope(),
                 RECEIVED,
                 &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
+                Some(&signing_key()),
             )
             .await
             .unwrap();
@@ -629,12 +645,13 @@ mod tests {
         // of its own — and one that starts with whitespace, so it attaches to
         // whatever Pigeon prepended above it.
         let folded = b"From: \"A Long Display Name\"\r\n <alice@sender.example>\r\n                       To: <bob@example.com>\r\nSubject: hi\r\n\r\nbody\r\n";
-        let out = pipeline(true)
+        let out = pipeline()
             .process(
                 folded,
                 &envelope(),
                 RECEIVED,
                 &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
+                Some(&signing_key()),
             )
             .await
             .unwrap();
@@ -691,12 +708,13 @@ mod tests {
         // The one local failure that must not degrade. An unsigned rewrite
         // fails DMARC on a domain Pigeon controls, which is worse than not
         // rewriting at all.
-        let err = pipeline(false)
+        let err = pipeline()
             .process(
                 MESSAGE,
                 &envelope(),
                 RECEIVED,
                 &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
+                None,
             )
             .await
             .unwrap_err();
@@ -708,8 +726,8 @@ mod tests {
         // The opposite rule, and the reason the two are separate: a missing ARC
         // set drops a recovery path, which is the pre-ARC status quo and is
         // survivable. Refusing here would lose mail over a local key problem.
-        let out = pipeline(false)
-            .process(MESSAGE, &envelope(), RECEIVED, &Rewrite::Preserve)
+        let out = pipeline()
+            .process(MESSAGE, &envelope(), RECEIVED, &Rewrite::Preserve, None)
             .await
             .unwrap();
         assert!(!out.sealed);
@@ -722,8 +740,14 @@ mod tests {
         // R-5: unconditional whenever authentication was evaluated. This
         // message is unsigned and its sender publishes nothing, which is
         // precisely the case a "write it only on failure" rule would skip.
-        let out = pipeline(true)
-            .process(MESSAGE, &envelope(), RECEIVED, &Rewrite::Preserve)
+        let out = pipeline()
+            .process(
+                MESSAGE,
+                &envelope(),
+                RECEIVED,
+                &Rewrite::Preserve,
+                Some(&signing_key()),
+            )
             .await
             .unwrap();
         assert!(text(&out).contains("Authentication-Results: pigeon.test"));
@@ -735,8 +759,14 @@ mod tests {
         // R-1, end to end: what gets signed and sent is the converted form, and
         // no bare LF survives into the relayed message.
         let raw = b"From: <alice@sender.example>\nSubject: hi\n\nbody\n.\nnot smuggled\n";
-        let out = pipeline(true)
-            .process(raw, &envelope(), RECEIVED, &Rewrite::Preserve)
+        let out = pipeline()
+            .process(
+                raw,
+                &envelope(),
+                RECEIVED,
+                &Rewrite::Preserve,
+                Some(&signing_key()),
+            )
             .await
             .unwrap();
 
@@ -752,12 +782,13 @@ mod tests {
     async fn the_received_header_is_present_even_when_the_message_does_not_parse() {
         // Refusing over a parser disagreement would lose mail; the message is
         // still relayed, and the absence of a seal is recorded.
-        let out = pipeline(true)
+        let out = pipeline()
             .process(
                 b"not a message at all",
                 &envelope(),
                 RECEIVED,
                 &Rewrite::Preserve,
+                Some(&signing_key()),
             )
             .await
             .unwrap();

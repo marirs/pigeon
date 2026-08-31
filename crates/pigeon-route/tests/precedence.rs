@@ -57,6 +57,7 @@ fn live() -> DomainGate {
 fn domain(name: &str, aliases: Vec<AliasInput>) -> DomainInput {
     DomainInput {
         name: name.into(),
+        forwarding: Default::default(),
         gate: live(),
         plus_addressing: true,
         default_destination: None,
@@ -504,6 +505,7 @@ fn a_valid_diamond_is_not_a_loop() {
     // destinations is advertised, so diamonds are ordinary.
     let d = DomainInput {
         name: "example.com".into(),
+        forwarding: Default::default(),
         gate: live(),
         plus_addressing: true,
         default_destination: None,
@@ -533,6 +535,7 @@ fn a_deep_but_acyclic_chain_is_not_a_loop() {
 
     let d = DomainInput {
         name: "example.com".into(),
+        forwarding: Default::default(),
         gate: live(),
         plus_addressing: true,
         default_destination: None,

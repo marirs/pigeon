@@ -144,9 +144,8 @@ async fn pigeons_own_signature_verifies_against_the_message_it_sent() {
         &pair.txt_record(),
     );
 
-    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN).with_signing_key(
-        SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap(),
-    );
+    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN);
+    let signing = SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap();
 
     let out = pipeline
         .process(
@@ -154,6 +153,7 @@ async fn pigeons_own_signature_verifies_against_the_message_it_sent() {
             &envelope(),
             RECEIVED,
             &Rewrite::From(FromAddress::new(&format!("forward@{DOMAIN}")).unwrap()),
+            Some(&signing),
         )
         .await
         .unwrap();
@@ -199,9 +199,8 @@ async fn the_arc_set_verifies_against_the_message_it_sent() {
         &pair.txt_record(),
     );
 
-    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN).with_signing_key(
-        SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap(),
-    );
+    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN);
+    let signing = SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap();
 
     let out = pipeline
         .process(
@@ -209,6 +208,7 @@ async fn the_arc_set_verifies_against_the_message_it_sent() {
             &envelope(),
             RECEIVED,
             &Rewrite::From(FromAddress::new(&format!("forward@{DOMAIN}")).unwrap()),
+            Some(&signing),
         )
         .await
         .unwrap();
@@ -256,9 +256,8 @@ async fn a_chain_that_arrived_failed_is_not_extended() {
          From: <alice@sender.example>\r\nSubject: hi\r\n\r\nbody\r\n"
     );
 
-    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN).with_signing_key(
-        SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap(),
-    );
+    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN);
+    let signing = SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap();
 
     let out = pipeline
         .process(
@@ -266,6 +265,7 @@ async fn a_chain_that_arrived_failed_is_not_extended() {
             &envelope(),
             RECEIVED,
             &Rewrite::Preserve,
+            Some(&signing),
         )
         .await
         .unwrap();
@@ -303,9 +303,8 @@ async fn tampering_with_the_rewritten_from_breaks_the_signature() {
         &pair.txt_record(),
     );
 
-    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN).with_signing_key(
-        SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap(),
-    );
+    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN);
+    let signing = SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap();
 
     let out = pipeline
         .process(
@@ -313,6 +312,7 @@ async fn tampering_with_the_rewritten_from_breaks_the_signature() {
             &envelope(),
             RECEIVED,
             &Rewrite::From(FromAddress::new(&format!("forward@{DOMAIN}")).unwrap()),
+            Some(&signing),
         )
         .await
         .unwrap();

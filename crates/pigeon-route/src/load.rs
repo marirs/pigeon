@@ -12,8 +12,10 @@
 
 use rusqlite::Connection;
 
-use crate::snapshot::{AliasInput, CatchAllInput, Destination, DomainInput};
-use pigeon_types::{DomainGate, DomainStatus};
+use crate::snapshot::{
+    AliasInput, CatchAllInput, Destination, DkimIdentity, DomainInput, Forwarding,
+};
+use pigeon_types::{DomainGate, DomainStatus, ForwardPolicy};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -26,18 +28,36 @@ pub enum LoadError {
          or ungate a broken one."
     )]
     UnknownStatus { domain: String, status: String },
+
+    #[error(
+        "domain {domain} has forward_policy {policy:?}, which this build does not recognise. \
+         Preserve and rewrite_from mean different things to DMARC; guessing would forward \
+         mail under a policy nobody chose."
+    )]
+    UnknownForwardPolicy { domain: String, policy: String },
 }
 
 /// Read every domain and its rules.
 pub fn load(conn: &Connection) -> Result<Vec<DomainInput>, LoadError> {
     let mut stmt = conn.prepare(
+        // The DKIM join is restricted to the *active* key, which the partial
+        // unique index makes at most one per algorithm. Ordering by algorithm
+        // and taking the first is not arbitrary: `rsa2048` sorts before
+        // `ed25519` is false, so the order is stated explicitly below rather
+        // than left to the collation — a domain with both keys must sign with
+        // the one this build can actually use.
         "SELECT d.id, d.name, d.status, d.inbound_enabled, d.outbound_enabled,
-                d.plus_addressing, d.catchall_enabled,
+                d.plus_addressing, d.catchall_enabled, d.forward_policy,
                 dd.local, dd.domain,
-                cd.local, cd.domain
+                cd.local, cd.domain,
+                k.selector, k.private_key_path, k.algorithm
          FROM domain d
          LEFT JOIN destination dd ON dd.id = d.default_destination_id
          LEFT JOIN destination cd ON cd.id = d.catchall_destination_id
+         LEFT JOIN dkim_key k
+                ON k.domain_id = d.id
+               AND k.state = 'active'
+               AND k.algorithm = 'rsa2048'
          ORDER BY d.name",
     )?;
 
@@ -50,8 +70,21 @@ pub fn load(conn: &Connection) -> Result<Vec<DomainInput>, LoadError> {
             outbound_enabled: r.get::<_, i64>(4)? != 0,
             plus_addressing: r.get::<_, i64>(5)? != 0,
             catchall_enabled: r.get::<_, i64>(6)? != 0,
-            default_destination: optional_destination(r, 7, 8)?,
-            catchall_destination: optional_destination(r, 9, 10)?,
+            forward_policy: r.get(7)?,
+            default_destination: optional_destination(r, 8, 9)?,
+            catchall_destination: optional_destination(r, 10, 11)?,
+            dkim: match (
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<String>>(13)?,
+                r.get::<_, Option<String>>(14)?,
+            ) {
+                (Some(selector), Some(private_key_path), Some(algorithm)) => Some(DkimIdentity {
+                    selector,
+                    private_key_path,
+                    algorithm,
+                }),
+                _ => None,
+            },
         })
     })?;
 
@@ -76,6 +109,19 @@ pub fn load(conn: &Connection) -> Result<Vec<DomainInput>, LoadError> {
             destination: raw.catchall_destination.map(|d| vec![d]),
         });
 
+        // Resolved before the struct is built, so the error can name the
+        // domain without fighting the move.
+        let policy = match raw.forward_policy.as_str() {
+            "preserve" => ForwardPolicy::Preserve,
+            "rewrite_from" => ForwardPolicy::RewriteFrom,
+            other => {
+                return Err(LoadError::UnknownForwardPolicy {
+                    domain: raw.name.clone(),
+                    policy: other.to_string(),
+                });
+            }
+        };
+
         out.push(DomainInput {
             name: raw.name,
             gate: DomainGate {
@@ -84,6 +130,16 @@ pub fn load(conn: &Connection) -> Result<Vec<DomainInput>, LoadError> {
                 outbound_enabled: raw.outbound_enabled,
             },
             plus_addressing: raw.plus_addressing,
+            forwarding: Forwarding {
+                // An unrecognised policy is not guessed at. `preserve` and
+                // `rewrite_from` mean different things to DMARC, and picking
+                // either one for a value written by a newer build would forward
+                // mail under a policy nobody chose. The CHECK constraint keeps
+                // this out on the write path; a restored database is why it is
+                // rejected here too.
+                policy,
+                dkim: raw.dkim,
+            },
             default_destination: raw.default_destination,
             aliases,
             catchall,
@@ -101,8 +157,10 @@ struct RawDomain {
     outbound_enabled: bool,
     plus_addressing: bool,
     catchall_enabled: bool,
+    forward_policy: String,
     default_destination: Option<Destination>,
     catchall_destination: Option<Destination>,
+    dkim: Option<DkimIdentity>,
 }
 
 fn load_aliases(conn: &Connection, domain_id: i64) -> Result<Vec<AliasInput>, rusqlite::Error> {

@@ -78,6 +78,7 @@ mod tests {
         let (dl, dd) = to.rsplit_once('@').unwrap();
         Snapshot::build(vec![DomainInput {
             name: "example.com".into(),
+            forwarding: Default::default(),
             gate: DomainGate {
                 status: DomainStatus::Active,
                 inbound_enabled: true,
