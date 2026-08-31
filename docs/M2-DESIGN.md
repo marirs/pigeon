@@ -369,6 +369,28 @@ The file becomes a small ring, newest first:
   operator; making them load-bearing would let a mistyped year change which key
   signs.
 
+`pigeon srs rotate` refuses at the cap rather than dropping the oldest key —
+which is the one whose addresses are closest to expiring, and therefore the one
+a bounce still in flight is most likely to need.
+
+**The ring is part of the published runtime, not startup state.** Rotation
+writes a new file while the daemon runs, so a daemon holding the ring it booted
+with would keep issuing return paths under the key that was just displaced:
+addresses that verify today and stop verifying the moment an operator deletes
+it, weeks later, as bounces that cannot be routed home. The existing reload
+worker therefore reconciles the ring alongside the database, through the same
+publisher — one thing installs a runtime, and the ordering between the routing
+table, the signing keys and the ring never has to be reasoned about. A ring that
+will not load keeps the previous one, which is the rule the table already
+follows.
+
+Rotation replaces the file under an exclusive lock, through a `0600` temporary
+file, fsynced, renamed, with the directory fsynced after. Three different
+failures, and skipping any one of them loses keys: two rotations racing each
+drop the other's key, a partial write leaves a ring nothing can load, and
+content in the page cache with no durable directory entry is a rotation the
+operator believes happened.
+
 ### 5.5 The timestamp, the window, the wrap, and the clock
 
 Classic SRS uses two Base32 characters: days since the SRS epoch modulo 1024.
