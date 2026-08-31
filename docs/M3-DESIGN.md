@@ -246,6 +246,45 @@ A crash *before* the commit leaves orphaned spool files. That is the correct
 failure — the sender did not get a `250` and will retry — and they are collected
 by the sweep in §8.
 
+### 4.1 A failed `COMMIT` is not the same as "nothing committed"
+
+The distinction the acceptance path turns on, and the one place guessing is
+forbidden.
+
+A statement failing *before* the commit is unambiguous: the transaction rolls
+back and nothing exists, so the spool files are orphans and must be removed. A
+`COMMIT` returning an error is not. SQLite can fail a commit with the
+transaction still active, and it can fail to *report* a commit that reached the
+disk — an I/O error on the reply path, a process killed between the write and
+the return.
+
+Classifying that as "nothing committed" and deleting the file destroys a message
+that rows already point at. Nothing recovers it: the body is not in the
+database, and the sender, told nothing, retries into a queue that already
+believes it has the message.
+
+The costs are not symmetric, so neither is the rule:
+
+| Outcome | Cost |
+|---|---|
+| A durable file leaks | recoverable — orphan recovery collects it |
+| A retry duplicates | recoverable — the recipient sees two |
+| A file with committed rows is deleted | **permanent loss** |
+
+So on a failed commit the database is read back **through a fresh connection** —
+the one that failed may be unusable, and asking it what happened is asking the
+thing that just failed. Three answers:
+
+- **every group present** — the commit landed; this is an acceptance,
+- **no group present** — non-commit is *established*; the files may be removed,
+- **anything else**, including the read failing and a partial result no single
+  transaction could produce — **unknown**. The files stay, the sender gets a
+  transient failure, and orphan recovery resolves it later.
+
+The type enforces this rather than a comment: the failure carries which case it
+is, and only the established-non-commit variant answers `spool_may_be_removed`
+with true.
+
 **Recipient rejection at `RCPT TO` is a correctness requirement, not an
 optimisation** (`ARCHITECTURE.md` §2.6.1). Anything accepted and later
 undeliverable must be bounced, and bouncing mail that should have been refused

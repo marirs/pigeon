@@ -1281,7 +1281,9 @@ dependencies = [
 name = "pigeon-spool"
 version = "0.0.1"
 dependencies = [
+ "pigeon-db",
  "pigeon-types",
+ "rusqlite",
  "thiserror",
  "tokio",
  "tracing",

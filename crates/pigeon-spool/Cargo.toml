@@ -12,5 +12,10 @@ publish.workspace      = true
 [dependencies]
 pigeon-types = { workspace = true }
 tokio = { workspace = true }
+rusqlite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+pigeon-db = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
