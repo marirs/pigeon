@@ -85,11 +85,20 @@ jobs:
       # source guard is the right instrument.
       - name: Assert constant-time SRS tag comparison
         run: |
-          if ! grep -q 'ct_eq' crates/pigeon-auth/src/srs.rs; then
+          # Scoped to the comparison itself, not the file. A bare `grep ct_eq`
+          # over the whole source matches the comment that explains why the
+          # call is there, so deleting the call and keeping the comment — the
+          # single most likely way this regresses — would pass.
+          if ! awk '/fn match_tag/,/^    }$/' crates/pigeon-auth/src/srs.rs \
+             | grep -v '^\s*//' \
+             | grep -qE '\.ct_eq\('; then
             echo "::error::SRS tag comparison is no longer constant-time."
             echo
             echo "A byte-at-a-time compare leaks the tag prefix to anyone who"
             echo "can time a bounce, turning 2^40 guesses into 8 x 32."
+            echo
+            echo "No test can catch this: == is functionally identical and"
+            echo "differs only in timing. See M2-DESIGN.md 5.2."
             exit 1
           fi
           echo "SRS tag comparison uses a constant-time equality."

@@ -264,6 +264,19 @@ SRS1=HHHHHHHH=firsthop==HHHHHHHH=TT=origdomain=origlocal@forward.example
 would bury the original sender one layer deeper on every hop, and the address
 would grow without bound.
 
+**`SRS1` carries no timestamp of the wrapping host's own**, and that is the
+classic layout rather than an omission. Implementation raised the question —
+without one, this host's tag on a wrapped address never expires — and the
+ruling is that **interoperability wins**: expiry already exists one hop away.
+The tail is an `SRS0` address issued by the host named in `firsthop`, carrying
+that host's tag and timestamp, and a bounce reaching the wrapper is sent onward
+to exactly that host, which applies its own window.
+
+So the consequence is recorded rather than removed: our tag on an `SRS1`
+address authenticates that this host produced the wrapper, and nothing about
+when. A replayed one lands at the first hop, where the timestamp that governs
+it lives.
+
 ### 5.2 What the HMAC covers, exactly
 
 Classic SRS concatenates timestamp, domain and local part and hashes the
@@ -744,7 +757,7 @@ a version bump or a change of call path.
 | SRS timestamps compare modularly | replace with a plain subtraction |
 | The MAC input is unambiguous | drop the `0x00` separators and rely on concatenation |
 | Escaping is reversible | escape `=` before `%` |
-| Tag comparison is constant-time | replace with `==` |
+| Tag comparison is constant-time | **not testable** — `==` is functionally identical and differs only in timing. Guarded in CI by matching the executable expression inside `match_tag`, with comment lines stripped, because a guard that greps the file matches the comment explaining the call and passes with the call deleted. The guard is itself tested against that mutation. |
 | A queued message keeps its original return path | recompute the address on retry |
 | Rotation happens before signing | advance the ring lazily, after the address is built |
 | Verification accepts any ring key | verify against the newest key only |

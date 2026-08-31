@@ -326,17 +326,15 @@ impl Srs {
             // A foreign SRS0 tail is opaque: its tag is another host's, its
             // timestamp may be two characters or three, and its epoch is its
             // own business. Wrapping it whole is what makes that irrelevant.
-            self.build_srs1(key, &stamp, domain, rest)
+            self.build_srs1(key, domain, rest)
         } else if let Some(rest) = strip_prefix_ci(local, SRS1_PREFIX) {
-            // Already wrapped by someone. Re-tag it with our own key and a
-            // fresh timestamp, keeping the first hop it names.
+            // Already wrapped by someone. Re-tag it with our own key, keeping
+            // the first hop it names.
             let (_, after_tag) = split_once_field(rest).ok_or(SrsError::Malformed("SRS1 tag"))?;
-            let (_, after_stamp) =
-                split_once_field(after_tag).ok_or(SrsError::Malformed("SRS1 timestamp"))?;
-            let (first_hop, tail) = after_stamp
+            let (first_hop, tail) = after_tag
                 .split_once("==")
                 .ok_or(SrsError::Malformed("SRS1 body"))?;
-            self.build_srs1(key, &stamp, first_hop, tail)
+            self.build_srs1(key, first_hop, tail)
         } else {
             self.build_srs0(key, &stamp, domain, local)
         };
@@ -370,18 +368,28 @@ impl Srs {
         )
     }
 
-    /// `SRS1=tag=stamp=firsthop==<opaque tail>`
+    /// `SRS1=tag=firsthop==<opaque tail>` — the classic layout, with no
+    /// timestamp of our own.
     ///
-    /// The timestamp is **ours** and is covered by our tag, which is what makes
-    /// a wrapped address expire. Classic SRS1 carries no timestamp of the
-    /// wrapping host's own, and the tail's timestamp belongs to a host whose
-    /// window, epoch and field width are not ours to assume — so an SRS1
-    /// address without this would be a token that never expires, pointed at
-    /// another forwarder's return path.
-    fn build_srs1(&self, key: &Key, stamp: &str, first_hop: &str, tail: &str) -> String {
+    /// **Expiry belongs to the inner issuer.** The tail is an `SRS0` address
+    /// created by the host named in `firsthop`, carrying that host's tag and
+    /// its timestamp. A bounce reaching this address is sent onward to that
+    /// host, which applies its own window — so the expiry exists, one hop
+    /// away, and duplicating it here would buy nothing that the format's
+    /// recognisability does not outweigh.
+    ///
+    /// The consequence, stated so it is not discovered later: **our tag on an
+    /// SRS1 address does not expire.** What it authenticates is that this host
+    /// produced the wrapper. A replayed one still lands at the first hop,
+    /// which is where the timestamp that governs it lives.
+    ///
+    /// `==` between the hop and the tail is the classic separator, and it is
+    /// what lets a decoder find the start of an opaque tail that contains `=`
+    /// characters of its own.
+    fn build_srs1(&self, key: &Key, first_hop: &str, tail: &str) -> String {
         let hop = into_lowercase(first_hop.to_string());
-        let tag = tag(&key.secret, stamp, &hop, tail);
-        format!("{SRS1_PREFIX}{tag}={stamp}={}=={tail}", escape(&hop))
+        let tag = tag_untimed(&key.secret, &hop, tail);
+        format!("{SRS1_PREFIX}{tag}={}=={tail}", escape(&hop))
     }
 
     /// Turn a rewritten address back into the one it was made from.
@@ -389,7 +397,7 @@ impl Srs {
         if let Some(rest) = strip_prefix_ci(local, SRS0_PREFIX) {
             self.reverse_srs0(rest, now)
         } else if let Some(rest) = strip_prefix_ci(local, SRS1_PREFIX) {
-            self.reverse_srs1(rest, now)
+            self.reverse_srs1(rest)
         } else {
             Err(SrsError::NotRewritten)
         }
@@ -420,17 +428,18 @@ impl Srs {
         })
     }
 
-    fn reverse_srs1(&self, rest: &str, now: Day) -> Result<Reversed, SrsError> {
+    /// No window check: an SRS1 address carries no timestamp of ours, by
+    /// design. See [`Srs::build_srs1`].
+    fn reverse_srs1(&self, rest: &str) -> Result<Reversed, SrsError> {
         let (tag_field, rest) = split_once_field(rest).ok_or(SrsError::Malformed("SRS1 tag"))?;
-        let (stamp, rest) = split_once_field(rest).ok_or(SrsError::Malformed("SRS1 timestamp"))?;
         let (hop_field, tail) = rest
             .split_once("==")
             .ok_or(SrsError::Malformed("SRS1 body"))?;
 
         let first_hop = unescape(hop_field).ok_or(SrsError::Malformed("SRS1 hop escaping"))?;
 
-        self.check_timestamp(stamp, now)?;
-        let key_id = self.verify_tag(tag_field, stamp, &into_lowercase(first_hop.clone()), tail)?;
+        let key_id =
+            self.verify_tag_untimed(tag_field, &into_lowercase(first_hop.clone()), tail)?;
 
         // Back to the forwarder that issued the inner address, which is the
         // only host that can interpret the tail.
@@ -468,6 +477,16 @@ impl Srs {
         Ok(())
     }
 
+    /// [`Srs::verify_tag`] for a tag that covers no timestamp (SRS1).
+    fn verify_tag_untimed(
+        &self,
+        presented: &str,
+        first_hop: &str,
+        tail: &str,
+    ) -> Result<u32, SrsError> {
+        self.match_tag(presented, |secret| tag_untimed(secret, first_hop, tail))
+    }
+
     /// Try every key; return the id of the one that matched.
     ///
     /// Every key is tried because the wire format carries no key identifier —
@@ -479,12 +498,21 @@ impl Srs {
         domain: &str,
         local: &str,
     ) -> Result<u32, SrsError> {
+        self.match_tag(presented, |secret| tag(secret, stamp, domain, local))
+    }
+
+    /// The shared half: try every key, constant-time.
+    fn match_tag(
+        &self,
+        presented: &str,
+        expected_for: impl Fn(&[u8]) -> String,
+    ) -> Result<u32, SrsError> {
         if presented.len() != TAG_CHARS {
             return Err(SrsError::BadTag);
         }
 
         for key in self.ring.keys() {
-            let expected = tag(&key.secret, stamp, domain, local);
+            let expected = expected_for(&key.secret);
             // Constant-time: a byte-at-a-time comparison leaks the tag's
             // prefix to anyone who can time a bounce, and 40 bits recovered a
             // character at a time is 8 x 32 attempts rather than 2^40.
@@ -527,12 +555,28 @@ impl Srs {
 /// domain's business, and folding one would make `User@x` and `user@x`
 /// interchangeable in a return path.
 fn tag(secret: &[u8], stamp: &str, lowercase_domain: &str, local: &str) -> String {
+    tag_fields(secret, &[stamp, lowercase_domain, local])
+}
+
+/// The SRS1 tag: first hop and opaque tail, no timestamp.
+///
+/// A separate function rather than `tag` with an empty stamp, because an empty
+/// first field is a field an attacker could also produce — `tag(k, "", d, l)`
+/// and `tag_untimed(k, d, l)` would then be the same value, and a tag issued
+/// for one form would verify for the other.
+fn tag_untimed(secret: &[u8], lowercase_first_hop: &str, tail: &str) -> String {
+    tag_fields(secret, &["SRS1", lowercase_first_hop, tail])
+}
+
+/// The MAC itself, over any number of fields.
+fn tag_fields(secret: &[u8], fields: &[&str]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(stamp.as_bytes());
-    mac.update(&[0]);
-    mac.update(lowercase_domain.as_bytes());
-    mac.update(&[0]);
-    mac.update(local.as_bytes());
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            mac.update(&[0]);
+        }
+        mac.update(field.as_bytes());
+    }
 
     let out = mac.finalize().into_bytes();
     base32_encode(&out[..TAG_BYTES])
@@ -1091,12 +1135,16 @@ mod tests {
     }
 
     #[test]
-    fn a_wrapped_address_expires_under_our_own_window() {
-        // The departure from classic SRS1, and the reason for it. The tail's
-        // timestamp belongs to another host, whose window, epoch and field
-        // width are not ours to assume — so without a timestamp of our own an
-        // SRS1 address would be a token that never expires, pointed at another
-        // forwarder's return path.
+    fn a_wrapped_address_carries_no_window_of_ours() {
+        // The classic SRS1 layout has no timestamp of the wrapping host's own,
+        // and this pins the consequence rather than leaving it to be found
+        // later: our tag on an SRS1 address does not expire.
+        //
+        // That is the accepted trade. Expiry lives one hop away, with the host
+        // named in the address — it issued the inner SRS0 and applies its own
+        // window when the bounce arrives — and an address other implementations
+        // recognise is worth more than a second copy of a check that already
+        // exists.
         let s = srs();
         let wrapped = s
             .forward(
@@ -1105,11 +1153,25 @@ mod tests {
                 day(20_000),
             )
             .unwrap();
+
+        let much_later = Day(20_000 + WINDOW_DAYS * 100);
+        let back = s.reverse(local_of(&wrapped), much_later).unwrap();
         assert_eq!(
-            s.reverse(local_of(&wrapped), Day(20_000 + WINDOW_DAYS + 1)),
-            Err(SrsError::Expired {
-                age_days: WINDOW_DAYS + 1
-            })
+            back.address, "SRS0=abcd=TT=origin.example=alice@first.example",
+            "a wrapped address stopped resolving to its first hop"
+        );
+    }
+
+    #[test]
+    fn an_srs1_tag_cannot_be_replayed_as_an_srs0_tag() {
+        // `tag_untimed` prefixes the field list with a literal rather than
+        // reusing `tag` with an empty timestamp. Without that, a tag issued for
+        // one form verifies for the other, since an empty first field is one an
+        // attacker can also present.
+        let secret = base64_decode(K2).unwrap();
+        assert_ne!(
+            tag_untimed(&secret, "first.example", "tail"),
+            tag(&secret, "", "first.example", "tail"),
         );
     }
 
