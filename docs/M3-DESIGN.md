@@ -548,10 +548,12 @@ left to implementation:
   temporary**, which is fsynced and renamed before the queue commit.
 - Raw and intermediate files are removed idempotently, and swept after a crash.
 
-A memory map removes the 50 MB heap allocation and does **not** remove
-working-set pressure, which is why the semaphore is part of the ruling rather
-than a tuning knob. The precise file abstraction is not frozen until measurement
-2 below says what `mail-auth` needs to read, and how many times.
+**Measured and now frozen** (§11.2): `AuthenticatedMessage::parse` takes a
+`&[u8]`, so the raw file is **mapped** — a chunked reader cannot satisfy it. A
+map removes the 50 MB heap allocation and does not remove working-set pressure,
+which is why the semaphore is part of the ruling rather than a tuning knob, and
+why it is **sized from CPU count rather than connection count**: the worst case
+is ~23 ms of CPU per megabyte and about twice the message in resident memory.
 
 **R-6 — one coordinator. Ruled.** C-3's two options were a coordinator or a
 composite `(lineage, revision)` epoch; the coordinator wins because the epoch's
@@ -571,21 +573,123 @@ machines that boot together and after a clock step.
 
 ---
 
-## 11. To measure before implementing
+## 11. Measurements
 
-1. **SQLite write throughput under the acceptance path**, with WAL and one
-   `BEGIN IMMEDIATE` per submission. If a commit per message is the ceiling, the
-   design needs a batching story designed now rather than retrofitted.
-2. **What `mail-auth` needs from the payload, and how many times.** R-5's file
-   abstraction depends on it: verification, signing and sealing each parse the
-   message, and whether they can work from a mapped file or need a contiguous
-   slice decides whether the raw file can be mapped or must be read. Freeze the
-   abstraction after this, not before.
+Two of the four are done, on an Apple-silicon laptop with an NVMe SSD, release
+build. Absolute numbers are machine-specific; the *shapes* are not, and the
+shapes are what the design turns on.
+
+### 11.1 Acceptance-path cost is barriers, not rows
+
+```text
+transaction only, WAL
+  synchronous=FULL, fullfsync=ON     205 msg/s    4.9 ms per commit
+  synchronous=FULL, fullfsync=off  12,055 msg/s   0.08 ms per commit
+  synchronous=NORMAL               21,575 msg/s   0.05 ms per commit
+  batched x10, fullfsync=ON       1,876 msg/s    5.3 ms per commit
+
+whole path — spool write, fsync, rename, directory fsync, commit
+  50 KB message, fullfsync=ON          68 msg/s   14.6 ms
+   5 MB message, fullfsync=ON          52 msg/s   19.2 ms
+  50 KB message, fullfsync=off         96 msg/s   10.4 ms
+```
+
+Three findings, in order of how much they matter.
+
+**Row work is free.** One destination and three destinations commit at the same
+rate (205 vs 205); a 5 MB body costs 4.6 ms more than a 50 KB one across the
+whole path, against ~15 ms of barriers. Acceptance is three durability barriers
+— the spool file, its directory, the WAL commit — and everything else is noise.
+
+**So batching does not belong in the initial implementation.** At ~68 messages
+per second the ceiling is ~5.9 million a day, which is not the constraint for
+the deployments this is being built for. Group commit is the lever if it ever
+becomes one, and it is worth ~9× (205 → 1,876) because it amortises the barrier
+rather than the work. Recorded here so nobody has to re-derive it; **R-8** below
+defers it explicitly rather than leaving it unmentioned.
+
+**The durability knob is worth more than the batching one, and it is a
+correctness decision.** `fullfsync=off` is 60× faster and is not a barrier on
+macOS: the commit is in the drive's cache, so a power loss can lose an
+acknowledged message. `synchronous=NORMAL` in WAL is weaker again — it survives
+a process crash, which is what §12.1's kill tests exercise, but not a power
+failure. Pigeon's promise is about accepted mail, so **R-9** rules on this.
+
+### 11.2 What `mail-auth` needs from the payload
+
+```text
+per message, by size (parse / normalise / sign / seal)
+   1 MB    0.1ms   0.5ms    4.0ms    4.2ms  →   8.7ms
+   5 MB    0.0ms   2.3ms   18.6ms   18.2ms  →  39.1ms
+  25 MB    0.0ms  12.1ms   91.4ms   90.3ms  → 193.8ms
+
+body hashes forced by one message (5 MB body)
+   1 signature  →  1 body hash   18.0ms
+   8 signatures →  4 body hashes 77.1ms
+  50 signatures →  4 body hashes 76.8ms
+
+peak RSS for the 25 MB case, holding raw + normalised + signed: 110 MB
+```
+
+**Contiguity is required.** `AuthenticatedMessage::parse` takes `&[u8]`, so a
+mapped file satisfies it and a chunked reader does not. That settles R-5's file
+abstraction: the raw spool file is **mapped, not streamed**, for verification.
+
+**Parsing is header-only and free; the cost is body hashing**, which happens in
+`finalize` once per *distinct* `(canonicalisation, algorithm, l=)` triple rather
+than once per signature. Under strict parsing `l=` must be zero, so the sender's
+only lever is canonicalisation and algorithm — and the measurement shows it
+saturates at **four** body hashes whether the message carries eight signatures
+or fifty.
+
+That is a better bound than `M2-DESIGN.md` §4.4 assumed. The signature cap still
+earns its place — it bounds DNS lookups and public-key verifications, which are
+per signature — but body hashing was already bounded by the library, at roughly
+15 ms/MB in the worst case.
+
+**Worst case per message is therefore about 23 ms/MB** (4 body hashes on
+receipt, normalise, sign, seal), so a 50 MB message is a bit over a second of
+CPU. Concurrency has to be bounded by that, not by connection count: 256
+connections each entitled to a second of CPU and ~2× the message in working set
+is the denial of service R-5 exists to prevent. **The semaphore is sized from
+CPU count**, and the mapped raw file removes the heap copy without removing the
+pressure — peak RSS above is three buffers of a 25 MB message.
+
+### 11.3 Still to measure, before the parts that need them
+
 3. **What real receivers do with the RFC 3464 report** Pigeon generates —
    ideally the same providers as the M2 acceptance test, since a DSN nobody can
-   read is a bounce that did not happen.
+   read is a bounce that did not happen. Blocked on the same infrastructure.
 4. **Lease expiry under a stopped-world process** (`SIGSTOP`), which is the case
    a lease exists for and the one a graceful-shutdown test cannot produce.
+   Needs the queue to exist.
+
+---
+
+## 10b. Rulings the measurements settled
+
+**R-8 — no batching in the initial implementation. Ruled.** One transaction per
+submission. The measured ceiling is ~68 messages per second on the whole
+acceptance path, and group commit is a known ~9× lever if that ever binds.
+Building it now would add a latency knob and a partial-failure mode to buy
+throughput nothing needs.
+
+**R-9 — durability pragmas are part of the promise, not tuning.** `250` means
+the message survives, and the measurements show what each setting actually
+survives:
+
+| Setting | Survives a process crash | Survives power loss | Cost |
+|---|---|---|---|
+| `synchronous=NORMAL` | yes | **no** | 0.05 ms |
+| `synchronous=FULL`, `fullfsync=off` | yes | **not on macOS** | 0.08 ms |
+| `synchronous=FULL`, `fullfsync=ON` | yes | yes | 4.9 ms |
+
+Recommended: **`synchronous=FULL`, and `fullfsync=ON` where the platform has
+it**, with the cost stated in the operator documentation rather than discovered.
+A forwarder that loses acknowledged mail on a power cut has broken the one
+promise this milestone is about — and 68 messages a second is not a constraint
+worth trading it for. An operator who knowingly wants the weaker setting can
+have it, as a documented choice with the failure mode named.
 
 ---
 
