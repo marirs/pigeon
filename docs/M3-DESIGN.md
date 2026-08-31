@@ -1,8 +1,9 @@
 # Milestone 3 — Durability
 
-Design for review. **The rulings in §10 are settled and no implementation
-exists.** None should begin until the Milestone 2 acceptance test has passed or
-its risk has been explicitly accepted again. M2 is *implementation complete, acceptance
+Design for review. **The rulings in §10 are settled, and implementation has
+begun.** The Milestone 2 acceptance test has not run; its risk was accepted
+explicitly by the operator, whose standing decision is that live mailbox testing
+happens when the product is complete. `ROADMAP.md` records the waiver. M2 is *implementation complete, acceptance
 pending*: no message has reached a real mailbox at a real provider. Everything
 below assumes the bytes M2 produces are acceptable to receivers, and that
 assumption is unverified.

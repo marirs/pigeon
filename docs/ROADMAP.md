@@ -142,7 +142,16 @@ Exit criteria:
 
 Forwarded mail is accepted with passing authentication by every major receiving provider, verified against real mailboxes rather than local tests.
 
-**Status: implementation complete, acceptance pending.**
+**Status: implementation complete, acceptance pending — and the gate is
+waived.**
+
+The operator's standing decision is that live mailbox testing happens when the
+product is complete, not before. Milestone 3 therefore proceeds with the risk
+accepted explicitly: everything built on top of this assumes bytes no provider
+has yet accepted, and if a provider objects to something structural — the ARC
+set, the `From:` rewrite — the work above it is unwound rather than adjusted.
+
+That is a deliberate choice, recorded here so it stays one.
 
 Every item above is built and tested. The pipeline is wired into the delivery
 path and its output is verified cryptographically rather than by inspection —

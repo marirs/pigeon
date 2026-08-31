@@ -35,11 +35,18 @@ pub struct Migration {
 ///
 /// Append only. Editing a released entry is what the checksum in I2 exists to
 /// catch, and it will catch it on the next start.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: include_bytes!("../migrations/0001_initial.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: include_bytes!("../migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "queue",
+        sql: include_bytes!("../migrations/0002_queue.sql"),
+    },
+];
 
 /// What a run did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,8 +360,8 @@ mod tests {
         let applied = migrate(&mut conn, &tmp.db()).expect("migrate");
 
         assert_eq!(applied.from, 0);
-        assert_eq!(applied.to, 1);
-        assert_eq!(applied.versions, vec![1]);
+        assert_eq!(applied.to, 2);
+        assert_eq!(applied.versions, vec![1, 2]);
 
         // The tables the design actually specifies, not merely "some tables".
         let mut names: Vec<String> = conn
@@ -370,11 +377,16 @@ mod tests {
             vec![
                 "alias",
                 "alias_destination",
+                "delivery",
+                "delivery_event",
                 "destination",
                 "dkim_key",
                 "domain",
+                "message",
+                "original_recipient",
                 "principal",
                 "principal_grant",
+                "recipient_delivery",
                 "relay",
                 "schema_migration",
                 "sender_identity",
@@ -403,6 +415,16 @@ mod tests {
             indexes,
             vec![
                 "alias_destination_by_destination",
+                // The queue's indexes. Each one is a rule rather than a
+                // performance note: due work, owed notifications, and leases
+                // that may have expired are the three scans a worker makes,
+                // and a table of terminal rows is what it would scan without
+                // them.
+                "delivery_by_message",
+                "delivery_due",
+                "delivery_event_by_delivery",
+                "delivery_leases",
+                "delivery_owed",
                 "dkim_key_one_active",
                 "domain_by_catchall_dest",
                 "domain_by_default_dest",
@@ -415,7 +437,10 @@ mod tests {
         );
 
         // I9: readable by an operator with nothing but sqlite3.
-        assert_eq!(crate::schema_version(&conn).unwrap(), 1);
+        assert_eq!(
+            crate::schema_version(&conn).unwrap(),
+            MIGRATIONS.last().unwrap().version
+        );
     }
 
     /// The constraints the schema review established, checked through
@@ -517,8 +542,9 @@ mod tests {
 
         let second = migrate(&mut conn, &tmp.db()).expect("second");
         assert!(second.is_empty(), "re-applied a migration: {second:?}");
-        assert_eq!(second.from, 1);
-        assert_eq!(second.to, 1);
+        let latest = MIGRATIONS.last().unwrap().version;
+        assert_eq!(second.from, latest);
+        assert_eq!(second.to, latest);
 
         // No backup for a no-op run. Otherwise every restart of a
         // fully-migrated daemon copies the database for nothing.
@@ -574,15 +600,18 @@ mod tests {
         let (tmp, mut conn) = fresh("future");
         migrate(&mut conn, &tmp.db()).expect("migrate");
 
+        // One past whatever this build knows, so the test does not need
+        // editing every time a migration is added.
+        let future = MIGRATIONS.last().unwrap().version + 1;
         conn.execute(
             "INSERT INTO schema_migration (version, name, checksum, applied_at)
-             VALUES (2, 'from-a-newer-build', 'x', 0)",
-            [],
+             VALUES (?1, 'from-a-newer-build', 'x', 0)",
+            [future],
         )
         .unwrap();
 
         match migrate(&mut conn, &tmp.db()) {
-            Err(DbError::UnknownMigration { version }) => assert_eq!(version, 2),
+            Err(DbError::UnknownMigration { version }) => assert_eq!(version, future),
             other => panic!("a future database was accepted: {other:?}"),
         }
     }
@@ -596,12 +625,6 @@ mod tests {
 
         conn.execute("DELETE FROM schema_migration WHERE version = 1", [])
             .unwrap();
-        conn.execute(
-            "INSERT INTO schema_migration (version, name, checksum, applied_at)
-             VALUES (2, 'later', 'x', 0)",
-            [],
-        )
-        .unwrap();
 
         match migrate(&mut conn, &tmp.db()) {
             Err(DbError::VersionGap { expected, found }) => {
