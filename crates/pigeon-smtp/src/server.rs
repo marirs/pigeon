@@ -140,7 +140,14 @@ fn received_header(hostname: &str, session: &Session, peer: SocketAddr, tls: boo
     )
 }
 
-#[derive(Debug, Clone)]
+/// The shared form of [`crate::session::ReturnPathCheck`].
+///
+/// Named so the type is not repeated at every call site, and shared rather than
+/// cloned per connection: it holds the SRS key ring, and a copy per concurrent
+/// session would be a copy of the key material per session.
+pub type SharedReturnPathCheck = dyn Fn(&str) -> Result<(), usize> + Send + Sync;
+
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Name used in the banner and EHLO response. Must match forward and
     /// reverse DNS or receiving systems will distrust everything sent.
@@ -168,6 +175,33 @@ pub struct ServerConfig {
     /// client's handshake would be parsed as SMTP commands — a downgrade that
     /// looks like a working encrypted session from the outside.
     pub tls_available: bool,
+    /// Refuse recipients whose sender cannot be given a return path (R-4).
+    ///
+    /// Shared rather than cloned per connection: it holds the SRS key ring,
+    /// and one copy per concurrent session would be one copy of the key
+    /// material per session.
+    ///
+    /// `None` means no sender is refused for this reason, which is what a
+    /// Pigeon with no forwarding configured should do — and what keeps the
+    /// protocol tests independent of the rewriting scheme.
+    pub return_path: Option<Arc<SharedReturnPathCheck>>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    /// Hand-written because the return-path check is a closure. It shows
+    /// whether one is wired in, which is the operationally interesting bit.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("hostname", &self.hostname)
+            .field("max_message_size", &self.max_message_size)
+            .field("command_timeout", &self.command_timeout)
+            .field("data_timeout", &self.data_timeout)
+            .field("max_connections", &self.max_connections)
+            .field("max_session", &self.max_session)
+            .field("tls_available", &self.tls_available)
+            .field("return_path", &self.return_path.is_some())
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -183,6 +217,7 @@ impl Default for ServerConfig {
             max_connections: 256,
             max_session: Duration::from_secs(3600),
             tls_available: false,
+            return_path: None,
         }
     }
 }
@@ -260,6 +295,9 @@ async fn handle<S: MessageSink>(
         config.tls_available,
         config.max_message_size,
     );
+    if let Some(check) = config.return_path.clone() {
+        session = session.with_return_path_check(Box::new(move |sender| check(sender)));
+    }
     let mut lines = LineReader::new(MAX_COMMAND_LINE);
     let mut line = Vec::with_capacity(MAX_COMMAND_LINE);
     let mut chunk = vec![0u8; 8 * 1024];

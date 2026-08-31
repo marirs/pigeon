@@ -885,11 +885,50 @@ async fn run() -> io::Result<()> {
         forwarding,
     };
 
+    // R-4: a sender whose rewritten return path would not fit in a 64-octet
+    // local part cannot be forwarded, and the last moment at which refusing is
+    // still the *upstream* MTA's problem is `RCPT`. After `250` there is a
+    // message that can neither be forwarded nor bounced, and generating a DSN
+    // here would be generating mail — which needs the Milestone 3 queue.
+    //
+    // Absent configuration, no check: a Pigeon with no SRS ring refuses nobody
+    // for this reason.
+    let return_path = match &booted {
+        Some((b, _)) => {
+            let path = b.config.config().srs_secret_file.clone();
+            let ring = pigeon_auth::KeyRing::load(&path).map_err(|e| {
+                // Local, unambiguous misconfiguration: an unreadable ring means
+                // every forwarded message would lose its return path, which is
+                // not something to discover one bounce at a time.
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("SRS key ring {} is unusable: {e}", path.display()),
+                )
+            })?;
+            let srs = pigeon_auth::Srs::new(ring, hostname.clone());
+            Some(Arc::new(move |sender: &str| {
+                let (local, domain) = sender.rsplit_once('@').unwrap_or((sender, ""));
+                match srs.forward(local, domain, pigeon_auth::Day::now()) {
+                    Err(pigeon_auth::SrsError::TooLong { octets }) => Err(octets),
+                    // Every other failure is about this host — no signing key,
+                    // a ring that stopped signing — and is not the sender's
+                    // fault. Refusing their mail for it would be blaming them
+                    // for a local fault, and the message still forwards with
+                    // whatever the delivery path can do.
+                    _ => Ok(()),
+                }
+            })
+                as Arc<pigeon_smtp::server::SharedReturnPathCheck>)
+        }
+        None => None,
+    };
+
     let config = ServerConfig {
         hostname,
         // TLS arrives with the rest of Milestone 5; advertising it now would
         // invite clients to negotiate something that does not exist.
         tls_available: false,
+        return_path,
         ..Default::default()
     };
 

@@ -138,6 +138,24 @@ pub fn too_many_recipients() -> Reply {
     Reply::line(452, "Too many recipients")
 }
 
+/// The sender cannot be given a working return path.
+///
+/// Permanent, and refused at `RCPT` rather than after the message is accepted
+/// (`M2-DESIGN.md` R-4). Forwarding rewrites the envelope sender so bounces can
+/// find their way home, and RFC 5321 caps a local part at 64 octets — a long
+/// enough original sender does not fit. Discovering that after `250` would
+/// leave a message that can neither be forwarded nor bounced.
+///
+/// Refusing before acceptance leaves the DSN to the upstream MTA, which still
+/// has the message and a relationship with its sender. Pigeon generating one
+/// would be generating mail, which needs the Milestone 3 queue to be safe.
+///
+/// The text says what is wrong without saying how long the limit is or what the
+/// rewritten form looks like: reply text is attacker-visible.
+pub fn sender_cannot_be_rewritten() -> Reply {
+    Reply::line(550, "Sender address too long to forward")
+}
+
 pub fn message_too_large() -> Reply {
     Reply::line(552, "Message exceeds maximum size")
 }

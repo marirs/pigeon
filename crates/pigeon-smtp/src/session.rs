@@ -115,7 +115,6 @@ impl Message {
 }
 
 /// One SMTP conversation.
-#[derive(Debug)]
 pub struct Session {
     state: State,
     hostname: String,
@@ -132,7 +131,40 @@ pub struct Session {
     /// that succeeds — so a resettable counter never reaches its limit and the
     /// probing is bounded only by the session lifetime.
     refusals: usize,
+    /// Whether a sender can be given a working return path, if anything has
+    /// been wired in to answer.
+    ///
+    /// A boxed predicate rather than a dependency on `pigeon-auth`: this crate
+    /// speaks the protocol, and the rewriting scheme is not its business. What
+    /// it needs to know is one bit, at one point in the transaction.
+    return_path: Option<ReturnPathCheck>,
 }
+
+impl std::fmt::Debug for Session {
+    /// Hand-written because the return-path check is a closure.
+    ///
+    /// The envelope is deliberately included: it is what a session is *about*,
+    /// and a `Debug` that hid it would be useless in exactly the case anyone
+    /// formats a session — working out which transaction misbehaved.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("state", &self.state)
+            .field("hostname", &self.hostname)
+            .field("peer_name", &self.peer_name)
+            .field("envelope", &self.envelope)
+            .field("tls", &self.tls)
+            .field("errors", &self.errors)
+            .field("refusals", &self.refusals)
+            .field("return_path", &self.return_path.is_some())
+            .finish()
+    }
+}
+
+/// Answers "can this sender be rewritten?" for [`Session`].
+///
+/// `Err` carries the octets the rewritten local part would have taken, for the
+/// log — never for the reply, which is attacker-visible.
+pub type ReturnPathCheck = Box<dyn Fn(&str) -> Result<(), usize> + Send + Sync>;
 
 impl Session {
     /// Start a session. The caller sends the greeting returned by
@@ -148,7 +180,19 @@ impl Session {
             max_message_size,
             errors: 0,
             refusals: 0,
+            return_path: None,
         }
+    }
+
+    /// Refuse recipients whose forwarding would need a return path that cannot
+    /// be built (R-4).
+    ///
+    /// Wired in by the daemon, which owns the rewriting scheme. Left unset, no
+    /// sender is refused for this reason — which is what the protocol tests
+    /// want, and what a Pigeon with no forwarding configured should do.
+    pub fn with_return_path_check(mut self, check: ReturnPathCheck) -> Self {
+        self.return_path = Some(check);
+        self
     }
 
     /// The banner to send on connect.
@@ -314,6 +358,25 @@ impl Session {
             return self.protocol_error(reply::syntax_error());
         };
 
+        // Before anything is recorded: a sender that cannot be given a return
+        // path cannot be forwarded, and this is the last moment at which
+        // refusing is still the upstream MTA's problem rather than Pigeon's
+        // (R-4). Checked here rather than at `MAIL FROM` because it is only a
+        // problem for a recipient that would actually be forwarded.
+        //
+        // The null sender is exempt: a bounce is not forwarded and needs no
+        // return path of its own.
+        if !self.envelope.sender.is_empty()
+            && let Some(check) = &self.return_path
+            && let Err(octets) = check(&self.envelope.sender)
+        {
+            tracing::info!(
+                octets,
+                "refusing a recipient: the rewritten sender would not fit in a local part"
+            );
+            return Action::Reply(reply::sender_cannot_be_rewritten());
+        }
+
         // A repeat is accepted, as the specification requires, but recorded
         // once. Without this, a hundred identical RCPT commands produce a
         // hundred deliveries of one message to one mailbox, and consume the
@@ -435,6 +498,99 @@ mod tests {
 
     fn session() -> Session {
         Session::new("mx1.example.net", true, 50 * 1024 * 1024)
+    }
+
+    // ------------------------------------------- the return-path refusal (R-4)
+
+    /// Refuses any sender whose local part is longer than `limit`.
+    fn refuse_longer_than(limit: usize) -> ReturnPathCheck {
+        Box::new(move |sender: &str| {
+            let local = sender.split('@').next().unwrap_or_default();
+            if local.len() > limit {
+                Err(local.len())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn session_with_check(limit: usize) -> Session {
+        let mut s = Session::new("mx1.example.net", false, 50 * 1024 * 1024)
+            .with_return_path_check(refuse_longer_than(limit));
+        run(&mut s, b"EHLO client.example");
+        s
+    }
+
+    #[test]
+    fn a_sender_that_cannot_be_rewritten_is_refused_at_rcpt() {
+        // Before acceptance, so the upstream MTA still owns the message and
+        // the DSN. After 250 there would be a message that can neither be
+        // forwarded nor bounced.
+        let mut s = session_with_check(5);
+        run(&mut s, b"MAIL FROM:<averylongsenderaddress@sender.example>");
+
+        let reply = run(&mut s, b"RCPT TO:<bob@example.com>");
+        assert_eq!(code(&reply), 550, "{reply:?}");
+        assert!(
+            matches!(&reply, Action::Reply(r) if r.is_permanent()),
+            "a retry would produce the same answer"
+        );
+        assert!(
+            s.envelope().recipients.is_empty(),
+            "a refused recipient was recorded anyway"
+        );
+    }
+
+    #[test]
+    fn a_sender_that_fits_is_accepted() {
+        // The test above passes just as well if every recipient is refused.
+        let mut s = session_with_check(5);
+        run(&mut s, b"MAIL FROM:<short@sender.example>");
+        assert_eq!(code(&run(&mut s, b"RCPT TO:<bob@example.com>")), 250);
+        assert_eq!(s.envelope().recipients.len(), 1);
+    }
+
+    #[test]
+    fn the_null_sender_is_never_refused() {
+        // A bounce is not forwarded and needs no return path of its own, so
+        // there is nothing to rewrite and nothing that can fail to fit.
+        // Refusing here would reject every incoming DSN.
+        //
+        // The check refuses *everything*, so the exemption is the only thing
+        // that can produce a 250. An earlier version used a length limit of
+        // zero, which an empty sender passes — the test could not fail.
+        let mut s = Session::new("mx1.example.net", false, 50 * 1024 * 1024)
+            .with_return_path_check(Box::new(|sender: &str| Err(sender.len())));
+        run(&mut s, b"EHLO client.example");
+        run(&mut s, b"MAIL FROM:<>");
+        assert_eq!(code(&run(&mut s, b"RCPT TO:<bob@example.com>")), 250);
+    }
+
+    #[test]
+    fn without_a_check_no_sender_is_refused() {
+        // The default. A Pigeon with nothing wired in refuses nobody for this
+        // reason, which is what keeps the protocol tests independent of the
+        // rewriting scheme.
+        let mut s = session();
+        run(&mut s, b"EHLO client.example");
+        run(&mut s, b"MAIL FROM:<averylongsenderaddress@sender.example>");
+        assert_eq!(code(&run(&mut s, b"RCPT TO:<bob@example.com>")), 250);
+    }
+
+    #[test]
+    fn the_refusal_does_not_leak_the_limit_or_the_rewritten_form() {
+        // Reply text is attacker-visible, and finding 21 is about what ends up
+        // in it. The octet count goes to the log instead.
+        let mut s = session_with_check(5);
+        run(&mut s, b"MAIL FROM:<averylongsenderaddress@sender.example>");
+        let reply = run(&mut s, b"RCPT TO:<bob@example.com>");
+        let Action::Reply(reply) = reply else {
+            panic!("expected a reply: {reply:?}")
+        };
+        let wire = reply.to_wire();
+        assert!(!wire.contains("64"), "{wire}");
+        assert!(!wire.contains("SRS"), "{wire}");
+        assert!(!wire.contains("averylong"), "{wire}");
     }
 
     fn run(s: &mut Session, line: &[u8]) -> Action {
