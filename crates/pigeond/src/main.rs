@@ -66,6 +66,14 @@ const MAX_CONCURRENT_DELIVERIES: usize = 32;
 /// out first, not whether one does.
 const TOTAL_FORWARD_BUDGET: Duration = Duration::from_secs(1800);
 
+/// How long a queue claim is held.
+///
+/// Must outlast [`TOTAL_FORWARD_BUDGET`], or a row is reclaimed underneath a
+/// running attempt and the outcome the remote gave is discarded as fenced.
+/// Checked at startup rather than trusted: the two live in different crates.
+const CLAIM_LEASE: Duration =
+    Duration::from_secs(pigeon_spool::queue::DEFAULT_LEASE_SECONDS as u64);
+
 /// Where forwarded mail is sent, and who we claim to be when sending it.
 ///
 /// Generic over the resolver so delivery can be driven by `FakeResolver` in
@@ -1460,6 +1468,16 @@ async fn run() -> io::Result<()> {
             }
         }) as Arc<pigeon_smtp::server::SharedReturnPathCheck>
     });
+
+    // A claim must outlast the delivery it covers, or a row is reclaimed
+    // underneath a live attempt and the remote's real answer is discarded as
+    // fenced. The two constants live in different crates, so the relationship
+    // is checked rather than assumed — and at startup, because the failure it
+    // prevents looks like a remote problem rather than a configuration one.
+    pigeon_spool::queue::assert_lease_exceeds_deadline(
+        CLAIM_LEASE.as_secs() as i64,
+        TOTAL_FORWARD_BUDGET.as_secs() as i64,
+    );
 
     // The queue's own connection. Opened here rather than shared with the
     // reload worker's: that one is read-only by design, so that a detector

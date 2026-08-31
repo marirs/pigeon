@@ -13,6 +13,8 @@ publish.workspace      = true
 pigeon-types = { workspace = true }
 tokio = { workspace = true }
 rusqlite = { workspace = true }
+# Claim tokens. A counter resets with the process; randomness does not.
+getrandom = "0.3"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

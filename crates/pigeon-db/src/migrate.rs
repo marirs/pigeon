@@ -46,6 +46,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "queue",
         sql: include_bytes!("../migrations/0002_queue.sql"),
     },
+    Migration {
+        version: 3,
+        name: "claim-token",
+        sql: include_bytes!("../migrations/0003_claim_token.sql"),
+    },
 ];
 
 /// What a run did.
@@ -360,8 +365,13 @@ mod tests {
         let applied = migrate(&mut conn, &tmp.db()).expect("migrate");
 
         assert_eq!(applied.from, 0);
-        assert_eq!(applied.to, 2);
-        assert_eq!(applied.versions, vec![1, 2]);
+        let latest = MIGRATIONS.last().unwrap().version;
+        assert_eq!(applied.to, latest);
+        assert_eq!(
+            applied.versions,
+            (1..=latest).collect::<Vec<_>>(),
+            "a fresh database should apply every migration in order"
+        );
 
         // The tables the design actually specifies, not merely "some tables".
         let mut names: Vec<String> = conn

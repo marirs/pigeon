@@ -31,9 +31,11 @@
 #![forbid(unsafe_code)]
 
 pub mod accept;
+pub mod queue;
 pub mod store;
 
 pub use accept::{AcceptFailure, Acceptance, Destination, Reconciled, accept};
+pub use queue::{Applied, Claim, Outcome, claim, complete};
 pub use store::{InvalidSpoolId, Spool, SpoolError, SpoolId};
 
 // M3: lease-based claim, exponential backoff, bounce via SRS. The writer is

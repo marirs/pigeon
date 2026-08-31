@@ -135,10 +135,19 @@ fn a_claim_and_delivering_are_the_same_fact() {
     );
     assert!(e.contains("CHECK"), "a lease with no owner: {e}");
 
+    let e = refused(
+        &conn,
+        &format!("UPDATE delivery SET claim_token = 'tok' WHERE id = {d}"),
+    );
+    assert!(e.contains("CHECK"), "a token with no owner: {e}");
+
     // A complete claim on a row that is not delivering.
     let e = refused(
         &conn,
-        &format!("UPDATE delivery SET claimed_by='worker-1', lease_expires_at=60 WHERE id = {d}"),
+        &format!(
+            "UPDATE delivery SET claimed_by='worker-1', claim_token='tok', lease_expires_at=60
+              WHERE id = {d}"
+        ),
     );
     assert!(e.contains("CHECK"), "a claim without delivering: {e}");
 
@@ -152,8 +161,8 @@ fn a_claim_and_delivering_are_the_same_fact() {
     conn.execute(
         &format!(
             "UPDATE delivery
-                SET state='delivering', claimed_by='worker-1', lease_expires_at=60,
-                    next_attempt_at=NULL, attempts=attempts+1
+                SET state='delivering', claimed_by='worker-1', claim_token='tok',
+                    lease_expires_at=60, next_attempt_at=NULL, attempts=attempts+1
               WHERE id = {d}"
         ),
         [],
