@@ -19,6 +19,10 @@ pigeon-route = { workspace = true }
 pigeon-smtp = { workspace = true }
 # For the outbound TLS configuration handed to the delivery client.
 rustls = { workspace = true }
+
+# `statvfs`, for the spool's free space. Acceptance stops before the disk is
+# full rather than after.
+libc = "0.2"
 pigeon-spool = { workspace = true }
 pigeon-alert = { workspace = true }
 rusqlite = { workspace = true }

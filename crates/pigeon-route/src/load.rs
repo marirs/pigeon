@@ -68,10 +68,6 @@ pub fn load(conn: &Connection) -> Result<Vec<DomainInput>, LoadError> {
             forward_policy: r.get(7)?,
             default_destination: optional_destination(r, 8, 9)?,
             catchall_destination: optional_destination(r, 10, 11)?,
-            // Loaded per domain below rather than joined here: a domain may
-            // publish more than one active selector — RSA plus an optional
-            // Ed25519 — and a join would multiply every domain row by its keys.
-            dkim: Vec::new(),
         })
     })?;
 
@@ -147,7 +143,6 @@ struct RawDomain {
     forward_policy: String,
     default_destination: Option<Destination>,
     catchall_destination: Option<Destination>,
-    dkim: Vec<DkimIdentity>,
 }
 
 /// Every active signing identity for one domain.

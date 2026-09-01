@@ -35,6 +35,15 @@ pub struct Migration {
 ///
 /// Append only. Editing a released entry is what the checksum in I2 exists to
 /// catch, and it will catch it on the next start.
+/// The newest schema this build knows how to produce.
+///
+/// Read by `pigeon verify`, which has to tell "this database is damaged" from
+/// "this database was written by a newer build" — the second is a downgrade and
+/// the fix is a different binary, not a restore.
+pub fn latest_version() -> u32 {
+    MIGRATIONS.last().map(|m| m.version).unwrap_or(0)
+}
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -65,6 +74,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "greylist",
         sql: include_bytes!("../migrations/0006_greylist.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "freeze",
+        sql: include_bytes!("../migrations/0007_freeze.sql"),
     },
 ];
 
@@ -451,6 +465,7 @@ mod tests {
                 "delivery_by_message",
                 "delivery_due",
                 "delivery_event_by_delivery",
+                "delivery_frozen",
                 "delivery_leases",
                 "delivery_owed",
                 "dkim_key_one_active",

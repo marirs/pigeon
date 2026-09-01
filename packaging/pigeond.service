@@ -1,0 +1,73 @@
+# systemd unit for pigeond.
+#
+# Install to /etc/systemd/system/pigeond.service, then:
+#   systemctl daemon-reload && systemctl enable --now pigeond
+#
+# The hardening below is not decoration. A mail server is reachable by anyone,
+# and every line here removes something it never needs: writing outside its own
+# state, seeing other processes, gaining privileges, loading kernel modules.
+
+[Unit]
+Description=Pigeon mail forwarding
+Documentation=https://github.com/marirs/pigeon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+Environment=PIGEON_CONFIG=/etc/pigeon/pigeon.toml
+ExecStart=/usr/local/bin/pigeond
+
+# SIGTERM is what stops it, and it is what the daemon handles: accepting and
+# claiming stop first, then what is in flight is drained. The timeout is
+# comfortably above the daemon's own 20-second drain, so systemd never has to
+# send SIGKILL for an orderly shutdown.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# Restart on failure, not on a clean exit: a daemon that exited because its
+# configuration is wrong should stay stopped rather than loop while an operator
+# reads the log.
+Restart=on-failure
+RestartSec=5s
+
+User=pigeon
+Group=pigeon
+
+# Port 25 needs a privileged bind and nothing else does.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# State: the database, the spool, the keys. Everything else is read-only.
+StateDirectory=pigeon
+ReadWritePaths=/var/lib/pigeon
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# The log goes to the journal. Pigeon writes structured lines to stderr and
+# rotates nothing itself: the journal already does that, and a daemon that
+# rotated its own logs would be a second thing to configure and a second thing
+# to get wrong. See docs/OPERATIONS.md for a syslog or file-based setup.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

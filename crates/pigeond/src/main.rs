@@ -35,6 +35,7 @@
 
 mod delivery;
 mod health;
+mod metrics;
 mod notify;
 mod reload;
 mod routing;
@@ -88,6 +89,16 @@ const TOTAL_FORWARD_BUDGET: Duration = Duration::from_secs(1800);
 /// record is collected before its bounce is sent is a failure nobody can
 /// explain afterwards.
 const RETAIN_RECORDS_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How much room the spool filesystem must keep.
+///
+/// Acceptance stops below this, with a `452`, so the sender keeps the message
+/// and retries. The alternative is accepting mail and then failing to write it,
+/// which is the same outage with a lost message on the end.
+///
+/// A fixed floor rather than a percentage: a percentage of a 4TB volume is a
+/// number nobody chose, and what matters is whether the next message fits.
+const DISK_FLOOR: u64 = 256 * 1024 * 1024;
 
 /// How long shutdown waits for work already in progress.
 ///
@@ -630,6 +641,84 @@ struct SpoolSink {
     boot: u32,
     /// What is refused during the conversation, and to whom it does not apply.
     abuse: Arc<Abuse>,
+    /// The spool filesystem, watched so acceptance stops before it fills.
+    disk: Arc<Disk>,
+}
+
+/// Whether there is room to accept another message.
+///
+/// Refusing at `MAIL FROM` with a `452` is the honest failure: the sender keeps
+/// the message and retries, and a host that is out of disk gets quiet rather
+/// than accepting mail it cannot write. Accepting and then failing to spool is
+/// the same outage with a lost message on the end of it.
+///
+/// Sampled rather than checked per message: `statvfs` on every `MAIL FROM`
+/// would put a syscall on the hot path to answer a question whose answer
+/// changes over minutes.
+#[derive(Debug)]
+struct Disk {
+    path: PathBuf,
+    /// Bytes that must remain free.
+    floor: u64,
+    /// The last reading, and when it was taken.
+    seen: std::sync::Mutex<(std::time::Instant, u64)>,
+}
+
+impl Disk {
+    /// How often the filesystem is asked. Long enough not to be a per-message
+    /// cost, short enough that a filling disk is noticed inside one retry.
+    const SAMPLE: Duration = Duration::from_secs(30);
+
+    fn new(path: PathBuf, floor: u64) -> Self {
+        let free = free_space(&path).unwrap_or(u64::MAX);
+        Self {
+            path,
+            floor,
+            seen: std::sync::Mutex::new((std::time::Instant::now(), free)),
+        }
+    }
+
+    /// Whether there is room. A filesystem that cannot be read is treated as
+    /// having room: refusing every message because `statvfs` failed would be a
+    /// self-inflicted outage, and the spool write itself still fails honestly.
+    fn has_room(&self) -> bool {
+        let mut seen = match self.seen.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        if seen.0.elapsed() >= Self::SAMPLE {
+            *seen = (
+                std::time::Instant::now(),
+                free_space(&self.path).unwrap_or(u64::MAX),
+            );
+        }
+        seen.1 > self.floor
+    }
+}
+
+/// Free bytes on the filesystem holding `path`.
+#[cfg(unix)]
+fn free_space(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    // SAFETY: `statvfs` fills the struct and reads a NUL-terminated path. Both
+    // hold here, and the return code is checked before the struct is read.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_space(_path: &Path) -> std::io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "free space is only read on unix",
+    ))
 }
 
 /// The reputation controls, resolved once.
@@ -773,6 +862,16 @@ impl MessageSink for SpoolSink {
     /// DNS outage into a total mail outage here.
     async fn accepts_connection(&self, peer: std::net::SocketAddr) -> pigeon_smtp::Connection {
         use pigeon_dns::dnsbl::Listing;
+
+        // Before anything else: a host with no room for the message should say
+        // so now rather than after the sender has transmitted it.
+        if !self.disk.has_room() {
+            tracing::error!(
+                spool = %self.disk.path.display(),
+                "refusing connections: the spool filesystem is nearly full"
+            );
+            return pigeon_smtp::Connection::Refuse("insufficient storage".into());
+        }
 
         if self.abuse.blocklists.is_empty() || self.abuse.trusts(peer.ip()) {
             return pigeon_smtp::Connection::Accept;
@@ -1663,6 +1762,7 @@ async fn run() -> io::Result<()> {
         counter: Arc::new(AtomicU64::new(0)),
         boot: std::process::id(),
         abuse,
+        disk: Arc::new(Disk::new(sink_dir.clone(), DISK_FLOOR)),
     };
 
     let config = ServerConfig {
@@ -1693,6 +1793,18 @@ async fn run() -> io::Result<()> {
         retain_seconds: RETAIN_RECORDS_FOR.as_secs() as i64,
         worker,
     });
+
+    // The metrics endpoint, when one is configured. Started before the
+    // workers so a scraper sees the host coming up rather than seeing nothing
+    // and concluding it is down.
+    let stop_metrics = match started.config.config().metrics.listen {
+        Some(listen) => Some(
+            metrics::Metrics::start(listen, db_path.clone())
+                .await
+                .map_err(|e| io::Error::new(e.kind(), format!("cannot bind {listen}: {e}")))?,
+        ),
+        None => None,
+    };
 
     // Periodic DNS checks, gating and alerts. Started here with the others,
     // and after every fallible step for the same reason.
@@ -1849,6 +1961,11 @@ async fn run() -> io::Result<()> {
     stop_health.stop();
     drop(stop_health.supervise());
 
+    if let Some(m) = stop_metrics {
+        m.stop();
+        drop(m.supervise());
+    }
+
     served.unwrap_or(Ok(()))
 }
 
@@ -2001,6 +2118,9 @@ mod tests {
             counter: Arc::new(AtomicU64::new(0)),
             boot: 0x1234_5678,
             abuse: no_abuse_controls(),
+            // A floor of zero: these tests are about acceptance, and a test
+            // host that happens to be short of disk should not fail them.
+            disk: Arc::new(Disk::new(dir.to_path_buf(), 0)),
         };
         (sink, db)
     }
@@ -2984,6 +3104,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_full_spool_refuses_the_connection_rather_than_the_message() {
+        // Refusing at connect is the honest failure: the sender keeps the
+        // message and retries. Accepting and then failing to write it is the
+        // same outage with a lost message on the end.
+        let tmp = TempDir::new("disk-full");
+        let (mut s, db) = queued_sink(tmp.path());
+
+        // A floor no filesystem can be above.
+        s.disk = Arc::new(Disk::new(tmp.path().to_path_buf(), u64::MAX - 1));
+
+        assert!(
+            matches!(
+                s.accepts_connection("192.0.2.10:2525".parse().unwrap())
+                    .await,
+                pigeon_smtp::Connection::Refuse(_)
+            ),
+            "a full spool still accepted a connection"
+        );
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_filesystem_does_not_stop_the_mail() {
+        // Refusing every message because `statvfs` failed would be a
+        // self-inflicted outage. The spool write itself still fails honestly if
+        // there really is no room.
+        let disk = Disk::new(PathBuf::from("/nonexistent/spool"), 0);
+        assert!(disk.has_room(), "an unreadable filesystem refused mail");
+    }
+
+    #[tokio::test]
     async fn a_blocklist_that_cannot_answer_does_not_refuse() {
         // The rule the whole check turns on. A list that is down and treated as
         // "listed" refuses every message from everyone — a total mail outage
@@ -3433,6 +3589,7 @@ mod tests {
             counter: Arc::new(AtomicU64::new(0)),
             boot: 0x0bad_cafe,
             abuse: no_abuse_controls(),
+            disk: Arc::new(Disk::new(dir.to_path_buf(), 0)),
         };
 
         let deliverer = delivery::Deliverer::start(delivery::DeliveryConfig {

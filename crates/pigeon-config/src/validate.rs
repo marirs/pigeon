@@ -487,6 +487,7 @@ mod tests {
             smtp: crate::Smtp::default(),
             alerts: crate::Alerts::default(),
             abuse: crate::Abuse::default(),
+            metrics: crate::Metrics::default(),
         }
     }
 

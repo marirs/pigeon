@@ -98,6 +98,25 @@ pub struct Config {
 
     #[serde(default)]
     pub abuse: Abuse,
+
+    #[serde(default)]
+    pub metrics: Metrics,
+}
+
+/// The metrics endpoint.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    /// Where to serve Prometheus metrics, or absent for not at all.
+    ///
+    /// **Bind it to loopback.** The endpoint is unauthenticated and describes
+    /// who sends mail here, what is failing and which domains are gated — an
+    /// operational map of the host. A scraper on the same machine needs no
+    /// authentication; anything else does, and Pigeon has none to offer. The
+    /// daemon warns at startup when this is not a loopback address, because "I
+    /// did not realise it was reachable" is the usual way this goes wrong.
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
 }
 
 /// Reputation controls: what is refused during the conversation.

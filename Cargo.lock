@@ -1329,12 +1329,14 @@ dependencies = [
  "anyhow",
  "clap",
  "getrandom 0.3.4",
+ "libc",
  "pigeon-auth",
  "pigeon-config",
  "pigeon-db",
  "pigeon-dns",
  "pigeon-route",
  "pigeon-smtp",
+ "pigeon-spool",
  "pigeon-types",
  "rsa",
  "rusqlite",
@@ -1431,6 +1433,7 @@ name = "pigeond"
 version = "0.0.1"
 dependencies = [
  "getrandom 0.3.4",
+ "libc",
  "mail-auth",
  "pigeon-alert",
  "pigeon-auth",

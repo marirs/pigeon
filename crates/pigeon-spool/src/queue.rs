@@ -149,6 +149,12 @@ pub fn claim(
                FROM delivery d
                JOIN message m ON m.id = d.message_id
               WHERE d.state IN ('queued','deferred')
+                -- Frozen rows are held back deliberately, and holding them back
+                -- has to happen here rather than at the attempt: a claim taken
+                -- and then discarded would count as an attempt and move the
+                -- backoff on, so an operator's freeze would quietly push the
+                -- retry schedule out.
+                AND d.frozen_at IS NULL
                 AND d.next_attempt_at <= ?1
               ORDER BY d.next_attempt_at
               LIMIT ?2",
@@ -308,6 +314,176 @@ pub fn expire_old(conn: &Connection, horizon_seconds: i64, now: i64) -> rusqlite
             AND (SELECT received_at FROM message WHERE id = delivery.message_id) < ?2",
         rusqlite::params![now, now - horizon_seconds],
     )
+}
+
+/// Hold a message's deliveries back, or let them go again.
+///
+/// Freezing stops Pigeon *trying*; it does not stop the clock. The horizon
+/// still runs, so a destination frozen and forgotten expires and reports like
+/// any other — which is the outcome that does not silently swallow mail.
+///
+/// Terminal rows are left alone: there is nothing to hold back, and freezing
+/// one would suggest a retry that is never coming.
+pub fn freeze(conn: &Connection, selector: &Selector, now: i64) -> rusqlite::Result<usize> {
+    let (clause, param) = selector.sql();
+    conn.execute(
+        &format!(
+            "UPDATE delivery SET frozen_at = ?2
+              WHERE frozen_at IS NULL
+                AND state IN ('queued','deferred')
+                AND {clause}"
+        ),
+        rusqlite::params![param, now],
+    )
+}
+
+/// Release held deliveries.
+///
+/// The next attempt time is left as it was: a thawed row is due when it was
+/// already due, and resetting it would send every held message at once to a
+/// destination that may still be the reason they were held.
+pub fn thaw(conn: &Connection, selector: &Selector) -> rusqlite::Result<usize> {
+    let (clause, param) = selector.sql();
+    conn.execute(
+        &format!("UPDATE delivery SET frozen_at = NULL WHERE frozen_at IS NOT NULL AND {clause}"),
+        rusqlite::params![param],
+    )
+}
+
+/// Make held or deferred deliveries due immediately.
+///
+/// Thaws as well, because "retry this now" from an operator who froze it means
+/// what it says. Terminal rows are not revived: a delivered message is not
+/// resent, and a failed one has already had its report generated — reviving it
+/// would produce a second delivery of a message whose sender was told it failed.
+pub fn retry_now(conn: &Connection, selector: &Selector, now: i64) -> rusqlite::Result<usize> {
+    let (clause, param) = selector.sql();
+    conn.execute(
+        &format!(
+            "UPDATE delivery
+                SET next_attempt_at = ?2, frozen_at = NULL
+              WHERE state IN ('queued','deferred') AND {clause}"
+        ),
+        rusqlite::params![param, now],
+    )
+}
+
+/// Which deliveries an operator's command is about.
+#[derive(Debug, Clone)]
+pub enum Selector {
+    /// One message, by its spool identifier — the id the `250` gave the sender.
+    Message(String),
+    /// Every delivery to a destination domain.
+    Domain(String),
+    /// Everything held or due.
+    All,
+}
+
+impl Selector {
+    /// The `WHERE` fragment and the value it binds as `?1`.
+    ///
+    /// A fragment rather than a built string: the value is always bound, so a
+    /// domain named `'; DROP TABLE` is a domain nothing matches rather than a
+    /// statement. Callers bind their own values from `?2` onwards.
+    fn sql(&self) -> (&'static str, String) {
+        match self {
+            Self::Message(spool_id) => (
+                "message_id = (SELECT id FROM message WHERE spool_id = ?1)",
+                spool_id.clone(),
+            ),
+            // Matched on the destination's domain, which is what an operator
+            // means by "freeze example.net": the mail going *there*.
+            Self::Domain(domain) => (
+                "lower(substr(destination, instr(destination, '@') + 1)) = lower(?1)",
+                domain.clone(),
+            ),
+            Self::All => ("?1 = ?1", String::new()),
+        }
+    }
+}
+
+/// One row of `pigeon queue list`.
+#[derive(Debug, Clone)]
+pub struct QueueEntry {
+    pub delivery_id: i64,
+    pub spool_id: String,
+    pub destination: String,
+    pub state: String,
+    pub attempts: i64,
+    pub next_attempt_at: Option<i64>,
+    pub frozen_at: Option<i64>,
+    pub last_code: Option<i64>,
+    pub last_response: Option<String>,
+    pub original_sender: String,
+    pub received_at: i64,
+}
+
+/// What is in the queue, newest arrivals last.
+///
+/// Terminal rows are excluded unless asked for: after a day they are most of
+/// the table, and an operator asking "what is stuck?" does not mean "what has
+/// ever been sent from this host?".
+pub fn list(
+    conn: &Connection,
+    include_terminal: bool,
+    limit: usize,
+) -> rusqlite::Result<Vec<QueueEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.id, m.spool_id, d.destination, d.state, d.attempts,
+                d.next_attempt_at, d.frozen_at, d.last_code, d.last_response,
+                m.original_sender, m.received_at
+           FROM delivery d
+           JOIN message m ON m.id = d.message_id
+          WHERE (?1 OR d.state NOT IN ('delivered','failed','expired'))
+          ORDER BY m.received_at, d.id
+          LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![include_terminal, limit as i64], |r| {
+        Ok(QueueEntry {
+            delivery_id: r.get(0)?,
+            spool_id: r.get(1)?,
+            destination: r.get(2)?,
+            state: r.get(3)?,
+            attempts: r.get(4)?,
+            next_attempt_at: r.get(5)?,
+            frozen_at: r.get(6)?,
+            last_code: r.get(7)?,
+            last_response: r.get(8)?,
+            original_sender: r.get(9)?,
+            received_at: r.get(10)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// One thing that happened to a delivery.
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub at: i64,
+    pub kind: String,
+    /// The remote's code, when a remote said anything. A local failure has
+    /// none, which is the difference between "they refused it" and "we could
+    /// not send it".
+    pub code: Option<i64>,
+    pub response: Option<String>,
+}
+
+/// Everything recorded about one delivery, in order.
+pub fn events(conn: &Connection, delivery_id: i64) -> rusqlite::Result<Vec<Event>> {
+    let mut stmt = conn.prepare(
+        "SELECT at, kind, code, response FROM delivery_event
+          WHERE delivery_id = ?1 ORDER BY at, id",
+    )?;
+    let rows = stmt.query_map([delivery_id], |r| {
+        Ok(Event {
+            at: r.get(0)?,
+            kind: r.get(1)?,
+            code: r.get(2)?,
+            response: r.get(3)?,
+        })
+    })?;
+    rows.collect()
 }
 
 /// Delete the records of messages that were settled long enough ago.

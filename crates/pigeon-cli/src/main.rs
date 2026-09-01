@@ -92,6 +92,8 @@
 
 mod check;
 mod import;
+mod ops;
+mod queue;
 mod srs;
 
 use std::path::PathBuf;
@@ -184,6 +186,23 @@ enum Command {
         #[command(subcommand)]
         verb: Option<RouteVerb>,
     },
+    /// Is this host working?
+    Health,
+    /// Copy the database somewhere safe.
+    Backup {
+        /// Where to write it. Never overwritten.
+        to: PathBuf,
+    },
+    /// Check a database — or a backup — before trusting it.
+    Verify {
+        /// Defaults to the configured database.
+        path: Option<PathBuf>,
+    },
+    /// What is waiting to be delivered, and what to do about it.
+    Queue {
+        #[command(subcommand)]
+        verb: Option<QueueVerb>,
+    },
     /// Operator notifications.
     Alerts {
         #[command(subcommand)]
@@ -193,6 +212,42 @@ enum Command {
     Srs {
         #[command(subcommand)]
         verb: Option<SrsVerb>,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueVerb {
+    /// Everything waiting, oldest first.
+    List {
+        /// Include messages that are already delivered, failed or expired.
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Everything recorded about one message.
+    Show { message: String },
+    /// Try again now.
+    Retry {
+        /// A message id, or `--domain example.net`, or nothing for everything.
+        message: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Stop trying, without giving up.
+    ///
+    /// The horizon still runs: a frozen delivery expires and its sender is
+    /// still told, which is what stops a forgotten freeze from swallowing mail.
+    Freeze {
+        message: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Start trying again.
+    Thaw {
+        message: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
     },
 }
 
@@ -592,6 +647,72 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
                 Ok(exit::OK)
             }
             Some(v) => import_cmd(cli, v),
+        },
+        Command::Health => {
+            let conn = open_read(cli)?;
+            let spool = cli
+                .config
+                .as_ref()
+                .and_then(|p| pigeon_config::Config::load(p).ok())
+                .map(|c| c.spool);
+            ops::health(&conn, spool.as_deref(), cli.json)
+        }
+        Command::Backup { to } => {
+            let conn = open_read(cli)?;
+            let keys = cli
+                .config
+                .as_ref()
+                .and_then(|p| pigeon_config::Config::load(p).ok())
+                .map(|c| c.keys);
+            ops::backup(&conn, to, keys.as_deref(), cli.json)
+        }
+        Command::Verify { path } => {
+            let path = match path {
+                Some(p) => p.clone(),
+                None => database_path(cli)?,
+            };
+            ops::verify(&path, cli.json)
+        }
+        Command::Queue { verb } => match verb {
+            None => {
+                print_help("queue");
+                Ok(exit::OK)
+            }
+            Some(QueueVerb::List { all, limit }) => {
+                let conn = open_read(cli)?;
+                queue::list(&conn, *all, *limit, cli.json)
+            }
+            Some(QueueVerb::Show { message }) => {
+                let conn = open_read(cli)?;
+                queue::show(&conn, message, cli.json)
+            }
+            Some(QueueVerb::Retry { message, domain }) => {
+                let conn = open_write(cli)?;
+                queue::act(
+                    &conn,
+                    queue::Action::Retry,
+                    selector(message.as_deref(), domain.as_deref()),
+                    cli.json,
+                )
+            }
+            Some(QueueVerb::Freeze { message, domain }) => {
+                let conn = open_write(cli)?;
+                queue::act(
+                    &conn,
+                    queue::Action::Freeze,
+                    selector(message.as_deref(), domain.as_deref()),
+                    cli.json,
+                )
+            }
+            Some(QueueVerb::Thaw { message, domain }) => {
+                let conn = open_write(cli)?;
+                queue::act(
+                    &conn,
+                    queue::Action::Thaw,
+                    selector(message.as_deref(), domain.as_deref()),
+                    cli.json,
+                )
+            }
         },
         Command::Alerts { verb } => match verb {
             None => {
@@ -1534,6 +1655,28 @@ Getting started:
 
 fn print_help(noun: &str) {
     match noun {
+        "queue" => println!(
+            r#"What is waiting to be delivered.
+
+USAGE
+  pigeon queue <verb> [message] [--domain <domain>]
+
+VERBS
+  list       everything waiting, oldest first
+  show       everything recorded about one message
+  retry      try again now
+  freeze     stop trying, without giving up
+  thaw       start trying again
+
+Freezing stops Pigeon trying. It does not stop the clock: a frozen delivery
+still expires at the five-day horizon and its sender is still told.
+
+EXAMPLES
+  pigeon queue list
+  pigeon queue show 1788264852-0bad-000001
+  pigeon queue freeze --domain example.net
+  pigeon queue retry --domain example.net"#
+        ),
         "alerts" => println!(
             r#"Operator notifications.
 
@@ -1801,6 +1944,28 @@ fn alerts_test(cli: &Cli) -> anyhow::Result<u8> {
             Ok(exit::FAILED)
         }
     }
+}
+
+/// Which deliveries a queue command is about.
+///
+/// A message wins over a domain when both are given: the narrower instruction
+/// is the one the operator meant, and guessing the wider one could freeze a
+/// domain when they asked about one message.
+fn selector(message: Option<&str>, domain: Option<&str>) -> pigeon_spool::queue::Selector {
+    use pigeon_spool::queue::Selector;
+    match (message, domain) {
+        (Some(m), _) => Selector::Message(m.to_string()),
+        (None, Some(d)) => Selector::Domain(d.to_string()),
+        (None, None) => Selector::All,
+    }
+}
+
+/// Seconds since the epoch, which is the clock the queue keeps.
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn keys_root(cli: &Cli) -> anyhow::Result<PathBuf> {

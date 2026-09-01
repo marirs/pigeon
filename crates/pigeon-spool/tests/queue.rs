@@ -728,3 +728,180 @@ fn a_report_outlives_the_failure_it_explains() {
     assert_eq!(queue::expire_metadata(&f.conn, 100, 9_000).unwrap(), 1);
     assert_eq!(messages(&f), 0);
 }
+
+// -------------------------------------------------------- operator commands
+
+#[test]
+fn a_frozen_delivery_is_not_claimed_and_its_clock_keeps_running() {
+    // Freezing stops Pigeon trying; it does not stop the horizon. A
+    // destination frozen and forgotten expires and reports like any other,
+    // which is the outcome that does not silently swallow mail.
+    let mut f = Fixture::new("freeze");
+    f.accept("m-1", &["a@example.net"], 1_000, "SRS0=x@pigeon.test");
+
+    assert_eq!(
+        queue::freeze(&f.conn, &queue::Selector::All, 1_100).unwrap(),
+        1
+    );
+
+    // Not claimed while frozen — and not claimed *and discarded*, which would
+    // count as an attempt and push the backoff out.
+    let claims = queue::claim(&mut f.conn, "w", LEASE, 10, 2_000, tokens()).unwrap();
+    assert!(claims.is_empty(), "a frozen delivery was claimed");
+    assert_eq!(f.column::<i64>(1, "attempts"), 0);
+
+    // The horizon still applies.
+    assert_eq!(queue::expire_old(&f.conn, 100, 9_000).unwrap(), 1);
+    assert_eq!(f.state(1), "expired");
+}
+
+#[test]
+fn thawing_leaves_the_schedule_alone() {
+    // Resetting the next attempt on thaw would send every held message at once
+    // to a destination that may still be the reason they were held.
+    let mut f = Fixture::new("thaw");
+    f.accept("m-1", &["a@example.net"], 1_000, "SRS0=x@pigeon.test");
+
+    // Defer it into the future first.
+    let claim = queue::claim(&mut f.conn, "w", LEASE, 1, 1_000, tokens())
+        .unwrap()
+        .pop()
+        .unwrap();
+    queue::complete(
+        &f.conn,
+        &claim,
+        &Outcome::Deferred {
+            code: Some(451),
+            response: "later".into(),
+            next_attempt_at: 5_000,
+        },
+        1_000,
+    )
+    .unwrap();
+
+    queue::freeze(&f.conn, &queue::Selector::All, 1_100).unwrap();
+    assert_eq!(queue::thaw(&f.conn, &queue::Selector::All).unwrap(), 1);
+    assert_eq!(f.column::<i64>(1, "next_attempt_at"), 5_000);
+    assert!(f.column::<Option<i64>>(1, "frozen_at").is_none());
+}
+
+#[test]
+fn retrying_makes_a_held_delivery_due_now() {
+    // "Retry this now" from the operator who froze it means what it says, so a
+    // retry thaws as well.
+    let mut f = Fixture::new("retry");
+    f.accept("m-1", &["a@example.net"], 1_000, "SRS0=x@pigeon.test");
+    queue::freeze(&f.conn, &queue::Selector::All, 1_100).unwrap();
+
+    assert_eq!(
+        queue::retry_now(&f.conn, &queue::Selector::Message("m-1".into()), 3_000).unwrap(),
+        1
+    );
+    assert_eq!(f.column::<i64>(1, "next_attempt_at"), 3_000);
+
+    let claims = queue::claim(&mut f.conn, "w", LEASE, 10, 3_000, tokens()).unwrap();
+    assert_eq!(claims.len(), 1, "a retried delivery was not claimable");
+}
+
+#[test]
+fn a_terminal_delivery_is_never_revived() {
+    // A delivered message is not resent, and a failed one has already had its
+    // report generated — reviving it would deliver a message whose sender was
+    // told it failed.
+    let mut f = Fixture::new("revive");
+    f.accept("m-1", &["a@example.net"], 1_000, "SRS0=x@pigeon.test");
+
+    let claim = queue::claim(&mut f.conn, "w", LEASE, 1, 1_000, tokens())
+        .unwrap()
+        .pop()
+        .unwrap();
+    queue::complete(
+        &f.conn,
+        &claim,
+        &Outcome::Delivered {
+            code: 250,
+            response: "ok".into(),
+        },
+        1_000,
+    )
+    .unwrap();
+
+    assert_eq!(
+        queue::retry_now(&f.conn, &queue::Selector::All, 2_000).unwrap(),
+        0
+    );
+    assert_eq!(
+        queue::freeze(&f.conn, &queue::Selector::All, 2_000).unwrap(),
+        0
+    );
+    assert_eq!(f.state(1), "delivered");
+}
+
+#[test]
+fn a_selector_matches_the_destination_domain_and_nothing_else() {
+    // "Freeze example.net" means the mail going *there*. A value that looks
+    // like SQL is a domain nothing matches rather than a statement.
+    let mut f = Fixture::new("selector");
+    f.accept(
+        "m-1",
+        &["a@example.net", "b@other.example"],
+        1_000,
+        "SRS0=x@pigeon.test",
+    );
+
+    assert_eq!(
+        queue::freeze(
+            &f.conn,
+            &queue::Selector::Domain("EXAMPLE.NET".into()),
+            1_100
+        )
+        .unwrap(),
+        1,
+        "the domain match is not case-insensitive"
+    );
+    assert_eq!(
+        queue::freeze(
+            &f.conn,
+            &queue::Selector::Domain("'; DROP TABLE delivery; --".into()),
+            1_100
+        )
+        .unwrap(),
+        0
+    );
+
+    let listed = queue::list(&f.conn, false, 100).unwrap();
+    assert_eq!(listed.len(), 2, "the table did not survive the selector");
+    assert_eq!(listed.iter().filter(|e| e.frozen_at.is_some()).count(), 1);
+}
+
+#[test]
+fn listing_hides_terminal_rows_unless_asked() {
+    // After a day the queue is mostly terminal rows, and "what is stuck?" does
+    // not mean "what has this host ever sent?".
+    let mut f = Fixture::new("list");
+    f.accept("m-1", &["a@example.net"], 1_000, "SRS0=x@pigeon.test");
+    let claim = queue::claim(&mut f.conn, "w", LEASE, 1, 1_000, tokens())
+        .unwrap()
+        .pop()
+        .unwrap();
+    queue::complete(
+        &f.conn,
+        &claim,
+        &Outcome::Delivered {
+            code: 250,
+            response: "ok".into(),
+        },
+        1_000,
+    )
+    .unwrap();
+
+    assert!(queue::list(&f.conn, false, 100).unwrap().is_empty());
+    assert_eq!(queue::list(&f.conn, true, 100).unwrap().len(), 1);
+
+    // And what happened to it is readable.
+    let events = queue::events(&f.conn, 1).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "deliver"),
+        "the delivery event was not recorded: {events:?}"
+    );
+}

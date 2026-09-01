@@ -31,6 +31,13 @@ rsa = { workspace = true }
 pigeon-dns = { workspace = true }
 # One delivery path: `alerts test` sends the way the daemon does.
 pigeon-smtp = { workspace = true }
+# The queue's own semantics: freezing, retrying and what counts as due.
+pigeon-spool = { workspace = true }
+
+# `statvfs`, for the free space `pigeon health` reports. Already in the graph
+# through every crate that touches the filesystem; named here because this one
+# calls it directly.
+libc = "0.2"
 
 [dev-dependencies]
 pigeon-db = { workspace = true }

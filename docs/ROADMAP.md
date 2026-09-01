@@ -284,21 +284,21 @@ A fresh domain can be added, its required records printed, its DNS validated, an
 
 ## Milestone 6 — Operations
 
-- [ ] queue inspection
-- [ ] retry one message
-- [ ] retry a domain
-- [ ] freeze / unfreeze
-- [ ] delivery log with search
-- [ ] disk pressure protection
-- [ ] database integrity check
-- [ ] backup command
-- [ ] restore validation
-- [ ] metrics endpoint, local-only by default
-- [ ] health command
-- [ ] systemd unit
-- [ ] Docker image
-- [ ] log rotation guidance
-- [ ] graceful upgrades
+- [x] queue inspection
+- [x] retry one message
+- [x] retry a domain
+- [x] freeze / unfreeze
+- [x] delivery log with search
+- [x] disk pressure protection
+- [x] database integrity check
+- [x] backup command
+- [x] restore validation
+- [x] metrics endpoint, local-only by default
+- [x] health command
+- [x] systemd unit
+- [x] Docker image
+- [x] log rotation guidance
+- [x] graceful upgrades
 
 Backup deserves specific attention. DKIM private keys are the only state that cannot be regenerated: losing them means republishing DNS for every domain by hand.
 
