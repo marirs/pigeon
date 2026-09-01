@@ -175,7 +175,7 @@ pub async fn check_host(resolver: &SystemResolver, hostname: &str, addresses: &[
                     .map(|n| n.trim_end_matches('.').to_ascii_lowercase())
                     .collect();
 
-                if !named.iter().any(|n| *n == ours) {
+                if !named.contains(&ours) {
                     out.findings.push(Finding::new(
                         Severity::Error,
                         "ptr.mismatch",
@@ -284,7 +284,7 @@ async fn check_mx(resolver: &SystemResolver, domain: &str, expected: &Expected, 
         .map(|r| r.exchange.trim_end_matches('.').to_ascii_lowercase())
         .collect();
 
-    if !named.iter().any(|h| *h == ours) {
+    if !named.contains(&ours) {
         out.findings.push(
             Finding::new(
                 Severity::Fatal,

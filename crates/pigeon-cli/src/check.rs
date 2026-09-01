@@ -165,7 +165,7 @@ fn print_report(report: &Report) {
 
     // Worst first: the thing that stops mail is the thing to read.
     let mut findings: Vec<_> = report.findings.iter().collect();
-    findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+    findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
 
     for f in findings {
         println!("  {:<8} {}", label(f.severity), f.detail);
