@@ -247,10 +247,7 @@ fn the_forwarding_policy_and_active_key_come_from_the_same_snapshot() {
         .expect("a domain the table carries has a forwarding policy");
     assert_eq!(forwarding.policy, pigeon_types::ForwardPolicy::RewriteFrom);
 
-    let dkim = forwarding
-        .dkim
-        .as_ref()
-        .expect("the active key is recorded");
+    let dkim = forwarding.dkim.first().expect("the active key is recorded");
     assert_eq!(dkim.selector, "pigeon");
     assert_eq!(dkim.private_key_path, "example.com/pigeon.key");
     assert_eq!(dkim.algorithm, "rsa2048");
@@ -283,7 +280,7 @@ fn a_retired_key_is_not_offered_for_signing() {
         .unwrap()
         .snapshot;
     assert!(
-        snapshot.forwarding("example.com").unwrap().dkim.is_none(),
+        snapshot.forwarding("example.com").unwrap().dkim.is_empty(),
         "a retired key was offered for signing"
     );
 }

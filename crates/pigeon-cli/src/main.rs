@@ -239,6 +239,12 @@ enum DomainVerb {
     Show { domain: String },
     /// Compare this domain's published DNS with what this host needs.
     Check { domain: String },
+    /// Add an Ed25519 signing key alongside the RSA one.
+    ///
+    /// Additional, never instead: Ed25519 support among receivers is uneven,
+    /// and a message signed only with a key the receiver cannot verify has no
+    /// usable signature at all.
+    Ed25519 { domain: String },
     /// Set where this domain's mail goes by default.
     Forward { domain: String, address: String },
     /// Allow this domain to receive mail.
@@ -832,6 +838,64 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
             let conn = open_read(cli)?;
             let config = config_for_checks(cli)?;
             check::one(&conn, &config, domain, cli.json)
+        }
+
+        DomainVerb::Ed25519 { domain } => {
+            let mut conn = open_write(cli)?;
+            let keys_root = keys_root(cli)?;
+            let name = domain.to_ascii_lowercase();
+
+            let pair = pigeon_auth::dkim::Ed25519Pair::generate()?;
+            let selector = "ed25519";
+            let key_file = format!("{name}.{selector}.{}.key", nonce());
+            let key_path = keys_root.join(&key_file);
+
+            // Written and fsynced before the transaction, like the RSA key: a
+            // row may only ever name a key that is already durable.
+            if !cli.dry_run {
+                write_private_key_bytes(&key_path, pair.pkcs8())?;
+            }
+
+            let outcome = apply(cli, &mut conn, |tx| {
+                repo::add_ed25519_key(tx, &name, selector, pair.public_base64(), &key_file)
+                    .map(|_| ())
+            });
+
+            let outcome = match outcome {
+                Ok(o) => o,
+                Err(e) => {
+                    if !cli.dry_run {
+                        let _ = std::fs::remove_file(&key_path);
+                    }
+                    return Err(e);
+                }
+            };
+            let _ = outcome;
+
+            let record_name = pigeon_auth::dkim::record_name(selector, &name);
+            if cli.json {
+                json::ok(serde_json::json!({
+                    "domain": name,
+                    "dkim": {
+                        "selector": selector,
+                        "algorithm": "ed25519",
+                        "record_name": record_name,
+                        "record_value": pair.txt_record(),
+                        "private_key": key_path.display().to_string(),
+                    },
+                }));
+            } else {
+                println!("Added an Ed25519 key for {name}.\n");
+                println!("Publish this record as well as the RSA one:\n");
+                println!("  Type:  TXT");
+                println!("  Name:  {record_name}");
+                println!("  Value: {}\n", pair.txt_record());
+                println!(
+                    "Both signatures are added to every forwarded message, and a receiver\n\
+                     verifies whichever it understands. Keep the RSA record published."
+                );
+            }
+            Ok(exit::OK)
         }
 
         DomainVerb::Forward { domain, address } => {
@@ -1779,6 +1843,15 @@ fn keys_root(cli: &Cli) -> anyhow::Result<PathBuf> {
 /// private key sitting in the keys directory, under a name a later run would
 /// not reuse and no operator would think to look for.
 fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
+    write_private_key_bytes(path, pem.as_bytes())
+}
+
+/// The same, for a key that is not text.
+///
+/// Ed25519 private keys are PKCS#8 DER: `ring` produces DER and `mail-auth`
+/// takes it, so wrapping it in PEM would be encoding a thing in order to decode
+/// it again.
+fn write_private_key_bytes(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
 
     let mut options = std::fs::OpenOptions::new();
@@ -1805,7 +1878,7 @@ fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
     // From here the file exists, so every path out of this function has to
     // remove it or leave key material nothing will ever collect.
     let written = (|| -> std::io::Result<()> {
-        f.write_all(pem.as_bytes())?;
+        f.write_all(bytes)?;
         // fsync the file: a key in the page cache and not on disk is a key that
         // a power failure turns into a domain nobody can sign for.
         f.sync_all()

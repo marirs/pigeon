@@ -49,15 +49,10 @@ pub fn load(conn: &Connection) -> Result<Vec<DomainInput>, LoadError> {
         "SELECT d.id, d.name, d.status, d.inbound_enabled, d.outbound_enabled,
                 d.plus_addressing, d.catchall_enabled, d.forward_policy,
                 dd.local, dd.domain,
-                cd.local, cd.domain,
-                k.selector, k.private_key_path, k.algorithm
+                cd.local, cd.domain
          FROM domain d
          LEFT JOIN destination dd ON dd.id = d.default_destination_id
          LEFT JOIN destination cd ON cd.id = d.catchall_destination_id
-         LEFT JOIN dkim_key k
-                ON k.domain_id = d.id
-               AND k.state = 'active'
-               AND k.algorithm = 'rsa2048'
          ORDER BY d.name",
     )?;
 
@@ -73,18 +68,10 @@ pub fn load(conn: &Connection) -> Result<Vec<DomainInput>, LoadError> {
             forward_policy: r.get(7)?,
             default_destination: optional_destination(r, 8, 9)?,
             catchall_destination: optional_destination(r, 10, 11)?,
-            dkim: match (
-                r.get::<_, Option<String>>(12)?,
-                r.get::<_, Option<String>>(13)?,
-                r.get::<_, Option<String>>(14)?,
-            ) {
-                (Some(selector), Some(private_key_path), Some(algorithm)) => Some(DkimIdentity {
-                    selector,
-                    private_key_path,
-                    algorithm,
-                }),
-                _ => None,
-            },
+            // Loaded per domain below rather than joined here: a domain may
+            // publish more than one active selector — RSA plus an optional
+            // Ed25519 — and a join would multiply every domain row by its keys.
+            dkim: Vec::new(),
         })
     })?;
 
@@ -138,7 +125,7 @@ pub fn load(conn: &Connection) -> Result<Vec<DomainInput>, LoadError> {
                 // this out on the write path; a restored database is why it is
                 // rejected here too.
                 policy,
-                dkim: raw.dkim,
+                dkim: load_dkim(conn, raw.id)?,
             },
             default_destination: raw.default_destination,
             aliases,
@@ -160,7 +147,30 @@ struct RawDomain {
     forward_policy: String,
     default_destination: Option<Destination>,
     catchall_destination: Option<Destination>,
-    dkim: Option<DkimIdentity>,
+    dkim: Vec<DkimIdentity>,
+}
+
+/// Every active signing identity for one domain.
+///
+/// **RSA first**, which is what the ordering is for: the first key is the one
+/// that seals the ARC set, and every receiver verifies RSA while Ed25519
+/// support is still uneven. A domain that published only Ed25519 would be
+/// signing with something a large share of the internet cannot check.
+fn load_dkim(conn: &Connection, domain_id: i64) -> Result<Vec<DkimIdentity>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT selector, private_key_path, algorithm
+           FROM dkim_key
+          WHERE domain_id = ?1 AND state = 'active'
+          ORDER BY (algorithm = 'ed25519'), selector",
+    )?;
+    let rows = stmt.query_map([domain_id], |r| {
+        Ok(DkimIdentity {
+            selector: r.get(0)?,
+            private_key_path: r.get(1)?,
+            algorithm: r.get(2)?,
+        })
+    })?;
+    rows.collect()
 }
 
 fn load_aliases(conn: &Connection, domain_id: i64) -> Result<Vec<AliasInput>, rusqlite::Error> {

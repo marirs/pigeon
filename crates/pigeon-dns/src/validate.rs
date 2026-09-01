@@ -122,8 +122,13 @@ pub struct Expected {
     pub hostname: String,
     /// The addresses this host actually has, for the MX and PTR checks.
     pub addresses: Vec<IpAddr>,
-    /// The active DKIM selector and the public key it should publish.
-    pub dkim: Option<ExpectedDkim>,
+    /// Every active DKIM selector and the record it should publish.
+    ///
+    /// A list because a domain may publish RSA and Ed25519 together, and a
+    /// second selector that is signed with but not published verifies nothing
+    /// — which is worse than not offering it, since a receiver that prefers it
+    /// will use it.
+    pub dkim: Vec<ExpectedDkim>,
 }
 
 #[derive(Debug, Clone)]
@@ -468,10 +473,17 @@ async fn check_dkim(
     expected: &Expected,
     out: &mut Report,
 ) {
-    let Some(dkim) = &expected.dkim else {
-        return;
-    };
+    for dkim in &expected.dkim {
+        check_one_dkim(resolver, domain, dkim, out).await;
+    }
+}
 
+async fn check_one_dkim(
+    resolver: &SystemResolver,
+    domain: &str,
+    dkim: &ExpectedDkim,
+    out: &mut Report,
+) {
     let name = format!("{}._domainkey.{domain}", dkim.selector);
     let records = match resolver.lookup_txt(&name).await {
         Ok(r) => r,

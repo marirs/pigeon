@@ -30,11 +30,11 @@ fn domain() -> DomainInput {
         plus_addressing: true,
         forwarding: Forwarding {
             policy: ForwardPolicy::Preserve,
-            dkim: Some(DkimIdentity {
+            dkim: vec![DkimIdentity {
                 selector: "sel".into(),
                 private_key_path: "example.com/sel.key".into(),
                 algorithm: "rsa2048".into(),
-            }),
+            }],
         },
         default_destination: Some(destination("me", "example.net")),
         aliases: vec![AliasInput {
@@ -84,17 +84,27 @@ fn it_notices_every_runtime_input() {
     });
 
     notices("a new selector", |d| {
-        d.forwarding.dkim.as_mut().unwrap().selector = "other".into()
+        d.forwarding.dkim[0].selector = "other".into()
     });
     notices("a different key algorithm", |d| {
-        d.forwarding.dkim.as_mut().unwrap().algorithm = "ed25519".into()
+        d.forwarding.dkim[0].algorithm = "ed25519".into()
     });
     // Two domains pointing at different files is a different runtime even when
     // the selectors match.
     notices("a different key file", |d| {
-        d.forwarding.dkim.as_mut().unwrap().private_key_path = "example.com/other.key".into()
+        d.forwarding.dkim[0].private_key_path = "example.com/other.key".into()
     });
-    notices("a key being removed", |d| d.forwarding.dkim = None);
+    notices("a key being removed", |d| d.forwarding.dkim.clear());
+    notices("a second selector", |d| {
+        // Ed25519 alongside RSA: a domain that starts publishing a second
+        // signature is signing differently, and a fingerprint that missed it
+        // would let a restore add or drop one silently.
+        d.forwarding.dkim.push(DkimIdentity {
+            selector: "ed".into(),
+            private_key_path: "example.com/ed.key".into(),
+            algorithm: "ed25519".into(),
+        })
+    });
 
     notices("a changed default destination", |d| {
         d.default_destination = Some(destination("someone-else", "example.net"))
@@ -199,14 +209,12 @@ fn fields_cannot_be_confused_with_one_another() {
     // produce the same bytes and therefore the same hash, and a routing
     // fingerprint that collides is a restore reconciliation cannot detect.
     let mut a = domain();
-    let k = a.forwarding.dkim.as_mut().unwrap();
-    k.selector = "sel".into();
-    k.algorithm = "rsa2048".into();
+    a.forwarding.dkim[0].selector = "sel".into();
+    a.forwarding.dkim[0].algorithm = "rsa2048".into();
 
     let mut b = domain();
-    let k = b.forwarding.dkim.as_mut().unwrap();
-    k.selector = "selrsa".into();
-    k.algorithm = "2048".into();
+    b.forwarding.dkim[0].selector = "selrsa".into();
+    b.forwarding.dkim[0].algorithm = "2048".into();
 
     assert_ne!(
         fingerprint(&[a]),

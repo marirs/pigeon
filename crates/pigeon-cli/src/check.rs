@@ -80,20 +80,21 @@ fn run(
     let expectations: Vec<(String, Expected)> = domains
         .iter()
         .map(|name| {
-            // The active key, if the domain has one. A domain with no key
-            // signs nothing, so there is no record to compare and no finding to
-            // make — silence rather than a complaint about an absence nobody
-            // asked for.
-            let dkim = pigeon_db::repo::dkim_keys_for(conn, name)
-                .ok()
-                .and_then(|keys| {
-                    keys.into_iter()
-                        .find(|k| k.state == "active")
-                        .map(|k| ExpectedDkim {
-                            selector: k.selector,
-                            record: format!("v=DKIM1; k=rsa; p={}", k.public_key),
-                        })
-                });
+            // Every active key. A domain with none signs nothing, so there is
+            // no record to compare and no finding to make — silence rather than
+            // a complaint about an absence nobody asked for. A domain with two
+            // is publishing RSA and Ed25519 together, and a selector that is
+            // signed with but not published verifies nothing at a receiver that
+            // prefers it.
+            let dkim: Vec<ExpectedDkim> = pigeon_db::repo::dkim_keys_for(conn, name)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|k| k.state == "active")
+                .map(|k| ExpectedDkim {
+                    selector: k.selector.clone(),
+                    record: record_for(&k),
+                })
+                .collect();
             (
                 name.clone(),
                 Expected {
@@ -130,6 +131,18 @@ fn run(
 /// Only `Fatal`. A missing SPF record is worth fixing and is not worth waking
 /// somebody at three in the morning, and an exit code that cannot tell the
 /// difference gets ignored.
+/// The record a key should publish, which differs by algorithm.
+///
+/// `k=ed25519` is what tells a receiver the `p=` value is not RSA. Publishing
+/// an Ed25519 key without it produces a record that verifies nothing.
+fn record_for(key: &pigeon_db::repo::DkimKey) -> String {
+    if key.algorithm == "ed25519" {
+        format!("v=DKIM1; k=ed25519; p={}", key.public_key)
+    } else {
+        format!("v=DKIM1; k=rsa; p={}", key.public_key)
+    }
+}
+
 fn verdict(reports: &[Report]) -> u8 {
     if reports.iter().all(Report::passes) {
         crate::exit::OK

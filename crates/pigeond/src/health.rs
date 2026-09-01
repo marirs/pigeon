@@ -154,15 +154,18 @@ async fn cycle<R: MxLookup>(config: &HealthConfig<R>, tracker: &mut Tracker) {
             hostname: config.hostname.clone(),
             addresses: config.addresses.clone(),
             dkim: pigeon_db::repo::dkim_keys_for(&conn, &domain.name)
-                .ok()
-                .and_then(|keys| {
-                    keys.into_iter()
-                        .find(|k| k.state == "active")
-                        .map(|k| ExpectedDkim {
-                            selector: k.selector,
-                            record: format!("v=DKIM1; k=rsa; p={}", k.public_key),
-                        })
-                }),
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|k| k.state == "active")
+                .map(|k| ExpectedDkim {
+                    selector: k.selector,
+                    record: if k.algorithm == "ed25519" {
+                        format!("v=DKIM1; k=ed25519; p={}", k.public_key)
+                    } else {
+                        format!("v=DKIM1; k=rsa; p={}", k.public_key)
+                    },
+                })
+                .collect(),
         };
 
         let report =

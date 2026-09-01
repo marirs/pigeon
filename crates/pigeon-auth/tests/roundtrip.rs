@@ -153,7 +153,7 @@ async fn pigeons_own_signature_verifies_against_the_message_it_sent() {
             &envelope(),
             RECEIVED,
             &Rewrite::From(FromAddress::new(&format!("forward@{DOMAIN}")).unwrap()),
-            Some(&signing),
+            std::slice::from_ref(&signing),
         )
         .await
         .unwrap();
@@ -208,7 +208,7 @@ async fn the_arc_set_verifies_against_the_message_it_sent() {
             &envelope(),
             RECEIVED,
             &Rewrite::From(FromAddress::new(&format!("forward@{DOMAIN}")).unwrap()),
-            Some(&signing),
+            std::slice::from_ref(&signing),
         )
         .await
         .unwrap();
@@ -265,7 +265,7 @@ async fn a_chain_that_arrived_failed_is_not_extended() {
             &envelope(),
             RECEIVED,
             &Rewrite::Preserve,
-            Some(&signing),
+            std::slice::from_ref(&signing),
         )
         .await
         .unwrap();
@@ -312,7 +312,7 @@ async fn tampering_with_the_rewritten_from_breaks_the_signature() {
             &envelope(),
             RECEIVED,
             &Rewrite::From(FromAddress::new(&format!("forward@{DOMAIN}")).unwrap()),
-            Some(&signing),
+            std::slice::from_ref(&signing),
         )
         .await
         .unwrap();

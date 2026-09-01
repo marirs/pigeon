@@ -55,6 +55,11 @@ pub enum DkimError {
     #[error("could not encode the public key: {0}")]
     EncodePublic(#[from] rsa::pkcs8::spki::Error),
 
+    /// Ed25519 generation, which goes through `ring` rather than `rsa` and so
+    /// carries a message rather than a typed source.
+    #[error("could not generate an ed25519 key: {0}")]
+    GenerateEd25519(String),
+
     #[error("{path} is not a usable PKCS#8 private key: {source}")]
     ReadPrivate {
         path: String,
@@ -201,6 +206,59 @@ pub fn txt_record(public_base64: &str) -> String {
 }
 
 /// The DNS name a selector is published at.
+/// An Ed25519 signing key, for the optional second selector.
+///
+/// Offered *alongside* RSA and never instead of it: Ed25519 support among
+/// receivers is still uneven, and a message signed only with a key the receiver
+/// cannot verify has no usable signature at all. Publishing both costs one
+/// extra DNS record and one extra header.
+///
+/// Generated through `mail-auth`'s `ring` backend, like everything else that
+/// touches key material here — the `rsa` crate's advisory exception rests on it
+/// being used only to generate RSA keys, and this is not one.
+pub struct Ed25519Pair {
+    /// PKCS#8 DER, as `ring` produces it. Not PEM: `mail-auth` takes DER
+    /// directly, and wrapping it would be encoding a thing to decode it again.
+    pkcs8: Vec<u8>,
+    public_base64: String,
+}
+
+impl Ed25519Pair {
+    pub fn generate() -> Result<Self, DkimError> {
+        use mail_auth::common::crypto::Ed25519Key;
+
+        let pkcs8 =
+            Ed25519Key::generate_pkcs8().map_err(|e| DkimError::GenerateEd25519(e.to_string()))?;
+
+        // The public half is read back from the parsed key rather than sliced
+        // out of the DER: the offset is an encoding detail, and a wrong slice
+        // publishes a record that verifies nothing.
+        let key = Ed25519Key::from_pkcs8_der(&pkcs8)
+            .map_err(|e| DkimError::GenerateEd25519(e.to_string()))?;
+
+        Ok(Self {
+            // Raw 32 bytes, base64'd. Unlike RSA, an Ed25519 `p=` is the key
+            // itself rather than a SubjectPublicKeyInfo wrapper (RFC 8463 §3).
+            public_base64: base64_standard(&key.public_key()),
+            pkcs8,
+        })
+    }
+
+    pub fn pkcs8(&self) -> &[u8] {
+        &self.pkcs8
+    }
+
+    pub fn public_base64(&self) -> &str {
+        &self.public_base64
+    }
+
+    /// The record to publish. `k=ed25519`, which is what tells a receiver which
+    /// algorithm the `p=` value is for.
+    pub fn txt_record(&self) -> String {
+        format!("v=DKIM1; k=ed25519; p={}", self.public_base64)
+    }
+}
+
 pub fn record_name(selector: &str, domain: &str) -> String {
     format!("{selector}._domainkey.{domain}")
 }
@@ -317,6 +375,37 @@ pub fn public_from_private_pem(pem: &str) -> Result<String, DkimError> {
 /// Taken from the PEM rather than by adding a base64 dependency: PEM *is*
 /// base64 with a header, a footer and line breaks, so removing those is the
 /// whole conversion.
+/// Standard base64, which is what a DKIM `p=` tag carries.
+fn base64_standard(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    // Written out rather than pulled in: this is one 32-byte value encoded
+    // once at key generation, and a dependency for it would be a dependency to
+    // review for ever.
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn spki_base64(public: &RsaPublicKey) -> Result<String, DkimError> {
     let pem = public.to_public_key_pem(LineEnding::LF)?;
     Ok(pem
@@ -328,6 +417,47 @@ fn spki_base64(public: &RsaPublicKey) -> Result<String, DkimError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_the_encoding_a_receiver_expects() {
+        // RFC 4648 test vectors. The encoder is written out here rather than
+        // pulled in, so it is worth proving against the specification's own
+        // examples instead of against itself.
+        assert_eq!(base64_standard(b""), "");
+        assert_eq!(base64_standard(b"f"), "Zg==");
+        assert_eq!(base64_standard(b"fo"), "Zm8=");
+        assert_eq!(base64_standard(b"foo"), "Zm9v");
+        assert_eq!(base64_standard(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_standard(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_standard(b"foobar"), "Zm9vYmFy");
+        // A byte that exercises the top of the alphabet.
+        assert_eq!(base64_standard(&[0xff, 0xef, 0xbe]), "/+++");
+    }
+
+    #[test]
+    fn an_ed25519_record_names_its_algorithm() {
+        // `k=ed25519` is what tells a receiver which algorithm the `p=` value
+        // is for. Without it the record reads as RSA and verifies nothing.
+        let pair = Ed25519Pair::generate().expect("ring generates ed25519 keys");
+        let record = pair.txt_record();
+        assert!(record.contains("k=ed25519"), "{record}");
+        assert!(record.starts_with("v=DKIM1;"), "{record}");
+
+        // 32 raw bytes, base64'd — not a SubjectPublicKeyInfo wrapper, which is
+        // what RSA publishes and what an Ed25519 verifier would reject
+        // (RFC 8463 §3).
+        let p = record.split("p=").nth(1).expect("a p= tag");
+        assert_eq!(p.len(), 44, "an ed25519 p= is 32 bytes base64'd: {p}");
+    }
+
+    #[test]
+    fn an_ed25519_key_signs_through_the_pipeline() {
+        // The pair is only useful if `mail-auth` accepts the DER back, which is
+        // the half that a generation test alone does not prove.
+        let pair = Ed25519Pair::generate().unwrap();
+        crate::pipeline::SigningKey::from_ed25519_pkcs8(pair.pkcs8(), "example.com", "ed")
+            .expect("the generated key should load");
+    }
 
     /// 1024 bits everywhere below. Too short to publish and fast enough to run
     /// in a test suite; every property here is about encoding and matching

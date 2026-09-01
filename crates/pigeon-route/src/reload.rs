@@ -392,16 +392,16 @@ pub fn fingerprint(inputs: &[DomainInput]) -> [u8; 32] {
         // identity. A restore that only flips this changes every forwarded
         // message.
         field(&mut h, forward_policy(d.forwarding.policy).as_bytes());
-        match &d.forwarding.dkim {
-            Some(k) => {
-                field(&mut h, b"dkim");
-                field(&mut h, k.selector.as_bytes());
-                field(&mut h, k.algorithm.as_bytes());
-                // The path, because two domains pointing at different files is
-                // a different runtime even when the selectors match.
-                field(&mut h, k.private_key_path.as_bytes());
-            }
-            None => field(&mut h, b"no-dkim"),
+        // Every active identity, in the order the loader returns them — the
+        // order decides which key seals the ARC set, so a reordering is a
+        // change even when the set is the same.
+        count(&mut h, d.forwarding.dkim.len());
+        for k in &d.forwarding.dkim {
+            field(&mut h, k.selector.as_bytes());
+            field(&mut h, k.algorithm.as_bytes());
+            // The path, because two domains pointing at different files is
+            // a different runtime even when the selectors match.
+            field(&mut h, k.private_key_path.as_bytes());
         }
 
         // Destinations keep the case they were stored with. The domain half is

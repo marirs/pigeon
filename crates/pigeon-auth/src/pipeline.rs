@@ -75,7 +75,7 @@ const SIGNED_HEADERS: [&str; 8] = [
 /// exception rests on `rsa` being used only to *generate* keys, and signing
 /// stays entirely on `ring` (`M2-DESIGN.md` §6.1).
 pub struct SigningKey {
-    key: SharedKey,
+    key: Material,
     domain: String,
     selector: String,
     /// Which key material this is, without being the key material.
@@ -101,8 +101,37 @@ pub struct SigningKey {
 /// So the key is parsed once, at startup, and shared. The wrapper is what makes
 /// that possible: it implements `mail-auth`'s public `SigningKey` trait by
 /// forwarding to the `Arc`, so a clone costs a refcount.
+/// Which kind of key this is.
+///
+/// RSA-2048 is the default and the one every receiver verifies. Ed25519 is
+/// offered as an **additional** selector, never alone: support is still uneven,
+/// and a message signed only with a key a receiver cannot verify is a message
+/// with no usable signature at all. Publishing both and signing with both costs
+/// one extra header and is verified by whichever the receiver understands.
+#[derive(Clone)]
+enum Material {
+    Rsa(SharedKey),
+    Ed25519(SharedEd25519),
+}
+
 #[derive(Clone)]
 struct SharedKey(Arc<RsaKey<Sha256>>);
+
+/// The same sharing trick as [`SharedKey`], for Ed25519.
+#[derive(Clone)]
+struct SharedEd25519(Arc<mail_auth::common::crypto::Ed25519Key>);
+
+impl MailAuthSigningKey for SharedEd25519 {
+    type Hasher = Sha256;
+
+    fn sign(&self, input: impl Writable) -> mail_auth::Result<Vec<u8>> {
+        self.0.sign(input)
+    }
+
+    fn algorithm(&self) -> Algorithm {
+        self.0.algorithm()
+    }
+}
 
 impl MailAuthSigningKey for SharedKey {
     type Hasher = Sha256;
@@ -157,7 +186,38 @@ impl SigningKey {
         h.update(pem.as_bytes());
 
         Ok(Self {
-            key: SharedKey(Arc::new(key)),
+            key: Material::Rsa(SharedKey(Arc::new(key))),
+            domain,
+            selector,
+            identity: h.finalize().into(),
+        })
+    }
+
+    /// Load an Ed25519 key from the PKCS#8 DER `dkim::Ed25519Pair` writes.
+    ///
+    /// DER rather than PEM: `ring` produces PKCS#8 DER for Ed25519 and
+    /// `mail-auth` takes it directly, so wrapping it in PEM would be encoding a
+    /// thing in order to decode it again.
+    pub fn from_ed25519_pkcs8(
+        der: &[u8],
+        domain: impl Into<String>,
+        selector: impl Into<String>,
+    ) -> Result<Self, PipelineError> {
+        let key = mail_auth::common::crypto::Ed25519Key::from_pkcs8_der(der)
+            .map_err(|e| PipelineError::Key(e.to_string()))?;
+
+        let domain = domain.into();
+        let selector = selector.into();
+
+        let mut h = Sha256Digest::new();
+        h.update(domain.as_bytes());
+        h.update(b"\0");
+        h.update(selector.as_bytes());
+        h.update(b"\0");
+        h.update(der);
+
+        Ok(Self {
+            key: Material::Ed25519(SharedEd25519(Arc::new(key))),
             domain,
             selector,
             identity: h.finalize().into(),
@@ -317,7 +377,7 @@ impl Pipeline {
         envelope: &Envelope<'_>,
         received_header: &str,
         rewrite: &Rewrite,
-        signing: Option<&SigningKey>,
+        signing: &[SigningKey],
     ) -> Result<Outbound, PipelineError> {
         // The host domain is borrowed by `AuthenticationResults`, so the
         // envelope handed to authentication must borrow from something that
@@ -392,15 +452,33 @@ impl Pipeline {
             let _ = replaced;
 
             // R-8: a rewritten From: is never forwarded unsigned.
-            let key =
-                signing.ok_or_else(|| PipelineError::UnsignedRewrite("no signing key".into()))?;
-            let signature = DkimSigner::from_key(key.key.clone())
-                .domain(&key.domain)
-                .selector(&key.selector)
-                .headers(SIGNED_HEADERS)
-                .sign(payload.as_bytes())
-                .map_err(|e| PipelineError::UnsignedRewrite(e.to_string()))?;
-            payload.prepend_headers(&[signature.to_header().trim_end().to_string()]);
+            if signing.is_empty() {
+                return Err(PipelineError::UnsignedRewrite("no signing key".into()));
+            }
+
+            // One signature per key. Several `DKIM-Signature` headers is the
+            // normal way to publish two algorithms, and a receiver verifies
+            // whichever it understands — which is the whole reason Ed25519 is
+            // an additional selector rather than a replacement.
+            for key in signing {
+                let header = match &key.key {
+                    Material::Rsa(k) => DkimSigner::from_key(k.clone())
+                        .domain(&key.domain)
+                        .selector(&key.selector)
+                        .headers(SIGNED_HEADERS)
+                        .sign(payload.as_bytes())
+                        .map(|s| s.to_header())
+                        .map_err(|e| PipelineError::UnsignedRewrite(e.to_string()))?,
+                    Material::Ed25519(k) => DkimSigner::from_key(k.clone())
+                        .domain(&key.domain)
+                        .selector(&key.selector)
+                        .headers(SIGNED_HEADERS)
+                        .sign(payload.as_bytes())
+                        .map(|s| s.to_header())
+                        .map_err(|e| PipelineError::UnsignedRewrite(e.to_string()))?,
+                };
+                payload.prepend_headers(&[header.trim_end().to_string()]);
+            }
             signed = true;
         }
 
@@ -429,12 +507,15 @@ impl Pipeline {
 /// A free function rather than a method: it needs the key it was handed, not
 /// the pipeline, and taking `&self` would have invited the key to live there.
 fn seal(
-    signing: Option<&SigningKey>,
+    signing: &[SigningKey],
     payload: &mut Relayable,
     results: &mail_auth::AuthenticationResults<'_>,
     arc_output: Option<&mail_auth::ArcOutput<'_>>,
 ) -> (bool, Option<SealSkipped>) {
-    let Some(key) = signing else {
+    // The first key seals. An ARC set carries one seal per instance (RFC 8617),
+    // so a second one would not be a second opinion — it would be a malformed
+    // chain. The first is the RSA key, which is what every verifier supports.
+    let Some(key) = signing.first() else {
         return (false, Some(SealSkipped::NoKey));
     };
 
@@ -455,14 +536,24 @@ fn seal(
     let default_arc = mail_auth::ArcOutput::default();
     let arc = arc_output.unwrap_or(&default_arc);
 
-    match ArcSealer::from_key(key.key.clone())
-        .domain(&key.domain)
-        .selector(&key.selector)
-        .headers(SIGNED_HEADERS)
-        .seal(&outbound, results, arc)
-    {
-        Ok(set) => {
-            payload.prepend_headers(&[set.to_header().trim_end().to_string()]);
+    let sealed = match &key.key {
+        Material::Rsa(k) => ArcSealer::from_key(k.clone())
+            .domain(&key.domain)
+            .selector(&key.selector)
+            .headers(SIGNED_HEADERS)
+            .seal(&outbound, results, arc)
+            .map(|set| set.to_header()),
+        Material::Ed25519(k) => ArcSealer::from_key(k.clone())
+            .domain(&key.domain)
+            .selector(&key.selector)
+            .headers(SIGNED_HEADERS)
+            .seal(&outbound, results, arc)
+            .map(|set| set.to_header()),
+    };
+
+    match sealed {
+        Ok(header) => {
+            payload.prepend_headers(&[header.trim_end().to_string()]);
             (true, None)
         }
         Err(_) => (false, Some(SealSkipped::Failed)),
@@ -608,7 +699,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::Preserve,
-                Some(&signing_key()),
+                std::slice::from_ref(&signing_key()),
             )
             .await
             .unwrap();
@@ -629,7 +720,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::Preserve,
-                Some(&signing_key()),
+                std::slice::from_ref(&signing_key()),
             )
             .await
             .unwrap();
@@ -647,7 +738,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::Preserve,
-                Some(&signing_key()),
+                std::slice::from_ref(&signing_key()),
             )
             .await
             .unwrap();
@@ -678,7 +769,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
-                Some(&signing_key()),
+                std::slice::from_ref(&signing_key()),
             )
             .await
             .unwrap();
@@ -710,7 +801,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
-                Some(&signing_key()),
+                std::slice::from_ref(&signing_key()),
             )
             .await
             .unwrap();
@@ -741,7 +832,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
-                Some(&signing_key()),
+                std::slice::from_ref(&signing_key()),
             )
             .await
             .unwrap();
@@ -804,7 +895,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::From(FromAddress::new("forward@pigeon.test").unwrap()),
-                None,
+                &[],
             )
             .await
             .unwrap_err();
@@ -817,7 +908,7 @@ mod tests {
         // set drops a recovery path, which is the pre-ARC status quo and is
         // survivable. Refusing here would lose mail over a local key problem.
         let out = pipeline()
-            .process(MESSAGE, &envelope(), RECEIVED, &Rewrite::Preserve, None)
+            .process(MESSAGE, &envelope(), RECEIVED, &Rewrite::Preserve, &[])
             .await
             .unwrap();
         assert!(!out.sealed);
@@ -836,7 +927,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::Preserve,
-                Some(&signing_key()),
+                std::slice::from_ref(&signing_key()),
             )
             .await
             .unwrap();
@@ -855,7 +946,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::Preserve,
-                Some(&signing_key()),
+                std::slice::from_ref(&signing_key()),
             )
             .await
             .unwrap();
@@ -878,7 +969,7 @@ mod tests {
                 &envelope(),
                 RECEIVED,
                 &Rewrite::Preserve,
-                Some(&signing_key()),
+                std::slice::from_ref(&signing_key()),
             )
             .await
             .unwrap();

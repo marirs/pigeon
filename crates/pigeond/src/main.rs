@@ -217,15 +217,15 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 fn load_keys(
     snapshot: &pigeon_route::Snapshot,
     checked: &pigeon_config::Checked,
-) -> Result<HashMap<String, pigeon_auth::pipeline::SigningKey>, String> {
+) -> Result<HashMap<String, Vec<pigeon_auth::pipeline::SigningKey>>, String> {
     use pigeon_auth::pipeline::SigningKey;
 
-    let mut keys = HashMap::new();
+    let mut keys: HashMap<String, Vec<SigningKey>> = HashMap::new();
     for domain in snapshot.domains() {
         let Some(forwarding) = snapshot.forwarding(domain) else {
             continue;
         };
-        let Some(identity) = &forwarding.dkim else {
+        if forwarding.dkim.is_empty() {
             if forwarding.policy == pigeon_types::ForwardPolicy::RewriteFrom {
                 return Err(format!(
                     "domain {domain} is set to rewrite_from and has no active DKIM key; \
@@ -234,18 +234,33 @@ fn load_keys(
                 ));
             }
             continue;
-        };
+        }
 
-        // The stored path is operator-editable, so it is resolved against the
-        // configured root and refused if it escapes.
-        let path = checked
-            .resolve_key(&identity.private_key_path)
+        // Every active identity, in the loader's order: RSA first, because the
+        // first key is the one that seals the ARC set and RSA is what every
+        // receiver verifies.
+        let mut loaded = Vec::with_capacity(forwarding.dkim.len());
+        for identity in &forwarding.dkim {
+            // The stored path is operator-editable, so it is resolved against
+            // the configured root and refused if it escapes.
+            let path = checked
+                .resolve_key(&identity.private_key_path)
+                .map_err(|e| format!("DKIM key for {domain}: {e}"))?;
+
+            let key = if identity.algorithm == "ed25519" {
+                let der = std::fs::read(&path)
+                    .map_err(|e| format!("DKIM key for {domain} at {}: {e}", path.display()))?;
+                SigningKey::from_ed25519_pkcs8(&der, domain, &identity.selector)
+            } else {
+                let pem = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("DKIM key for {domain} at {}: {e}", path.display()))?;
+                SigningKey::from_pkcs8_pem(&pem, domain, &identity.selector)
+            }
             .map_err(|e| format!("DKIM key for {domain}: {e}"))?;
-        let pem = std::fs::read_to_string(&path)
-            .map_err(|e| format!("DKIM key for {domain} at {}: {e}", path.display()))?;
-        let key = SigningKey::from_pkcs8_pem(&pem, domain, &identity.selector)
-            .map_err(|e| format!("DKIM key for {domain}: {e}"))?;
-        keys.insert(domain.to_string(), key);
+
+            loaded.push(key);
+        }
+        keys.insert(domain.to_string(), loaded);
     }
 
     Ok(keys)
@@ -262,7 +277,7 @@ fn load_keys(
 struct Runtime {
     snapshot: Arc<pigeon_route::Snapshot>,
     /// Parsed signing keys, by domain, from the paths *this* snapshot names.
-    keys: HashMap<String, pigeon_auth::pipeline::SigningKey>,
+    keys: HashMap<String, Vec<pigeon_auth::pipeline::SigningKey>>,
     /// The SRS ring, as of this publication.
     ///
     /// In here rather than beside it because rotation is the same kind of event
@@ -298,17 +313,23 @@ impl Runtime {
 
         // Sorted, because a `HashMap`'s order is not a property of the
         // configuration and would make one runtime hash differently per run.
-        let mut keys: Vec<(&String, [u8; 32])> = derived
+        let mut keys: Vec<(&String, Vec<[u8; 32]>)> = derived
             .keys
             .iter()
-            .map(|(domain, key)| (domain, key.identity()))
+            .map(|(domain, keys)| (domain, keys.iter().map(|k| k.identity()).collect()))
             .collect();
         keys.sort_by(|a, b| a.0.cmp(b.0));
         h.update((keys.len() as u64).to_be_bytes());
-        for (domain, identity) in keys {
+        for (domain, identities) in keys {
             h.update((domain.len() as u64).to_be_bytes());
             h.update(domain.as_bytes());
-            h.update(identity);
+            // Ordered, not sorted: the order decides which key seals the ARC
+            // set, so two domains signing with the same pair in a different
+            // order are two different runtimes.
+            h.update((identities.len() as u64).to_be_bytes());
+            for identity in identities {
+                h.update(identity);
+            }
         }
 
         // An unreadable ring hashes as its own state rather than as any
@@ -378,7 +399,7 @@ struct RuntimeState {
 type Deriver = Box<dyn Fn(&pigeon_route::Snapshot) -> Result<Derived, String> + Send + Sync>;
 
 struct Derived {
-    keys: HashMap<String, pigeon_auth::pipeline::SigningKey>,
+    keys: HashMap<String, Vec<pigeon_auth::pipeline::SigningKey>>,
     srs: Arc<pigeon_auth::Srs>,
     /// The hash of the ring bytes these keys were parsed from.
     ///
@@ -683,7 +704,12 @@ async fn authenticate(
     let snapshot = &runtime.snapshot;
 
     let forwarding = snapshot.forwarding(recipient_domain);
-    let signing = runtime.keys.get(recipient_domain);
+    // Every key the domain publishes: one signature each, and the first seals.
+    let signing: &[pigeon_auth::pipeline::SigningKey] = runtime
+        .keys
+        .get(recipient_domain)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
 
     let rewrite = match forwarding.map(|f| f.policy) {
         Some(pigeon_types::ForwardPolicy::RewriteFrom) => {
@@ -1935,7 +1961,7 @@ mod tests {
             plus_addressing: true,
             forwarding: pigeon_route::snapshot::Forwarding {
                 policy: pigeon_types::ForwardPolicy::Preserve,
-                dkim: None,
+                dkim: Vec::new(),
             },
             default_destination: Some(pigeon_route::snapshot::Destination {
                 local: local.into(),
@@ -2700,8 +2726,10 @@ mod tests {
         if let Some(pem) = key {
             keys.insert(
                 "example.com".to_string(),
-                pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(pem, "example.com", "sel")
-                    .unwrap(),
+                vec![
+                    pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(pem, "example.com", "sel")
+                        .unwrap(),
+                ],
             );
         }
         Runtime::assemble(
@@ -3537,11 +3565,11 @@ mod tests {
                 plus_addressing: true,
                 forwarding: RouteForwarding {
                     policy,
-                    dkim: Some(DkimIdentity {
+                    dkim: vec![DkimIdentity {
                         selector: "sel".into(),
                         private_key_path: "unused-in-test".into(),
                         algorithm: "rsa2048".into(),
-                    }),
+                    }],
                 },
                 default_destination: Some(pigeon_route::snapshot::Destination {
                     local: "me".into(),
@@ -3589,8 +3617,14 @@ mod tests {
                 for domain in snapshot.domains() {
                     keys.insert(
                         domain.to_string(),
-                        pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(e2e_key(), domain, "sel")
+                        vec![
+                            pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(
+                                e2e_key(),
+                                domain,
+                                "sel",
+                            )
                             .unwrap(),
+                        ],
                     );
                 }
             }
@@ -3643,11 +3677,11 @@ mod tests {
             plus_addressing: true,
             forwarding: RouteForwarding {
                 policy,
-                dkim: Some(DkimIdentity {
+                dkim: vec![DkimIdentity {
                     selector: "sel".into(),
                     private_key_path: "unused-in-test".into(),
                     algorithm: "rsa2048".into(),
-                }),
+                }],
             },
             default_destination: Some(pigeon_route::snapshot::Destination {
                 local: "me".into(),
@@ -3696,11 +3730,11 @@ mod tests {
                 plus_addressing: true,
                 forwarding: RouteForwarding {
                     policy: pigeon_types::ForwardPolicy::Preserve,
-                    dkim: Some(DkimIdentity {
+                    dkim: vec![DkimIdentity {
                         selector: "sel".into(),
                         private_key_path: "unused-in-test".into(),
                         algorithm: "rsa2048".into(),
-                    }),
+                    }],
                 },
                 default_destination: Some(pigeon_route::snapshot::Destination {
                     local: "me".into(),

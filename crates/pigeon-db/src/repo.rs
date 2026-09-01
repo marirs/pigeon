@@ -592,6 +592,28 @@ pub fn add_dkim_key(
     Ok(conn.last_insert_rowid())
 }
 
+/// Record a generated Ed25519 key.
+///
+/// A second selector alongside the RSA one, never instead of it: the partial
+/// unique index allows one active key per algorithm, which is what makes
+/// "publish both, sign with both" expressible at all.
+pub fn add_ed25519_key(
+    conn: &Connection,
+    domain: &str,
+    selector: &str,
+    public_key: &str,
+    private_key_path: &str,
+) -> Result<i64, DbError> {
+    let id = domain_id(conn, domain)?;
+    conn.execute(
+        "INSERT INTO dkim_key (domain_id, selector, algorithm, public_key,
+                               private_key_path, state, created_at)
+         VALUES (?1, ?2, 'ed25519', ?3, ?4, 'active', ?5)",
+        params![id, selector, public_key, private_key_path, now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Active keys, for the startup verification and for `dns show`.
 pub fn active_dkim_keys(conn: &Connection) -> Result<Vec<DkimKey>, DbError> {
     let mut stmt = conn.prepare(

@@ -251,7 +251,7 @@ Rejection happens during the SMTP conversation. Accepting and then discarding is
 - [x] PTR validation
 - [x] hostname consistency
 - [x] SPF validation
-- [ ] optional ed25519 second selector
+- [x] optional ed25519 second selector
 - [x] DKIM selector validation against the published record
 - [x] DMARC validation
 - [x] TLS validation

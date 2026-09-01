@@ -110,7 +110,12 @@ pub struct Forwarding {
     /// The active key, if the domain has one. `None` means nothing here can
     /// sign — which `Preserve` does not need and `RewriteFrom` cannot do
     /// without.
-    pub dkim: Option<DkimIdentity>,
+    /// Every active signing identity, RSA first.
+    ///
+    /// A list rather than one, because Ed25519 is offered as an *additional*
+    /// selector: publishing both and signing with both is what makes it safe
+    /// to offer at all, since a receiver verifies whichever it understands.
+    pub dkim: Vec<DkimIdentity>,
 }
 
 /// The active DKIM key for a domain, as the database records it.

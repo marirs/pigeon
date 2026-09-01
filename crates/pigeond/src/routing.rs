@@ -246,7 +246,7 @@ mod tests {
             plus_addressing: true,
             forwarding: Forwarding {
                 policy: ForwardPolicy::Preserve,
-                dkim: None,
+                dkim: Vec::new(),
             },
             default_destination: Some(destination(local, host)),
             aliases: Vec::new(),
