@@ -604,3 +604,26 @@ Apache License 2.0. See [LICENSE](LICENSE).
 **Pigeon**
 
 *Your domains. Your server. Your mail routing.*
+
+## Documentation
+
+Start here:
+
+- **[DEPLOY.md](docs/DEPLOY.md)** — from nothing to mail arriving.
+- **[CLI.md](docs/CLI.md)** — every command.
+- **[OPERATIONS.md](docs/OPERATIONS.md)** — the queue, health, backups, metrics.
+- **[RECOVERY.md](docs/RECOVERY.md)** — after something has gone wrong.
+
+Design and policy:
+
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the parts fit together.
+- [SECURITY.md](docs/SECURITY.md) and [THREAT-MODEL.md](docs/THREAT-MODEL.md) —
+  what is defended, and what is deliberately not.
+- [VERSIONING.md](docs/VERSIONING.md) — what a version number promises, and the
+  migration policy.
+- [CLUSTER.md](docs/CLUSTER.md) — running a second node.
+- [DEPENDENCIES.md](docs/DEPENDENCIES.md) — every direct dependency and why.
+- [ROADMAP.md](docs/ROADMAP.md) — what is built and what is not.
+
+Milestone design notes — the reasoning behind decisions that are hard to
+reconstruct from the code — are in `docs/M*-*.md`.

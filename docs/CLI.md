@@ -590,45 +590,74 @@ Domain-wide grants are called out clearly when made. Secrets are shown once and 
 
 ```bash
 pigeon relay list
-pigeon relay add <name>
-pigeon relay remove <name>
-pigeon relay test <name>
+pigeon relay add <name> <host> [--port 587] [--username <user>] [--secret <name>]
+pigeon domain relay <domain> <relay>     # send this domain's mail through it
+pigeon domain relay <domain> direct      # stop
 ```
 
-Secrets are prompted for or read from stdin, never taken as command-line arguments where they would land in your shell history.
+`--secret` is the **name** of a file in the secrets directory, never a path and
+never the password itself: a password on the command line lands in your shell
+history and in `ps`, and a path in the database would let a hand-edited row name
+any readable file.
+
+A smarthost is configured on the *sending* domain — you choose one because of
+where mail leaves from, and the recipient has no say in it.
 
 ## Queue
 
 ```bash
-pigeon queue list
-pigeon queue show <id>
-pigeon queue retry <id>
-pigeon queue retry --domain <domain>
-pigeon queue remove <id>
-pigeon queue freeze <id>
-pigeon queue unfreeze <id>
+pigeon queue list [--all] [--limit N]
+pigeon queue show <message-id>
+pigeon queue retry [<message-id>] [--domain <domain>]
+pigeon queue freeze [<message-id>] [--domain <domain>]
+pigeon queue thaw [<message-id>] [--domain <domain>]
 ```
 
-Removal is permanent — Pigeon retains no copy — so it confirms unless given `--yes`.
+With neither a message nor `--domain`, the verb applies to everything waiting.
+
+**Freezing stops Pigeon trying. It does not stop the clock**: a frozen delivery
+still expires at the five-day horizon and its sender is still told. A freeze you
+set and forget cannot swallow mail.
+
+Retrying thaws as well, and neither verb revives a terminal delivery: a
+delivered message is not resent, and a failed one has already had its report
+generated.
+
+There is no `queue remove`. Deleting a message an operator has already been told
+was accepted is the one operation this queue does not offer — freeze it, or let
+it expire and produce its report.
 
 ## DNS
 
 ```bash
-pigeon dns show <domain>
-pigeon dns show <domain> --record mx|spf|dkim|dmarc
-pigeon dns check <domain>
+pigeon domain check <domain>
+pigeon domains check
 ```
 
-`dns show` prints the exact records to publish and changes nothing. Pigeon never needs credentials for your DNS provider.
+Both compare what a domain publishes with what this host needs, and print the
+exact record to publish for anything missing. Pigeon never needs credentials for
+your DNS provider.
+
+Severities decide what happens rather than how loud it is:
+
+| | meaning | effect |
+|---|---|---|
+| `FATAL` | mail for this domain cannot work | the domain is gated |
+| `ERROR` | works, and is likely to be refused or spam-foldered | not gated |
+| `WARN` | works today, will break or degrade | not gated |
+| `INFO` | worth knowing | nothing |
+
+Exit code 3 when any domain has a fatal finding, zero otherwise — so a monitor
+does not have to parse prose to decide whether to page somebody. A check that
+could not run at all is reported separately and never gates: a resolver timeout
+is not evidence about the domain.
 
 ## Alerts
 
 Pigeon emails you when a domain is gated or recovers. See [`ALERTING.md`](ALERTING.md).
 
 ```bash
-pigeon alerts show
 pigeon alerts test
-pigeon alerts test --domain example.com
 ```
 
 `alerts test` sends a real message through the out-of-band alert path and reports each step, exiting non-zero on failure so cron or an external monitor can drive it. Run it after setup and periodically: a broken alert path produces silence, which is indistinguishable from health.
@@ -662,6 +691,65 @@ Goes through the real submission path — sender authorisation, DKIM signing, co
 Both are configuration diagnostics, not general-purpose send commands.
 
 ---
+
+## Applications that send through this host
+
+```bash
+pigeon auth add <name>
+pigeon auth list
+pigeon auth allow <name> <address>      # or '*@domain' for the whole domain
+pigeon auth revoke <name> <address>
+pigeon auth disable <name>
+pigeon auth enable <name>
+pigeon auth remove <name> --yes
+```
+
+A principal is an *application* — a phone, a backup script — not a person, so
+one credential can be revoked without touching the others and a leak names what
+leaked it. The password is shown once: what is stored is an Argon2id hash, so a
+lost password means a new credential rather than a recovered one.
+
+A new credential can send **nothing** until an address is allowed. The grant is
+checked against the envelope sender and against the `From:` header, on the whole
+address rather than the domain — "anyone on the domain may claim any address on
+it" is exactly what a per-address grant exists to deny.
+
+`disable` keeps the grants, so turning a credential back on is not a re-grant.
+
+## Operations
+
+```bash
+pigeon health                        # is this host working?
+pigeon backup /var/backups/pigeon.db
+pigeon verify [path]                 # a database, or a backup, before trusting it
+```
+
+`health` exits non-zero for exactly two things: a gated domain, or mail waiting
+more than a day. A check that pages on volume is one people turn off.
+
+`backup` uses SQLite's own backup API rather than a file copy, which can be torn
+across a WAL checkpoint, and integrity-checks the result before returning. It
+does not include the DKIM private keys — they are the only state no backup of
+the database restores.
+
+`verify` separates the two failures that look alike: a corrupt page is a disk
+problem, and a newer schema is a downgrade, which needs a different binary
+rather than a restore.
+
+See [OPERATIONS.md](OPERATIONS.md).
+
+## Two nodes
+
+```bash
+pigeon config export [path]
+pigeon config checksum
+```
+
+The export is the same CSV `pigeon import` reads, sorted so two nodes with the
+same routing produce byte-identical output. The checksum is one line to compare
+between them. Neither includes the private keys, which are not in the database:
+matching checksums with different key files is a real and otherwise invisible
+way to be wrong. See [CLUSTER.md](CLUSTER.md).
 
 ## Global options
 
@@ -711,18 +799,30 @@ Empty collections are `[]`, never `null`.
 ## Exit codes
 
 ```text
-0   success / healthy
+0   success, or healthy
 1   command or configuration error
-2   DNS validation failure
-3   runtime or system failure
+3   a check ran and the answer was no
 4   database failure
-5   queue or delivery failure
-6   authentication or authorisation failure
-64  CLI usage error
 ```
 
 Stable across releases, so scripts can branch on them.
 
+`3` is the one worth knowing: it means the command worked and the *answer* was
+negative — a domain that cannot carry mail, a host that needs attention, a
+message that could not be sent. Distinct from `1` so a monitor can tell "this
+host has a problem" from "you typed the command wrong".
+
 ## Where commands run
 
-Read commands open SQLite directly. Mutating commands go through the daemon's Unix socket while it is running, so there is only ever one writer and changes are validated against live state before they commit. Offline mutation is permitted only when the daemon is stopped.
+Every command opens SQLite directly, whether the daemon is running or not.
+
+There is no control socket, and that is deliberate: adding one to answer "what
+is stuck?" would mean adding a protocol, a permission model and a failure mode
+to a question the database already answers — and a health command that needed
+the socket would report "unhealthy" when the socket was the only broken thing.
+
+Concurrent writes are safe because SQLite makes them safe: one writer at a time,
+`BEGIN IMMEDIATE` where it matters, and every mutation validated against the
+whole routing table before it commits. The daemon notices a change on its next
+poll, which is where its own rules take over — a frozen delivery is skipped at
+claim time, so freezing cannot race an attempt into a half state.

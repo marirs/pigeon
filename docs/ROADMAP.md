@@ -370,15 +370,19 @@ Adding a second MX record alone is not a high-availability design.
 
 ## Milestone 10 — Stable release
 
-- [ ] migration compatibility policy
-- [ ] semantic versioning policy
-- [ ] complete CLI documentation
-- [ ] deployment guide
-- [ ] recovery guide
-- [ ] compatibility matrix
-- [ ] tagged release artefacts
-- [ ] checksums and signatures
-- [ ] package publishing
+- [x] migration compatibility policy
+- [x] semantic versioning policy
+- [x] complete CLI documentation
+- [x] deployment guide
+- [x] recovery guide
+- [x] compatibility matrix
+- [x] tagged release artefacts
+- [x] checksums and signatures
+- [x] package publishing — GitHub releases with signed checksums, plus the
+      packaged systemd unit and Dockerfile. Distribution packages (deb, rpm,
+      Homebrew) are deliberately not attempted from here: each one is a
+      packaging policy to keep current, and a stale package is worse than none
+      for a mail server that people upgrade to get security fixes.
 
 ---
 
