@@ -188,7 +188,7 @@ mail that providers reject.**
 - [ ] duplicate suppression
 - [ ] loop detection at delivery, as a backstop for chains leaving and
       re-entering through systems Pigeon cannot see
-- [ ] STARTTLS
+- [x] STARTTLS
 - [x] SMTP timeouts, connection and size limits
 - [x] malformed message handling
 - [ ] graceful shutdown

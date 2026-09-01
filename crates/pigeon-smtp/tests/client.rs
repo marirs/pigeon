@@ -27,6 +27,7 @@ async fn deliver_to(peer: Peer) -> Result<pigeon_smtp::Accepted, ClientError> {
         "client.test",
         &envelope(),
         &[b"Subject: hi\r\n\r\nBody\r\n".as_slice()],
+        None,
     )
     .await
 }
@@ -36,10 +37,15 @@ async fn accepts_a_well_behaved_server() {
     let (addr, transcript) = Peer::accepting().spawn().await;
     let stream = TcpStream::connect(addr).await.unwrap();
 
-    let accepted =
-        pigeon_smtp::deliver(stream, "client.test", &envelope(), &[b"hi\r\n".as_slice()])
-            .await
-            .expect("should deliver");
+    let accepted = pigeon_smtp::deliver(
+        stream,
+        "client.test",
+        &envelope(),
+        &[b"hi\r\n".as_slice()],
+        None,
+    )
+    .await
+    .expect("should deliver");
 
     assert_eq!(accepted.code, 250);
     // The remote's text is kept because it usually carries their queue id,
@@ -80,9 +86,15 @@ async fn falls_back_to_helo_when_ehlo_is_refused() {
         .await;
 
     let stream = TcpStream::connect(addr).await.unwrap();
-    pigeon_smtp::deliver(stream, "client.test", &envelope(), &[b"hi\r\n".as_slice()])
-        .await
-        .expect("should fall back to HELO");
+    pigeon_smtp::deliver(
+        stream,
+        "client.test",
+        &envelope(),
+        &[b"hi\r\n".as_slice()],
+        None,
+    )
+    .await
+    .expect("should fall back to HELO");
 
     assert!(transcript.saw("EHLO"), "should try EHLO first");
     assert!(transcript.saw("HELO client.test"), "should retry with HELO");
@@ -186,9 +198,15 @@ async fn multiline_greeting_is_read_as_one_reply() {
         .await;
 
     let stream = TcpStream::connect(addr).await.unwrap();
-    pigeon_smtp::deliver(stream, "client.test", &envelope(), &[b"hi\r\n".as_slice()])
-        .await
-        .expect("multiline banner is normal");
+    pigeon_smtp::deliver(
+        stream,
+        "client.test",
+        &envelope(),
+        &[b"hi\r\n".as_slice()],
+        None,
+    )
+    .await
+    .expect("multiline banner is normal");
 
     // Continuation lines must not be mistaken for the reply to EHLO.
     assert!(transcript.saw("EHLO"));
@@ -288,6 +306,7 @@ async fn body_arrives_dot_stuffed_and_terminated() {
         "client.test",
         &env,
         &[b".leading\r\nplain\r\n".as_slice()],
+        None,
     )
     .await
     .unwrap();

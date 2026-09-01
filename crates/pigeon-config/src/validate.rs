@@ -146,6 +146,9 @@ pub enum ValidationError {
     #[error("submission is configured on {listen} but {what} is not set")]
     SubmissionIncomplete { listen: String, what: &'static str },
 
+    #[error("inbound TLS is half configured: {what} is not set, so STARTTLS would not be offered")]
+    InboundTlsIncomplete { what: &'static str },
+
     #[error("alerts are enabled but {what} is not set")]
     AlertsIncomplete { what: &'static str },
 
@@ -190,6 +193,7 @@ pub fn validate(config: Config) -> Result<Checked, ValidationError> {
 
     require_mode("SRS secret", &config.srs_secret_file, 0o600)?;
 
+    check_inbound(&config)?;
     check_submission(&config)?;
     check_alerts(&config)?;
 
@@ -211,6 +215,29 @@ fn check_hostname(hostname: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::HostnameNotFqdn(hostname.to_string()));
     }
     Ok(())
+}
+
+/// Inbound TLS: both files or neither, and readable if present.
+///
+/// Half a pair is the dangerous state. A certificate with no key would leave
+/// `STARTTLS` unadvertised while the operator believes it is on, and the
+/// mistake is invisible — mail keeps flowing, in the clear.
+fn check_inbound(config: &Config) -> Result<(), ValidationError> {
+    let inbound = &config.smtp.inbound;
+    match (&inbound.tls_certificate, &inbound.tls_private_key) {
+        (None, None) => Ok(()),
+        (Some(cert), Some(key)) => {
+            require_readable("inbound TLS certificate", cert)?;
+            require_mode("inbound TLS private key", key, 0o600)?;
+            Ok(())
+        }
+        (Some(_), None) => Err(ValidationError::InboundTlsIncomplete {
+            what: "tls_private_key",
+        }),
+        (None, Some(_)) => Err(ValidationError::InboundTlsIncomplete {
+            what: "tls_certificate",
+        }),
+    }
 }
 
 fn check_submission(config: &Config) -> Result<(), ValidationError> {
@@ -413,6 +440,55 @@ mod tests {
     fn a_correct_configuration_validates() {
         let tmp = TempDir::new("good");
         validate(good(&tmp)).expect("a valid configuration was refused");
+    }
+
+    #[test]
+    fn inbound_tls_must_be_configured_in_full_or_not_at_all() {
+        // Half a pair is the dangerous state: a certificate with no key leaves
+        // STARTTLS unadvertised while the operator believes it is on, and the
+        // mistake is invisible — mail keeps flowing, in the clear.
+        let tmp = TempDir::new("inbound-tls");
+
+        let mut c = good(&tmp);
+        c.smtp.inbound.tls_certificate = Some(tmp.file("cert.pem", 0o644));
+        match validate(c) {
+            Err(ValidationError::InboundTlsIncomplete { what }) => {
+                assert_eq!(what, "tls_private_key")
+            }
+            other => panic!("accepted a certificate with no key: {other:?}"),
+        }
+
+        let mut c = good(&tmp);
+        c.smtp.inbound.tls_private_key = Some(tmp.file("key.pem", 0o600));
+        assert!(
+            matches!(
+                validate(c),
+                Err(ValidationError::InboundTlsIncomplete {
+                    what: "tls_certificate"
+                })
+            ),
+            "accepted a key with no certificate"
+        );
+
+        // Both, and the pair validates.
+        let mut c = good(&tmp);
+        c.smtp.inbound.tls_certificate = Some(tmp.file("cert2.pem", 0o644));
+        c.smtp.inbound.tls_private_key = Some(tmp.file("key2.pem", 0o600));
+        validate(c).expect("a complete inbound TLS pair was refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_inbound_tls_key_is_refused() {
+        // The key that authenticates this host to every sender that encrypts.
+        let tmp = TempDir::new("inbound-tls-perm");
+        let mut c = good(&tmp);
+        c.smtp.inbound.tls_certificate = Some(tmp.file("cert.pem", 0o644));
+        c.smtp.inbound.tls_private_key = Some(tmp.file("key.pem", 0o644));
+        match validate(c) {
+            Err(ValidationError::TooPermissive { actual, .. }) => assert_eq!(actual, 0o644),
+            other => panic!("accepted a world-readable TLS key: {other:?}"),
+        }
     }
 
     #[test]

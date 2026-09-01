@@ -110,12 +110,26 @@ pub struct Smtp {
 #[serde(deny_unknown_fields)]
 pub struct Inbound {
     pub listen: SocketAddr,
+
+    /// The certificate offered to senders that ask for `STARTTLS`.
+    ///
+    /// Optional, unlike submission's. Inbound TLS between mail servers is
+    /// opportunistic: a sender that cannot negotiate it sends in the clear, and
+    /// an MX that refused to serve without a certificate would refuse mail
+    /// rather than protect it. Absent means `STARTTLS` is not advertised at
+    /// all — which is honest, because an advertisement is a promise.
+    #[serde(default)]
+    pub tls_certificate: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_private_key: Option<PathBuf>,
 }
 
 impl Default for Inbound {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:25".parse().expect("literal"),
+            tls_certificate: None,
+            tls_private_key: None,
         }
     }
 }

@@ -217,14 +217,15 @@ pub struct ServerConfig {
     /// cap in place, enough such clients close the server to everyone else —
     /// the cap becomes the means of denial rather than the defence against it.
     pub max_session: Duration,
-    /// Advertise STARTTLS.
+    /// The certificate this listener serves, or `None` for plaintext only.
     ///
-    /// Must stay false: there is no TLS implementation yet, and [`serve`]
-    /// refuses to start if this is set. Advertising it would have the server
-    /// answer `220 Ready to start TLS` and then keep reading plaintext, so the
-    /// client's handshake would be parsed as SMTP commands — a downgrade that
-    /// looks like a working encrypted session from the outside.
-    pub tls_available: bool,
+    /// The presence of the configuration *is* the advertisement: `STARTTLS`
+    /// appears in the `EHLO` response exactly when there is something to
+    /// upgrade to. The previous shape — a `bool` beside no implementation —
+    /// could say "advertise it" while the server answered `220 Ready` and kept
+    /// reading plaintext, which is a downgrade that looks like a working
+    /// encrypted session from the outside. That state is now unrepresentable.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
     /// Refuse recipients whose sender cannot be given a return path (R-4).
     ///
     /// Shared rather than cloned per connection: it holds the SRS key ring,
@@ -248,7 +249,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("data_timeout", &self.data_timeout)
             .field("max_connections", &self.max_connections)
             .field("max_session", &self.max_session)
-            .field("tls_available", &self.tls_available)
+            .field("tls", &self.tls.is_some())
             .field("return_path", &self.return_path.is_some())
             .finish()
     }
@@ -266,7 +267,7 @@ impl Default for ServerConfig {
             data_timeout: Duration::from_secs(600),
             max_connections: 256,
             max_session: Duration::from_secs(3600),
-            tls_available: false,
+            tls: None,
             return_path: None,
         }
     }
@@ -278,19 +279,6 @@ pub async fn serve<S: MessageSink>(
     config: ServerConfig,
     sink: S,
 ) -> io::Result<()> {
-    // Refused rather than tolerated. A previous comment here claimed that
-    // adding TLS would be "a compile error rather than a silent no-op"; it was
-    // not, and setting this flag produced a server that advertised STARTTLS,
-    // accepted it, and then read the handshake as plaintext commands. Failing
-    // at startup is the only version of that promise the code can keep.
-    if config.tls_available {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "tls_available is set but no TLS implementation exists; \
-             the server would advertise STARTTLS and then read plaintext",
-        ));
-    }
-
     let config = Arc::new(config);
     let limit = Arc::new(Semaphore::new(config.max_connections));
 
@@ -327,6 +315,97 @@ pub async fn serve<S: MessageSink>(
     Ok(())
 }
 
+/// The connection, before and after a `STARTTLS` upgrade.
+///
+/// An enum rather than a generic parameter, because the upgrade happens *to* a
+/// live connection: the same session, the same peer, the same loop. A generic
+/// would need the whole handler instantiated twice and the plaintext half to
+/// hand control to the encrypted half, which is a second copy of the
+/// conversation and a second place for the state rules to be got wrong.
+enum Stream {
+    Plain(TcpStream),
+    // Boxed: `TlsStream` is large, and an enum is as big as its largest
+    // variant — every connection would carry that footprint whether or not it
+    // ever negotiates TLS.
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+}
+
+impl Stream {
+    /// Perform the server side of the handshake, consuming the plaintext
+    /// connection.
+    ///
+    /// A failed handshake ends the connection. It is never retried in
+    /// plaintext: the client asked for TLS and was told `220`, so anything it
+    /// sends next it believes to be encrypted.
+    async fn upgrade(self, config: Arc<rustls::ServerConfig>) -> io::Result<Self> {
+        match self {
+            Self::Plain(tcp) => match tokio_rustls::TlsAcceptor::from(config).accept(tcp).await {
+                Ok(tls) => Ok(Self::Tls(Box::new(tls))),
+                Err(e) => Err(e),
+            },
+            // The session refuses a second `STARTTLS` with 503, so this cannot
+            // be reached from the protocol.
+            Self::Tls(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "STARTTLS on a connection that is already encrypted",
+            )),
+        }
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(s) => s.shutdown().await,
+            Self::Tls(s) => s.shutdown().await,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for Stream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Stream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 /// Whether the connection loop should keep going.
 enum Flow {
     Continue,
@@ -335,14 +414,15 @@ enum Flow {
 
 /// Drive one connection.
 async fn handle<S: MessageSink>(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     config: Arc<ServerConfig>,
     sink: S,
 ) -> io::Result<()> {
+    let mut stream = Stream::Plain(stream);
     let mut session = Session::new(
         config.hostname.clone(),
-        config.tls_available,
+        config.tls.is_some(),
         config.max_message_size,
     );
     if let Some(check) = config.return_path.clone() {
@@ -430,6 +510,58 @@ async fn handle<S: MessageSink>(
                     match step(&mut transaction, &mut stream, &mut session, &sink, &line).await? {
                         Step::Continue => {}
                         Step::Close => return Ok(()),
+                        Step::StartTls(reply) => {
+                            let Some(tls) = config.tls.clone() else {
+                                // The session only answers `StartTls` when it
+                                // was told TLS is available, which is exactly
+                                // `config.tls.is_some()`.
+                                tracing::error!(%peer, "STARTTLS agreed with no TLS configured");
+                                return Ok(());
+                            };
+
+                            write_reply(&mut stream, &reply).await?;
+
+                            // Everything buffered is discarded *before* the
+                            // handshake, and nothing read in plaintext is
+                            // carried across it. A client that pipelines
+                            // `STARTTLS\r\nMAIL FROM:<...>` in one packet has
+                            // put that second command in this buffer, and
+                            // executing it after the upgrade would let an
+                            // attacker who can inject plaintext have their
+                            // commands attributed to the encrypted session —
+                            // the injection half of CVE-2011-0411.
+                            //
+                            // `line` is cleared too: `take_line` leaves the
+                            // command that was just parsed in it.
+                            lines.discard();
+                            line.clear();
+                            // Neither can be set here — the session refuses
+                            // STARTTLS inside a transaction — but the rule is
+                            // "nothing survives", and stating it once is
+                            // cheaper than re-deriving it whenever the state
+                            // machine changes.
+                            data = None;
+                            transaction = None;
+
+                            stream = match stream.upgrade(tls).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    // No plaintext fallback. The client was
+                                    // told `220` and believes everything it
+                                    // sends next is encrypted.
+                                    tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                                    return Ok(());
+                                }
+                            };
+
+                            // A fresh EHLO is required: the session forgets the
+                            // client's greeting and its envelope, because
+                            // anything learned before the handshake was learned
+                            // from an unauthenticated conversation.
+                            session.tls_established();
+                            tracing::debug!(%peer, "TLS established");
+                            break;
+                        }
                         Step::BeginData => {
                             // A pipelining client may have sent body bytes in
                             // the same packet as DATA; they are buffered here,
@@ -477,12 +609,16 @@ enum Step {
     Continue,
     Close,
     BeginData,
+    /// The client asked for TLS and the session agreed. The reply is not sent
+    /// here: the connection loop sends it, clears what it has buffered, and
+    /// performs the handshake.
+    StartTls(Reply),
 }
 
 /// Handle one framed command line.
 async fn step<S: MessageSink>(
     transaction: &mut Option<S::Transaction>,
-    stream: &mut TcpStream,
+    stream: &mut Stream,
     session: &mut Session,
     sink: &S,
     line: &[u8],
@@ -551,6 +687,12 @@ async fn step<S: MessageSink>(
     let action = session.advance(cmd);
     let begins_data = matches!(action, Action::ReadData(_));
 
+    // Handed back rather than written here. The upgrade belongs to the
+    // connection loop, which owns the buffers that must not survive it.
+    if let Action::StartTls(reply) = action {
+        return Ok(Step::StartTls(reply));
+    }
+
     match session.state() {
         State::Mail if starts_transaction => *transaction = Some(sink.begin()),
         State::Mail | State::Rcpt | State::Data => {}
@@ -569,7 +711,7 @@ async fn step<S: MessageSink>(
 /// Hand a finished body to the sink and answer the client.
 async fn finish_data<S: MessageSink>(
     transaction: Option<S::Transaction>,
-    stream: &mut TcpStream,
+    stream: &mut Stream,
     session: &mut Session,
     sink: &S,
     config: &ServerConfig,
@@ -622,7 +764,7 @@ async fn finish_data<S: MessageSink>(
 }
 
 /// Write whatever an action asked for, and say whether to keep going.
-async fn emit(stream: &mut TcpStream, action: Action) -> io::Result<Flow> {
+async fn emit(stream: &mut Stream, action: Action) -> io::Result<Flow> {
     match action {
         Action::Reply(r) | Action::ReadData(r) => {
             write_reply(stream, &r).await?;
@@ -634,20 +776,16 @@ async fn emit(stream: &mut TcpStream, action: Action) -> io::Result<Flow> {
             Ok(Flow::Stop)
         }
         Action::StartTls(r) => {
-            // Unreachable: `serve` refuses to start with `tls_available` set,
-            // and the session answers 454 without it.
-            //
-            // An earlier comment here claimed this arm made adding TLS "a
-            // compile error rather than a silent no-op". It did not — an
-            // exhaustive match arm is neither — and writing `220 Ready` while
-            // continuing to read plaintext is exactly the silent no-op it
-            // disclaimed. The guard in `serve` is the real protection; this is
-            // a loud failure rather than a quiet downgrade if it is ever
-            // removed.
+            // Never written here. The upgrade is the connection loop's, because
+            // only it can discard the buffers that must not survive the
+            // handshake — see `Step::StartTls`. Writing `220 Ready` from here
+            // and returning `Continue` would be the silent downgrade this
+            // module used to warn about: the client would negotiate while the
+            // server kept reading plaintext.
             let _ = r;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "STARTTLS reached the I/O layer with no TLS implementation",
+                "STARTTLS must be handled by the connection loop",
             ))
         }
     }
@@ -661,7 +799,7 @@ async fn emit(stream: &mut TcpStream, action: Action) -> io::Result<Flow> {
 /// there — so an unbounded write defeats both the session cap and the
 /// connection cap at once, and it is cheap to arrange: one 8 KB read of
 /// pipelined `EHLO` produces roughly 100 KB of replies.
-async fn write_reply(stream: &mut TcpStream, r: &Reply) -> io::Result<()> {
+async fn write_reply(stream: &mut Stream, r: &Reply) -> io::Result<()> {
     let wire = r.to_wire();
     match tokio::time::timeout(WRITE_TIMEOUT, async {
         stream.write_all(wire.as_bytes()).await?;

@@ -101,7 +101,9 @@ hickory-resolver = { version = "0.26", default-features = false, features = ["to
 # that; see deny.toml.
 rustls          = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
 tokio-rustls    = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
-rustls-pemfile  = "2"
+# PEM parsing comes from `rustls-pki-types` itself. `rustls-pemfile` was the
+# usual crate for it and is unmaintained (RUSTSEC-2025-0134): the archived
+# repository says its last version is a thin wrapper around this same code.
 rustls-pki-types = "1"
 
 # Storage

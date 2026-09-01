@@ -98,6 +98,9 @@ const GIVE_UP_AFTER: Duration = Duration::from_secs(5 * 24 * 60 * 60);
 /// type parameter is the way to get the seam.
 struct Forwarding<R: MxLookup> {
     resolver: Arc<R>,
+    /// How outbound `STARTTLS` is negotiated. Shared, and built once: see
+    /// `pigeon_smtp::tls::outbound` for why the peer is not authenticated.
+    tls: Arc<rustls::ClientConfig>,
     /// Name given in EHLO. Its forward and reverse DNS must agree with the
     /// sending address or receivers will treat everything as suspect.
     ehlo_name: String,
@@ -120,6 +123,7 @@ impl<R: MxLookup> Clone for Forwarding<R> {
     fn clone(&self) -> Self {
         Self {
             resolver: Arc::clone(&self.resolver),
+            tls: Arc::clone(&self.tls),
             ehlo_name: self.ehlo_name.clone(),
             limit: Arc::clone(&self.limit),
             port: self.port,
@@ -1279,7 +1283,19 @@ async fn forward<R: MxLookup>(
         let parts: [&[u8]; 1] = [message];
         let attempt = tokio::time::timeout(
             remaining,
-            pigeon_smtp::deliver(stream, &f.ehlo_name, &outgoing, &parts),
+            pigeon_smtp::deliver(
+                stream,
+                &f.ehlo_name,
+                &outgoing,
+                &parts,
+                // Encrypt whenever this host says it can. Built once at
+                // startup and shared: a client configuration per delivery
+                // would rebuild the cipher suite list for every message.
+                Some(pigeon_smtp::client::Tls {
+                    config: Arc::clone(&f.tls),
+                    server_name: host.as_str(),
+                }),
+            ),
         );
 
         match attempt.await {
@@ -1482,6 +1498,32 @@ async fn run() -> io::Result<()> {
     let spool = started.config.config().spool.clone();
     let sink_dir = spool.clone();
 
+    // Loaded here rather than at the first `STARTTLS`: a certificate that
+    // cannot be read is local misconfiguration, and discovering it per
+    // connection means discovering it while somebody's mail is in flight.
+    //
+    // Absent is a supported configuration, not a degraded one. Inbound TLS
+    // between mail servers is opportunistic, and an MX that refused to serve
+    // without a certificate would refuse mail rather than protect it.
+    let inbound = &started.config.config().smtp.inbound;
+    let tls = match (&inbound.tls_certificate, &inbound.tls_private_key) {
+        (Some(cert), Some(key)) => {
+            let loaded = pigeon_smtp::tls::load(cert, key)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            tracing::info!(certificate = %cert.display(), "STARTTLS enabled");
+            Some(loaded)
+        }
+        // Validation refuses half a pair, so this is genuinely "not
+        // configured" rather than "misconfigured".
+        _ => {
+            tracing::warn!(
+                "no inbound TLS certificate is configured: STARTTLS will not be offered and \
+                 mail from senders that would have encrypted arrives in the clear"
+            );
+            None
+        }
+    };
+
     let listener = TcpListener::bind(&listen)
         .await
         .map_err(|e| io::Error::new(e.kind(), format!("cannot bind {listen}: {e}")))?;
@@ -1504,6 +1546,7 @@ async fn run() -> io::Result<()> {
             SystemResolver::from_system()
                 .map_err(|e| io::Error::other(format!("cannot build resolver: {e}")))?,
         ),
+        tls: pigeon_smtp::tls::outbound(),
         ehlo_name: hostname.clone(),
         limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
         port: SUBMISSION_PORT,
@@ -1614,9 +1657,7 @@ async fn run() -> io::Result<()> {
 
     let config = ServerConfig {
         hostname,
-        // TLS arrives with the rest of Milestone 5; advertising it now would
-        // invite clients to negotiate something that does not exist.
-        tls_available: false,
+        tls,
         return_path,
         ..Default::default()
     };
@@ -1884,6 +1925,7 @@ mod tests {
             hostname: "pigeon.test".into(),
             spool,
             forwarding: Forwarding {
+                tls: pigeon_smtp::tls::outbound(),
                 resolver: Arc::new(FakeResolver::new().with(
                     "example.net",
                     vec![MxRecord::new(10, peer_addr.ip().to_string())],
@@ -2840,6 +2882,7 @@ mod tests {
             hostname: "pigeon.test".into(),
             spool,
             forwarding: Forwarding {
+                tls: pigeon_smtp::tls::outbound(),
                 resolver: Arc::new(FakeResolver::new().with(
                     "example.net",
                     vec![MxRecord::new(10, peer_addr.ip().to_string())],
@@ -4211,6 +4254,7 @@ mod tests {
             .await;
 
         let f = Forwarding {
+            tls: pigeon_smtp::tls::outbound(),
             resolver: Arc::new(pigeon_dns::FakeResolver::new().with(
                 "example.net",
                 vec![
@@ -4260,6 +4304,7 @@ mod tests {
         };
 
         let f = |resolver| Forwarding {
+            tls: pigeon_smtp::tls::outbound(),
             resolver: Arc::new(resolver),
             ehlo_name: "pigeon.test".into(),
             limit: Arc::new(Semaphore::new(1)),

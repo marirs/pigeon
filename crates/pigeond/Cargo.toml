@@ -17,6 +17,8 @@ pigeon-dns = { workspace = true }
 pigeon-auth = { workspace = true }
 pigeon-route = { workspace = true }
 pigeon-smtp = { workspace = true }
+# For the outbound TLS configuration handed to the delivery client.
+rustls = { workspace = true }
 pigeon-spool = { workspace = true }
 pigeon-alert = { workspace = true }
 rusqlite = { workspace = true }

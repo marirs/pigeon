@@ -84,6 +84,18 @@ impl LineReader {
         self.buf.len()
     }
 
+    /// Drop everything buffered, framed or not.
+    ///
+    /// Used by the `STARTTLS` upgrade: plaintext read before the handshake must
+    /// not be executed after it, whether or not it formed a complete command.
+    pub fn discard(&mut self) {
+        self.buf.clear();
+        // Cleared too: a client mid-overlong-line before the upgrade must not
+        // have the encrypted session's first command swallowed as the tail of
+        // a plaintext one.
+        self.discarding = false;
+    }
+
     /// Remove and return everything buffered.
     ///
     /// Needed when a `DATA` command is accepted: a pipelining client may have

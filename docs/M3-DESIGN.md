@@ -869,6 +869,51 @@ the upstream MTA's to report on:
 
 ---
 
+## 11.5 STARTTLS
+
+**Inbound.** Advertised exactly when a certificate is configured — the
+advertisement is a promise, and the previous shape (a `bool` beside no
+implementation) could promise what the server could not do. The certificate is
+loaded at startup, so an unreadable one is an operator problem rather than a
+discovery made while somebody's mail is in flight. Configuring it is optional:
+MX-to-MX TLS is opportunistic, and an MX that refused to serve without a
+certificate would refuse mail rather than protect it.
+
+The upgrade itself has one rule: **nothing crosses it.**
+
+- Every buffered byte is discarded before the handshake — framed or not. A
+  client that pipelines `STARTTLS\r\nMAIL FROM:<...>` in one packet has put
+  that command in the server's buffer, in plaintext; executing it afterwards
+  would attribute an injected command to the encrypted session (the injection
+  half of CVE-2011-0411).
+- The session is reset: greeting, envelope and state. A fresh `EHLO` is
+  required, because everything learned before the handshake was learned from an
+  unauthenticated conversation.
+- A failed handshake ends the connection. There is no plaintext fallback: the
+  client was told `220` and believes everything it sends next is encrypted.
+
+**Outbound.** Certificates are *not* verified, deliberately — see
+`pigeon-smtp/src/tls.rs`. Without DANE or MTA-STS there is no authenticated
+name to check against, and verifying against the public roots would fail on a
+large share of the internet's mail servers, leaving only two options: send in
+the clear anyway, or refuse mail every other MTA delivers. What opportunistic
+TLS buys is protection from a passive observer, which is what can be had
+honestly.
+
+But once a peer *advertises* `STARTTLS`, plaintext is off the table for that
+delivery:
+
+- a refused upgrade (`4xx`/`5xx` to the command) defers;
+- a failed handshake defers;
+- neither retries the message unencrypted.
+
+An attacker who can corrupt one packet could otherwise strip encryption from
+every message by making the handshake fail, and a client that fell back would
+hand them the plaintext for free. Deferral costs a retry; the fallback costs the
+message's confidentiality.
+
+---
+
 ## 12. Tests
 
 Every property with the mutation that must break it, in the discipline the

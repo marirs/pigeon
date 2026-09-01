@@ -134,13 +134,14 @@ pub async fn deliver<S>(
     ehlo_name: &str,
     envelope: &Envelope,
     parts: &[&[u8]],
+    tls: Option<Tls<'_>>,
 ) -> Result<Accepted, ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     match tokio::time::timeout(
         TOTAL_DELIVERY_BUDGET,
-        deliver_inner(stream, ehlo_name, envelope, parts),
+        deliver_inner(stream, ehlo_name, envelope, parts, tls),
     )
     .await
     {
@@ -149,11 +150,26 @@ where
     }
 }
 
+/// What to upgrade to, and who is being spoken to.
+///
+/// `None` at the call site means "never offer to encrypt", which is what a test
+/// against a scripted peer wants. Production always passes one: a server that
+/// advertises `STARTTLS` and is then spoken to in the clear is a downgrade
+/// nobody asked for.
+pub struct Tls<'a> {
+    pub config: std::sync::Arc<rustls::ClientConfig>,
+    /// The host this connection was made to, for SNI. Not used to authenticate
+    /// the peer — see [`crate::tls::outbound`] for why that cannot be done
+    /// without DANE or MTA-STS.
+    pub server_name: &'a str,
+}
+
 async fn deliver_inner<S>(
     stream: S,
     ehlo_name: &str,
     envelope: &Envelope,
     parts: &[&[u8]],
+    tls: Option<Tls<'_>>,
 ) -> Result<Accepted, ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -165,18 +181,86 @@ where
         return Err(ClientError::from_code(code, msg));
     }
 
-    // HELO is the fallback for the rare server that rejects EHLO outright.
-    // Losing ESMTP costs little here; failing the delivery costs the message.
-    let (code, _) = command(&mut io, &format!("EHLO {ehlo_name}\r\n")).await?;
-    if code != 250 {
-        let (code, msg) = command(&mut io, &format!("HELO {ehlo_name}\r\n")).await?;
-        if code != 250 {
-            return Err(ClientError::from_code(code, msg));
+    let offered = greet(&mut io, ehlo_name).await?;
+
+    // Encrypt when the peer says it can. Once it has said so, plaintext is no
+    // longer an option: a failure here defers the delivery rather than sending
+    // the message in the clear, because an attacker who can make a handshake
+    // fail could otherwise strip encryption from every message by doing so.
+    if offered.contains("STARTTLS")
+        && let Some(tls) = tls
+    {
+        let (code, msg) = command(&mut io, "STARTTLS\r\n").await?;
+        if code != 220 {
+            return Err(ClientError::Transient {
+                code,
+                message: format!("STARTTLS was advertised and then refused: {msg}"),
+            });
         }
+
+        // Nothing the peer sent before the handshake may be read after it, and
+        // there should be nothing: a server that pipelines past its own `220`
+        // is either broken or someone else injecting into the stream.
+        if !io.buffer().is_empty() {
+            return Err(ClientError::Protocol(
+                "the peer sent data between agreeing to STARTTLS and the handshake".into(),
+            ));
+        }
+
+        let name = rustls_pki_types::ServerName::try_from(tls.server_name)
+            .map_err(|e| ClientError::Protocol(format!("{}: {e}", tls.server_name)))?
+            .to_owned();
+        let upgraded = tokio_rustls::TlsConnector::from(tls.config)
+            .connect(name, io.into_inner())
+            .await
+            .map_err(|e| ClientError::Transient {
+                code: 0,
+                message: format!("the TLS handshake failed after STARTTLS was advertised: {e}"),
+            })?;
+
+        // A fresh EHLO over the encrypted connection: what the peer told us in
+        // the clear was told by whoever was in the middle.
+        let mut io = BufReader::new(upgraded);
+        greet(&mut io, ehlo_name).await?;
+        return transact(io, envelope, parts).await;
     }
 
+    transact(io, envelope, parts).await
+}
+
+/// Greet, and return the peer's capability lines.
+///
+/// HELO is the fallback for the rare server that rejects EHLO outright. Losing
+/// ESMTP costs little; failing the delivery costs the message — and a server
+/// that cannot do EHLO is not offering STARTTLS either.
+async fn greet<S>(io: &mut BufReader<S>, ehlo_name: &str) -> Result<String, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (code, text) = command(io, &format!("EHLO {ehlo_name}\r\n")).await?;
+    if code == 250 {
+        return Ok(text);
+    }
+
+    let (code, msg) = command(io, &format!("HELO {ehlo_name}\r\n")).await?;
+    if code != 250 {
+        return Err(ClientError::from_code(code, msg));
+    }
+    Ok(String::new())
+}
+
+/// The transaction itself, on whichever stream the conversation ended up on.
+async fn transact<S>(
+    mut io: BufReader<S>,
+    envelope: &Envelope,
+    parts: &[&[u8]],
+) -> Result<Accepted, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let io = &mut io;
     let from = &envelope.sender;
-    let (code, msg) = command(&mut io, &format!("MAIL FROM:<{from}>\r\n")).await?;
+    let (code, msg) = command(io, &format!("MAIL FROM:<{from}>\r\n")).await?;
     if code != 250 {
         return Err(ClientError::from_code(code, msg));
     }
@@ -195,7 +279,7 @@ where
     // belongs with the per-recipient queue in Milestone 3 — the thing that
     // makes a partial outcome representable at all.
     for rcpt in &envelope.recipients {
-        let (code, msg) = command(&mut io, &format!("RCPT TO:<{rcpt}>\r\n")).await?;
+        let (code, msg) = command(io, &format!("RCPT TO:<{rcpt}>\r\n")).await?;
         if !(200..300).contains(&code) {
             if envelope.recipients.len() > 1 {
                 return Err(ClientError::Transient {
@@ -211,7 +295,7 @@ where
         }
     }
 
-    let (code, msg) = command(&mut io, "DATA\r\n").await?;
+    let (code, msg) = command(io, "DATA\r\n").await?;
     if code != 354 {
         return Err(ClientError::from_code(code, msg));
     }
@@ -227,7 +311,7 @@ where
     }
 
     let (code, message) =
-        read_reply_within(&mut io, DATA_ACK_TIMEOUT, "waiting for acknowledgement").await?;
+        read_reply_within(io, DATA_ACK_TIMEOUT, "waiting for acknowledgement").await?;
     if code != 250 {
         return Err(ClientError::from_code(code, message));
     }
@@ -236,7 +320,7 @@ where
     // delivery failure and must not cause a retry. Given a short leash of its
     // own rather than the full command timeout — waiting five minutes for a
     // reply whose content is discarded holds the delivery slot for nothing.
-    let _ = tokio::time::timeout(QUIT_TIMEOUT, command(&mut io, "QUIT\r\n")).await;
+    let _ = tokio::time::timeout(QUIT_TIMEOUT, command(io, "QUIT\r\n")).await;
 
     Ok(Accepted { code, message })
 }

@@ -40,6 +40,7 @@ pub mod command;
 pub mod reply;
 pub mod server;
 pub mod session;
+pub mod tls;
 
 pub use client::{Accepted, ClientError, deliver};
 pub use codec::{DataReader, DataStatus, LineError, LineReader};

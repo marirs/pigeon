@@ -398,7 +398,7 @@ async fn client_delivers_to_server() {
     let body = b"Subject: round trip\r\n\r\n.leading dot\r\n.\r\nplain\r\n";
 
     let stream = TcpStream::connect(addr).await.unwrap();
-    let accepted = pigeon_smtp::deliver(stream, "client.test", &envelope, &[body.as_slice()])
+    let accepted = pigeon_smtp::deliver(stream, "client.test", &envelope, &[body.as_slice()], None)
         .await
         .expect("delivery should succeed");
 
@@ -421,9 +421,15 @@ async fn client_reports_rejected_recipient_as_permanent() {
     };
 
     let stream = TcpStream::connect(addr).await.unwrap();
-    let err = pigeon_smtp::deliver(stream, "client.test", &envelope, &[b"x\r\n".as_slice()])
-        .await
-        .expect_err("unknown recipient must fail");
+    let err = pigeon_smtp::deliver(
+        stream,
+        "client.test",
+        &envelope,
+        &[b"x\r\n".as_slice()],
+        None,
+    )
+    .await
+    .expect_err("unknown recipient must fail");
 
     // 550 means retrying is pointless; the queue should bounce rather than
     // spend five days on a mailbox that does not exist.
@@ -447,6 +453,7 @@ async fn client_delivers_a_bounce_with_a_null_sender() {
         "client.test",
         &envelope,
         &[b"delivery failed\r\n".as_slice()],
+        None,
     )
     .await
     .unwrap();

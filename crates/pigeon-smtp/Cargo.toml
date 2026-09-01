@@ -13,7 +13,20 @@ publish.workspace      = true
 pigeon-types = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# TLS. `ring` rather than the default provider, and no path to OpenSSL: see the
+# workspace manifest and deny.toml.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time", "test-util"] }
 pigeon-testkit = { workspace = true }
+
+# A certificate for the STARTTLS tests. Test-only: a fixture PEM checked into
+# the repository would expire, and generating one at test time is the only
+# version of the fixture that stays valid. `ring` for the same reason rustls
+# uses it — the default backend is aws-lc-rs, which is banned.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
