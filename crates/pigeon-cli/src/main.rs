@@ -188,6 +188,20 @@ enum Command {
     },
     /// Is this host working?
     Health,
+    /// Send one message, for diagnostics.
+    ///
+    /// Goes out the same way the queue does — the same relay, the same MX
+    /// selection, the same loop check — because a diagnostic that took a
+    /// different path would prove a path nobody uses. It does *not* go through
+    /// the queue: nothing is retried and nothing is stored.
+    Send {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "pigeon test")]
+        subject: String,
+    },
     /// Copy the database somewhere safe.
     Backup {
         /// Where to write it. Never overwritten.
@@ -728,6 +742,7 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
                 .map(|c| c.spool);
             ops::health(&conn, spool.as_deref(), cli.json)
         }
+        Command::Send { from, to, subject } => send(cli, from, to, subject),
         Command::Backup { to } => {
             let conn = open_read(cli)?;
             let keys = cli
@@ -2118,6 +2133,81 @@ fn alerts_test(cli: &Cli) -> anyhow::Result<u8> {
                 json::fail("alert_failed", &e);
             } else {
                 eprintln!("The alert could not be delivered.\n  {e}");
+            }
+            Ok(exit::FAILED)
+        }
+    }
+}
+
+/// `pigeon send`: one message, straight out, for diagnostics.
+///
+/// Not queued: nothing here is retried and nothing is stored, so a failure is
+/// reported to the person who typed the command rather than to a queue they
+/// then have to inspect. What it does share with the queue is the delivery
+/// path itself, because a diagnostic down a different path proves nothing.
+fn send(cli: &Cli, from: &str, to: &str, subject: &str) -> anyhow::Result<u8> {
+    let config = config_for_checks(cli)?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let outcome = runtime.block_on(async {
+        let resolver = pigeon_dns::SystemResolver::from_system()
+            .map_err(|e| format!("cannot build a resolver: {e}"))?;
+
+        let forwarding = pigeon_smtp::relay::Forwarding {
+            resolver: std::sync::Arc::new(resolver),
+            tls: pigeon_smtp::tls::outbound(),
+            identity: pigeon_smtp::relay::SelfIdentity::default(),
+            ehlo_name: config.hostname.clone(),
+            limit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            port: 25,
+            budget: std::time::Duration::from_secs(120),
+        };
+
+        let body = format!(
+            "From: <{from}>\r\n\
+             To: <{to}>\r\n\
+             Subject: {subject}\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             Sent by `pigeon send` from {}.\r\n\
+             \r\n\
+             This message did not go through the queue: it is a diagnostic, and\r\n\
+             nothing about it is retried or stored.\r\n",
+            config.hostname
+        );
+
+        // Unsigned, and worth saying: this path has no domain context and no
+        // DKIM key, so what it proves is that a message can leave this host and
+        // reach that recipient — not that a *forwarded* message would pass
+        // authentication there.
+        pigeon_smtp::relay::forward(&forwarding, 0, to, from, body.as_bytes())
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    match outcome {
+        Ok(remote) => {
+            if cli.json {
+                json::ok(serde_json::json!({ "sent": true, "to": to, "remote": remote }));
+            } else {
+                println!("Sent to {to}.\n  {remote}\n");
+                println!(
+                    "This message was not signed and did not go through the queue. It shows\n\
+                     that mail can leave this host, not that a forwarded message would pass\n\
+                     authentication at the far end."
+                );
+            }
+            Ok(exit::OK)
+        }
+        Err(e) => {
+            if cli.json {
+                json::fail("send_failed", &e);
+            } else {
+                eprintln!("Could not send.\n  {e}");
             }
             Ok(exit::FAILED)
         }

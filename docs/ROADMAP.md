@@ -323,7 +323,7 @@ Backup deserves specific attention. DKIM private keys are the only state that ca
 - [x] per-principal and per-domain rate limits
 - [x] anti-open-relay integration suite — the unauthenticated half landed in
       Milestone 0; the authenticated half is `pigeon-smtp/tests/relay.rs`
-- [ ] optional CLI send for diagnostics
+- [x] optional CLI send for diagnostics
 
 Sequenced after forwarding because it is the larger and more security-critical body of work, and because forwarding is what breaks first in production.
 
