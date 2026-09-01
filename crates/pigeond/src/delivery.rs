@@ -48,6 +48,9 @@ pub struct Deliverer {
 pub struct DeliveryConfig<R: MxLookup> {
     pub queue: Queue,
     pub spool: pigeon_spool::Spool,
+    /// For reversing a return path into the address a report goes to.
+    pub srs: Arc<pigeon_auth::Srs>,
+    pub hostname: String,
     pub forwarding: Forwarding<R>,
     /// Bounded concurrency. Also the number of permits, and therefore the
     /// number of rows that can be claimed at once.
@@ -69,6 +72,8 @@ impl Deliverer {
             let DeliveryConfig {
                 queue,
                 spool,
+                srs,
+                hostname,
                 forwarding,
                 lease_seconds,
                 horizon_seconds,
@@ -89,7 +94,16 @@ impl Deliverer {
                 };
 
                 let now = crate::unix_now();
-                housekeeping(&queue, now, horizon_seconds, lease_seconds).await;
+                housekeeping(
+                    &queue,
+                    &spool,
+                    &srs,
+                    &hostname,
+                    now,
+                    horizon_seconds,
+                    lease_seconds,
+                )
+                .await;
 
                 let claimed = {
                     let mut conn = queue.conn.lock().await;
@@ -152,8 +166,23 @@ impl Deliverer {
     }
 }
 
-/// Reclaim expired leases and give up on messages past the horizon.
-async fn housekeeping(queue: &Queue, now: i64, horizon: i64, lease: i64) {
+/// Everything the loop does besides delivering: reclaim, expire, report,
+/// release and sweep.
+///
+/// In this order, and the order is not arbitrary. Expiring produces owed
+/// reports; reporting is what releases bodies; releasing is what makes files
+/// collectable. Running them in any other order just means each step waits a
+/// tick for the one before it.
+#[allow(clippy::too_many_arguments)]
+async fn housekeeping(
+    queue: &Queue,
+    spool: &pigeon_spool::Spool,
+    srs: &pigeon_auth::Srs,
+    hostname: &str,
+    now: i64,
+    horizon: i64,
+    lease: i64,
+) {
     let mut conn = queue.conn.lock().await;
 
     // A lease that expired means a worker died mid-attempt, or was stopped long
@@ -169,6 +198,31 @@ async fn housekeeping(queue: &Queue, now: i64, horizon: i64, lease: i64) {
         Ok(0) => {}
         Ok(n) => tracing::warn!(count = n, "gave up on deliveries past the horizon"),
         Err(e) => tracing::error!(error = %e, "cannot expire old deliveries"),
+    }
+    drop(conn);
+
+    // Reports for whatever is owed, including anything the expiry above just
+    // produced.
+    crate::notify::run_once(queue, spool, srs, hostname, now).await;
+
+    // Bodies whose deliveries are all terminal and whose reports are all
+    // queued. Marked released before the file is removed, so a crash leaves an
+    // orphan rather than a row claiming a body that is gone.
+    crate::notify::release_bodies(queue, spool, now).await;
+
+    // And whatever an acceptance left behind by crashing before its commit.
+    // Files being installed right now are registered with the spool and are
+    // skipped; after a crash that register is empty, which is exactly when its
+    // files are collectable.
+    // Only with a listing that is known to be complete: an empty set claims
+    // nothing is referenced, and sweeping on that claim deletes every queued
+    // message.
+    if let Some(referenced) = crate::notify::referenced(queue).await {
+        match spool.sweep(&referenced).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "swept spool files no message refers to"),
+            Err(e) => tracing::warn!(error = %e, "cannot sweep the spool"),
+        }
     }
 }
 

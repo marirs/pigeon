@@ -238,13 +238,19 @@ pub fn enqueue(
 /// Record that a report can never be sent, and stop owing it.
 ///
 /// For the one case R-4's "never discard" does not cover: there is no address
-/// to send to. A return path that will not reverse is a local fault — a rotated
-/// key deleted too early, a corrupted row — and queueing a message to nowhere
-/// would leave the body pinned forever behind a notification that cannot
-/// happen.
+/// to send to. **Only for a permanent condition** — an address that is not a
+/// return path at all, or one whose tag will never verify. A ring that cannot
+/// be read right now is a different thing and must stay owed (see
+/// `ReversalFailure`), or a transient local fault would silently consume the
+/// obligation.
 ///
-/// Loud rather than quiet: the caller logs and alerts, and the event stays in
-/// the delivery log for whoever asks why a sender heard nothing.
+/// Recorded as `abandoned` rather than `none`, because "no report was
+/// required" and "a report was owed and will never be sent" are different
+/// facts: collapsing them means nobody can ask how many senders were left
+/// without an answer.
+///
+/// Loud rather than quiet: the caller logs *and alerts*, and the reason stays
+/// in the delivery log for whoever asks later.
 pub fn abandon_report(
     conn: &Connection,
     report: &Owed,
@@ -253,7 +259,7 @@ pub fn abandon_report(
 ) -> rusqlite::Result<()> {
     for entry in &report.entries {
         conn.execute(
-            "UPDATE delivery SET notification = 'none'
+            "UPDATE delivery SET notification = 'abandoned'
               WHERE id = ?1 AND notification = 'owed'",
             [entry.delivery_id],
         )?;
@@ -264,6 +270,22 @@ pub fn abandon_report(
         )?;
     }
     Ok(())
+}
+
+/// Why a return path could not be turned back into a sender.
+///
+/// The distinction decides whether an obligation is discharged or kept, so it
+/// is a type rather than a judgement made at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReversalFailure {
+    /// The stored address is not a return path this host issued, or its tag
+    /// will never verify: malformed, forged, or expired past a window that only
+    /// moves further away. No amount of waiting produces a recipient.
+    Permanent,
+    /// This host cannot answer *right now* — the ring is unreadable, no key is
+    /// eligible to verify, the clock has jumped. The address may be perfectly
+    /// good; the obligation stays owed and the next pass tries again.
+    Local,
 }
 
 /// Whether a message's body may be removed.
@@ -281,6 +303,44 @@ pub fn body_may_be_removed(conn: &Connection, message_id: i64) -> rusqlite::Resu
         |r| r.get(0),
     )?;
     Ok(pending == 0)
+}
+
+/// Mark a body released, before the file is removed.
+///
+/// The order matters and it is the opposite of the obvious one. SQLite cannot
+/// commit an unlink, so one of the two crash windows has to be chosen:
+///
+/// - **Commit first, then unlink.** A crash leaves a row saying the body is
+///   gone and a file that is still there: an orphan, which the sweep collects.
+/// - **Unlink first, then commit.** A crash leaves a row claiming a body that
+///   no longer exists — and every reader of that row treats a missing file as
+///   an integrity failure, which it now is, permanently.
+///
+/// The first is recoverable and the second is not, so the mark goes first.
+/// Returns whether the row was updated: `false` means somebody else already
+/// released it, and the caller should not remove the file on that basis.
+pub fn mark_body_released(conn: &Connection, message_id: i64, now: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE message SET body_deleted_at = ?1
+          WHERE id = ?2 AND body_deleted_at IS NULL",
+        rusqlite::params![now, message_id],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Spool identifiers whose bodies are marked released but may still be on disk.
+///
+/// The other half of the ordering above: a crash between the commit and the
+/// unlink leaves exactly these, and they are collectable at any time because
+/// nothing will ever read them again.
+pub fn released_bodies(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<SpoolId>> {
+    let mut stmt =
+        conn.prepare("SELECT spool_id FROM message WHERE body_deleted_at IS NOT NULL LIMIT ?1")?;
+    let rows = stmt.query_map([limit as i64], |r| r.get::<_, String>(0))?;
+    Ok(rows
+        .filter_map(|r| r.ok())
+        .filter_map(|s| SpoolId::new(&s).ok())
+        .collect())
 }
 
 /// Remove a spool file for a report that was not committed.

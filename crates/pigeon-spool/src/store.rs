@@ -11,8 +11,10 @@
 //! nothing after step 2 may remove it, because from that instant the message is
 //! owed to somebody.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncWriteExt;
 
@@ -93,14 +95,115 @@ pub enum InvalidSpoolId {
 }
 
 /// The spool directory.
+///
+/// Also the register of installs in progress. A file is deliberately
+/// unreferenced between being installed and its transaction committing, so a
+/// sweep that collected unreferenced files would delete exactly the message
+/// that is one instant away from being acknowledged.
+///
+/// An age heuristic would only make that window narrower, not closed: "old
+/// enough that no acceptance could still be running" is a guess about
+/// scheduling, and it is wrong on a machine that is paused, swapping, or
+/// stopped in a debugger. The register is exact — and it lives in memory
+/// deliberately, because after a crash there is no acceptance in progress and
+/// every one of those files really is collectable.
 #[derive(Debug, Clone)]
 pub struct Spool {
     root: PathBuf,
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+/// An install that has not been committed yet.
+///
+/// Holds the identifier in the register until it is dropped, which the caller
+/// does after its transaction commits — or after it rolls back and removes the
+/// file.
+#[derive(Debug)]
+pub struct Pending {
+    id: SpoolId,
+    active: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Pending {
+    pub fn id(&self) -> &SpoolId {
+        &self.id
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(self.id.as_str());
+        }
+    }
 }
 
 impl Spool {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            active: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Register an install that is about to happen, so the sweep leaves it
+    /// alone until the returned guard is dropped.
+    pub fn begin(&self, id: &SpoolId) -> Pending {
+        if let Ok(mut active) = self.active.lock() {
+            active.insert(id.as_str().to_string());
+        }
+        Pending {
+            id: id.clone(),
+            active: Arc::clone(&self.active),
+        }
+    }
+
+    /// Remove spool files that nothing refers to and nothing is installing.
+    ///
+    /// `referenced` is what the database knows about. Anything on disk that is
+    /// neither referenced nor mid-install was written by an acceptance that
+    /// crashed before its commit: the sender was never told `250`, so the file
+    /// is nobody's.
+    ///
+    /// Returns how many were removed.
+    pub async fn sweep(&self, referenced: &HashSet<String>) -> Result<usize, SpoolError> {
+        let mut entries = tokio::fs::read_dir(&self.root)
+            .await
+            .map_err(|e| SpoolError::io(format!("reading {}", self.root.display()), e))?;
+
+        let mut removed = 0;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name.strip_suffix(".eml") else {
+                // Partial files are left alone: one may belong to a write that
+                // is in progress this instant, and deleting it destroys mail in
+                // flight to save a few bytes.
+                continue;
+            };
+            if referenced.contains(stem) {
+                continue;
+            }
+            if self.active.lock().map(|a| a.contains(stem)).unwrap_or(true) {
+                // Mid-install, or the register is poisoned. Either way, leaving
+                // the file is the safe direction.
+                continue;
+            }
+
+            match tokio::fs::remove_file(entry.path()).await {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %entry.path().display(), error = %e, "cannot sweep");
+                }
+            }
+        }
+
+        if removed > 0 {
+            sync_dir(&self.root)
+                .await
+                .map_err(|e| SpoolError::io(format!("flushing {}", self.root.display()), e))?;
+        }
+        Ok(removed)
     }
 
     pub fn root(&self) -> &Path {

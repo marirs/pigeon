@@ -28,6 +28,7 @@
 //! because the TOML loader and SQLite schema arrive in Milestone 1.
 
 mod delivery;
+mod notify;
 mod reload;
 mod startup;
 
@@ -1576,12 +1577,16 @@ async fn run() -> io::Result<()> {
     // every fallible step, for the reason the reload worker is: an early `?`
     // between the start and the listener bind would drop the handle and leave
     // the task running.
-    let stop_delivery = match (&sink.queue, &sink.forwarding) {
-        (Some(queue), Some(forwarding)) => {
+    let stop_delivery = match (&sink.queue, &sink.forwarding, &sink.auth) {
+        (Some(queue), Some(forwarding), Some(auth)) => {
             let worker = worker_identity(&hostname_for_worker);
             tracing::info!(%worker, concurrency = MAX_CONCURRENT_DELIVERIES, "delivery worker starting");
             let d = delivery::Deliverer::start(delivery::DeliveryConfig {
                 queue: queue.clone(),
+                // The ring as published, so a rotation reaches the notifier
+                // the same way it reaches signing.
+                srs: Arc::clone(&auth.runtime.pin().srs),
+                hostname: hostname_for_worker.clone(),
                 spool: sink.spool.clone(),
                 forwarding: forwarding.clone(),
                 concurrency: MAX_CONCURRENT_DELIVERIES,
@@ -1814,6 +1819,14 @@ mod tests {
 
         let deliverer = delivery::Deliverer::start(delivery::DeliveryConfig {
             queue: queue.clone(),
+            srs: Arc::new(pigeon_auth::Srs::new(
+                pigeon_auth::KeyRing::parse(
+                    "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                )
+                .unwrap(),
+                "pigeon.test",
+            )),
+            hostname: "pigeon.test".into(),
             spool,
             forwarding: Forwarding {
                 resolver: Arc::new(FakeResolver::new().with(
@@ -2050,6 +2063,251 @@ mod tests {
             response.contains("550") || response.contains("No such user"),
             "the remote's answer was not recorded: {response}"
         );
+
+        deliverer.stop();
+    }
+
+    #[tokio::test]
+    async fn a_released_body_is_marked_before_the_file_goes() {
+        // SQLite cannot commit an unlink, so one of two crash windows has to
+        // be chosen. Marking first leaves an orphan the sweep collects;
+        // unlinking first leaves a row claiming a body that is gone, which
+        // every reader treats — correctly — as an integrity failure.
+        //
+        // Driven by making the removal fail: the row must still be marked.
+        let tmp = TempDir::new("release-order");
+        let (peer_addr, _t) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (queue, deliverer) =
+            delivery_fixture(tmp.path(), peer_addr, &["a@example.net"], 1, true).await;
+        deliverer.stop();
+
+        // A delivered message, so its body is releasable.
+        {
+            let conn = queue.conn.lock().await;
+            conn.execute(
+                "UPDATE delivery SET state='delivered', terminal_at=1, next_attempt_at=NULL",
+                [],
+            )
+            .unwrap();
+        }
+
+        // A directory the process cannot unlink from.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+
+        let spool = pigeon_spool::Spool::new(tmp.path().to_path_buf());
+        let released = notify::release_bodies(&queue, &spool, unix_now()).await;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        assert_eq!(released, 1);
+        let conn = queue.conn.lock().await;
+        let marked: Option<i64> = conn
+            .query_row("SELECT body_deleted_at FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            marked.is_some(),
+            "the row was not marked, so a crash here would claim a body that may be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_is_not_released_while_a_report_is_owed() {
+        // The report quotes the original headers, so the body outlives the
+        // deliveries by as long as the reports take.
+        let tmp = TempDir::new("release-owed");
+        let (peer_addr, _t) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (queue, deliverer) =
+            delivery_fixture(tmp.path(), peer_addr, &["a@example.net"], 1, true).await;
+        deliverer.stop();
+
+        {
+            let conn = queue.conn.lock().await;
+            conn.execute(
+                "UPDATE delivery SET state='failed', terminal_at=1, next_attempt_at=NULL,
+                                     notification='owed'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let spool = pigeon_spool::Spool::new(tmp.path().to_path_buf());
+        assert_eq!(
+            notify::release_bodies(&queue, &spool, unix_now()).await,
+            0,
+            "a body was released while its report was still owed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_listing_does_not_authorise_sweeping() {
+        // An empty set is a claim that nothing is referenced. Returning one
+        // because a query failed would delete every queued message on the
+        // host, so an unknown listing has to be its own answer.
+        let tmp = TempDir::new("sweep-unknown");
+        let (peer_addr, _t) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (queue, deliverer) =
+            delivery_fixture(tmp.path(), peer_addr, &["a@example.net"], 1, true).await;
+        deliverer.stop();
+
+        assert!(
+            notify::referenced(&queue).await.is_some(),
+            "a healthy database reported an unknown listing"
+        );
+
+        // With the table gone, the listing cannot be produced.
+        {
+            let conn = queue.conn.lock().await;
+            // Dropped in dependency order; `delivery` refers to `message`.
+            conn.execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TABLE recipient_delivery;
+                 DROP TABLE delivery_event;
+                 DROP TABLE delivery;
+                 DROP TABLE original_recipient;
+                 DROP TABLE message;",
+            )
+            .unwrap();
+        }
+        assert!(
+            notify::referenced(&queue).await.is_none(),
+            "a failed listing was reported as `nothing is referenced`"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_failure_produces_a_report_addressed_to_the_real_sender() {
+        // End to end: the destination refuses permanently, the failure is
+        // owed, the notifier reverses the stored SRS return path and queues a
+        // report to the address a person would recognise — not to the SRS
+        // address, which would deliver the bounce back into Pigeon.
+        let tmp = TempDir::new("dsn-e2e");
+        let (peer_addr, _t) = peer_answering("550 5.1.1 No such user").spawn().await;
+        let (queue, deliverer) =
+            delivery_fixture(tmp.path(), peer_addr, &["a@example.net"], 1, true).await;
+
+        // The fixture's ring, so the return path below reverses.
+        let srs = pigeon_auth::Srs::new(
+            pigeon_auth::KeyRing::parse(
+                "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            )
+            .unwrap(),
+            "pigeon.test",
+        );
+        let return_path = srs
+            .forward("alice", "remote.test", pigeon_auth::Day::now())
+            .unwrap();
+        {
+            let conn = queue.conn.lock().await;
+            conn.execute("UPDATE message SET return_path = ?1", [&return_path])
+                .unwrap();
+        }
+
+        // Wait for the report to be queued: a second message, with a null
+        // return path.
+        let mut reported = None;
+        for _ in 0..80 {
+            let conn = queue.conn.lock().await;
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT m.return_path, d.destination
+                       FROM message m JOIN delivery d ON d.message_id = m.id
+                      WHERE m.spool_id LIKE 'dsn-%'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            drop(conn);
+            if row.is_some() {
+                reported = row;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let (report_return_path, report_to) = reported.expect("no failure report was queued");
+        assert!(
+            report_return_path.is_empty(),
+            "the report has an envelope sender, so a bounce of it would bounce again"
+        );
+        assert_eq!(
+            report_to, "alice@remote.test",
+            "the report was not addressed to the original sender"
+        );
+
+        // And the failure is no longer owed.
+        let conn = queue.conn.lock().await;
+        let notification: String = conn
+            .query_row(
+                "SELECT notification FROM delivery WHERE destination = 'a@example.net'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notification, "enqueued");
+        drop(conn);
+
+        deliverer.stop();
+    }
+
+    #[tokio::test]
+    async fn a_return_path_that_will_never_verify_is_abandoned_not_retried_forever() {
+        // Permanent: the stored address is not something this host issued, so
+        // no amount of waiting produces a recipient. Recorded as `abandoned`,
+        // which is durably distinct from "no report was required".
+        let tmp = TempDir::new("dsn-abandon");
+        let (peer_addr, _t) = peer_answering("550 5.1.1 No such user").spawn().await;
+        let (queue, deliverer) =
+            delivery_fixture(tmp.path(), peer_addr, &["a@example.net"], 1, true).await;
+
+        {
+            let conn = queue.conn.lock().await;
+            conn.execute(
+                "UPDATE message SET return_path = 'not-an-srs-address@pigeon.test'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut notification = String::new();
+        for _ in 0..80 {
+            let conn = queue.conn.lock().await;
+            notification = conn
+                .query_row(
+                    "SELECT notification FROM delivery WHERE destination = 'a@example.net'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            drop(conn);
+            if notification == "abandoned" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            notification, "abandoned",
+            "an unreportable failure was not abandoned, or was recorded as needing no report"
+        );
+
+        // The reason is in the delivery log, not only in a process log.
+        let conn = queue.conn.lock().await;
+        let response: String = conn
+            .query_row(
+                "SELECT response FROM delivery_event WHERE kind = 'notify'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(response.contains("not reported"), "{response}");
+        drop(conn);
 
         deliverer.stop();
     }

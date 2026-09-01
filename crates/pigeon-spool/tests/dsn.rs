@@ -346,7 +346,10 @@ fn a_report_with_nowhere_to_go_stops_being_owed_and_says_so() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(notification, "none");
+    // `abandoned`, not `none`: "a report was owed and can never be sent" is a
+    // fault worth counting, and `none` would file it with the deliveries that
+    // never owed anything.
+    assert_eq!(notification, "abandoned");
 
     // The reason is in the delivery log rather than only in a process log, so
     // "why did the sender hear nothing?" has an answer later.

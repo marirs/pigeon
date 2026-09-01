@@ -209,3 +209,88 @@ async fn a_partial_write_leaves_nothing_behind() {
         "a temporary survived a failed install"
     );
 }
+
+// -------------------------------------------------------------- the sweep
+
+#[tokio::test]
+async fn a_file_being_installed_is_not_swept() {
+    // The window the register exists for: between the install and the commit
+    // the file is deliberately unreferenced, and it is one instant away from
+    // being a message somebody was told `250` about.
+    let dir = Dir::new("sweep-active");
+    let spool = dir.spool();
+    let m = id("msg-1");
+
+    let pending = spool.begin(&m);
+    spool.install(&m, &[b"body"]).await.unwrap();
+
+    let referenced = std::collections::HashSet::new();
+    assert_eq!(
+        spool.sweep(&referenced).await.unwrap(),
+        0,
+        "the sweep took a file that was mid-install"
+    );
+    assert!(spool.path(&m).exists());
+
+    // Once the transaction is done, the guard goes — and if the transaction did
+    // not commit, the file is nobody's.
+    drop(pending);
+    assert_eq!(spool.sweep(&referenced).await.unwrap(), 1);
+    assert!(!spool.path(&m).exists());
+}
+
+#[tokio::test]
+async fn a_referenced_file_is_never_swept() {
+    let dir = Dir::new("sweep-referenced");
+    let spool = dir.spool();
+    let m = id("msg-1");
+    spool.install(&m, &[b"body"]).await.unwrap();
+
+    let referenced: std::collections::HashSet<String> = ["msg-1".to_string()].into_iter().collect();
+    assert_eq!(spool.sweep(&referenced).await.unwrap(), 0);
+    assert!(spool.path(&m).exists(), "a queued message was swept");
+}
+
+#[tokio::test]
+async fn the_sweep_leaves_partial_files_alone() {
+    // One may belong to a write in progress this instant, and deleting it
+    // destroys mail in flight to save a few bytes. They are counted elsewhere
+    // so an operator whose disk is filling can see them.
+    let dir = Dir::new("sweep-partial");
+    let spool = dir.spool();
+    std::fs::write(dir.0.join(".msg-1.partial"), b"half").unwrap();
+
+    assert_eq!(
+        spool
+            .sweep(&std::collections::HashSet::new())
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(dir.0.join(".msg-1.partial").exists());
+}
+
+#[tokio::test]
+async fn after_a_restart_an_uncommitted_file_is_collectable() {
+    // The register is in memory on purpose: a crash empties it, and after a
+    // crash there is no acceptance in progress, so every file it was
+    // protecting really is nobody's.
+    let dir = Dir::new("sweep-restart");
+    {
+        let spool = dir.spool();
+        let m = id("msg-1");
+        let _pending = spool.begin(&m);
+        spool.install(&m, &[b"body"]).await.unwrap();
+        // The process ends here, guard and register with it.
+    }
+
+    let after_restart = dir.spool();
+    assert_eq!(
+        after_restart
+            .sweep(&std::collections::HashSet::new())
+            .await
+            .unwrap(),
+        1,
+        "a file left by a crashed acceptance was not collected"
+    );
+}

@@ -51,6 +51,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "claim-token",
         sql: include_bytes!("../migrations/0003_claim_token.sql"),
     },
+    Migration {
+        version: 4,
+        name: "abandoned-notification",
+        sql: include_bytes!("../migrations/0004_abandoned.sql"),
+    },
 ];
 
 /// What a run did.
@@ -430,6 +435,7 @@ mod tests {
                 // that may have expired are the three scans a worker makes,
                 // and a table of terminal rows is what it would scan without
                 // them.
+                "delivery_abandoned",
                 "delivery_by_message",
                 "delivery_due",
                 "delivery_event_by_delivery",

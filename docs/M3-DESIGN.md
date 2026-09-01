@@ -425,10 +425,21 @@ Three lifetimes, deliberately different:
 - **The rows** outlive it, for a configurable window, because queue inspection
   and post-incident debugging without them is guesswork.
 - **Orphaned spool files** — raw, intermediate or final, written before a crash
-  that preceded a commit — are swept at startup and periodically: any spool file
-  with no row referring to it, older than a grace period comfortably longer than
-  the acceptance path, is removed. The grace period is what stops the sweep
-  racing an acceptance in progress.
+  that preceded a commit — are swept periodically: any spool file with no row
+  referring to it and no install in progress is removed.
+
+  **Not an age heuristic.** A freshly installed file is *deliberately*
+  unreferenced until its transaction commits, and "old enough that no acceptance
+  could still be running" is a guess about scheduling that is wrong on a machine
+  that is paused, swapping, or stopped in a debugger. Installs in progress are
+  registered in memory instead, and the sweep skips them — exactly, not
+  probably. The register lives in memory on purpose: after a crash there is no
+  acceptance in progress, so every file it was protecting really is collectable.
+
+  A listing that cannot be produced is its own answer. An empty set is a *claim*
+  that nothing is referenced, and sweeping on that claim would delete every
+  queued message on the host, so an unreadable or incomplete listing means no
+  sweep at all.
 
 ### 8.1 Deletion is not part of the transition
 
@@ -436,21 +447,23 @@ SQLite cannot commit a file deletion, so `body_deleted_at` must not be written
 as though the terminal transition and the `unlink` were one act. They are four
 steps, in this order:
 
-1. Commit the last terminal delivery (and, if one is owed, the notification —
-   §9.2).
-2. Delete the spool file and fsync its directory.
-3. Set `body_deleted_at`.
-4. Periodically finish the pairs a crash separated: terminal messages with no
-   `body_deleted_at` whose file still exists get step 2 and 3 again.
+1. Commit the last terminal delivery, and the notification if one was owed
+   (§9.2).
+2. **Mark the body released** — `body_deleted_at` — and commit.
+3. Delete the spool file and fsync its directory.
+4. Periodically collect the files step 3 did not reach: a released body whose
+   file still exists is an orphan, and nothing will ever read it again.
 
-A crash between 1 and 2 leaves a file with no reader, which step 4 collects. A
-crash between 2 and 3 leaves a row claiming a body that is gone, which is why
-every path that opens a spool file treats *absent* as a distinct outcome rather
-than an I/O error — and why nothing may become deliverable again once terminal.
+The mark goes **before** the unlink, which is the opposite of the obvious
+order, because SQLite cannot commit a file deletion and one of the two crash
+windows has to be chosen:
 
-Doing it the other way round — setting `body_deleted_at` first — turns the same
-crash into a message whose body exists and which nothing will ever read or
-remove.
+| Order | A crash in between leaves | Recoverable? |
+|---|---|---|
+| Mark, then unlink | a row saying the body is gone, and a file that is still there | yes — an orphan, swept |
+| Unlink, then mark | a row claiming a body that no longer exists | **no** — every reader treats it as an integrity failure, correctly, forever |
+
+An earlier draft of this section had it the other way round.
 
 ---
 
@@ -472,6 +485,23 @@ be delivered is discarded, not bounced again.
 message was itself a bounce; failing to deliver a bounce is a double bounce, and
 the only correct action is to log it and stop. This is the one case where a
 failure is discarded rather than reported, and it is the exception R-4 names.
+
+**A return path that cannot be reversed is classified before anything is
+discarded.** Two very different things look the same at the call site:
+
+- **Permanent** — not a return path this host issued, malformed, a tag that will
+  never verify, or expired past a window that only moves further away. No amount
+  of waiting produces a recipient, so the obligation is discharged as
+  `abandoned`, with an operator alert as well as a delivery event.
+- **Local** — the ring is unreadable right now, no key is eligible, the clock
+  has jumped backwards. The address may be perfectly good, so the failure stays
+  `owed` and the next pass tries again. Treating this as permanent would consume
+  an obligation because a file was briefly unreadable.
+
+`abandoned` is a state of its own rather than a return to `none`, because "no
+report was required" and "a report was owed and will never be sent" are
+different facts. Collapsing them means nobody can ask how many senders were left
+without an answer.
 
 **Content**: RFC 3464 `multipart/report`, carrying
 
