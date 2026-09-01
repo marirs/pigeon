@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use pigeon_smtp::{Connection, DataError, Envelope, Message, MessageSink, Recipient};
+use pigeon_smtp::{Connection, DataError, Message, MessageSink, Recipient};
 
 use crate::{Auth, Queue, routing};
 
