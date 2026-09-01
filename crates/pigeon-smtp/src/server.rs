@@ -279,11 +279,49 @@ pub async fn serve<S: MessageSink>(
     config: ServerConfig,
     sink: S,
 ) -> io::Result<()> {
+    serve_with_shutdown(
+        listener,
+        config,
+        sink,
+        std::future::pending(),
+        Duration::ZERO,
+    )
+    .await
+}
+
+/// Serve until `shutdown` resolves, then drain.
+///
+/// The order is the whole design. **Stop accepting first**: a drain that runs
+/// while new connections are still arriving does not converge, and the process
+/// would be held open by exactly the traffic it is trying to stop taking. Then
+/// wait, up to `drain`, for the conversations already in progress — a session
+/// that is mid-`DATA` is one whose sender is waiting to be told whether Pigeon
+/// took the message, and cutting it produces a retry that could have been
+/// avoided by waiting a few seconds.
+///
+/// What happens at the bound is deliberate too: connections still open are
+/// dropped. Nothing is lost by that, because acceptance is durable exactly when
+/// the queue transaction commits — a session cut before its `250` never had one,
+/// and its sender retries.
+pub async fn serve_with_shutdown<S: MessageSink>(
+    listener: TcpListener,
+    config: ServerConfig,
+    sink: S,
+    shutdown: impl Future<Output = ()>,
+    drain: Duration,
+) -> io::Result<()> {
     let config = Arc::new(config);
-    let limit = Arc::new(Semaphore::new(config.max_connections));
+    let max = config.max_connections;
+    let limit = Arc::new(Semaphore::new(max));
+    let mut shutdown = std::pin::pin!(shutdown);
 
     loop {
-        let (stream, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, peer) = match accepted {
             Ok(v) => v,
             Err(e) => {
                 // Per-connection accept errors are transient: a peer that
@@ -310,6 +348,27 @@ pub async fn serve<S: MessageSink>(
                 tracing::debug!(%peer, error = %e, "connection ended");
             }
         });
+    }
+
+    // Closed before draining, not after: while it is open, a client can still
+    // connect and be answered, and the drain would be waiting on work that is
+    // still arriving.
+    drop(listener);
+
+    // Every permit back means every connection has finished. Acquiring them all
+    // is the drain: there is no separate counter to keep in step with the one
+    // the connection cap already maintains.
+    let done = tokio::time::timeout(drain, limit.acquire_many(max as u32));
+    match done.await {
+        Ok(_) => tracing::info!("all connections closed"),
+        Err(_) => {
+            let still_open = max - limit.available_permits();
+            tracing::warn!(
+                still_open,
+                "shutting down with connections still open; \
+                 anything not yet acknowledged will be retried by its sender"
+            );
+        }
     }
 
     Ok(())

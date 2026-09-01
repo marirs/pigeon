@@ -75,6 +75,16 @@ const MAX_CONCURRENT_DELIVERIES: usize = 32;
 /// out first, not whether one does.
 const TOTAL_FORWARD_BUDGET: Duration = Duration::from_secs(1800);
 
+/// How long shutdown waits for work already in progress.
+///
+/// Bounded because one delivery may legitimately run for the whole
+/// [`TOTAL_FORWARD_BUDGET`] — half an hour against a slow receiver — and a
+/// shutdown that waited for that is one nobody will use. What is left running
+/// is safe: an unacknowledged session's sender retries, and an abandoned
+/// attempt holds a fenced claim whose row returns to the queue when the lease
+/// expires.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(20);
+
 /// How long a queue claim is held.
 ///
 /// Must outlast [`TOTAL_FORWARD_BUDGET`], or a row is reclaimed underneath a
@@ -1700,30 +1710,97 @@ async fn run() -> io::Result<()> {
         (stopper, r.supervise())
     };
 
-    let outcome = tokio::select! {
-        r = pigeon_smtp::serve(listener, config, sink) => r,
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down");
-            Ok(())
-        }
-    };
+    // The two halves of shutdown, in this order:
+    //
+    //   1. stop accepting and stop claiming
+    //   2. drain what is already in progress, within a bound
+    //
+    // Reversing them does not converge: a drain that runs while connections
+    // are still being accepted and rows still being claimed is waiting on work
+    // the daemon is still taking on.
+    //
+    // Both are signalled by the same future, so the listener and the delivery
+    // worker stop at the same instant rather than in whatever order the
+    // shutdown code happens to be written in.
+    let (stopping, listener_stops) = tokio::sync::watch::channel(false);
+    let mut delivery_stops = stopping.subscribe();
 
-    // Signalled *and* joined, through the supervisor.
+    let served = tokio::spawn(async move {
+        let mut listener_stops = listener_stops;
+        pigeon_smtp::serve_with_shutdown(
+            listener,
+            config,
+            sink,
+            async move {
+                // `changed` only resolves on a *new* value, which is exactly
+                // the signal — the channel starts at false.
+                let _ = listener_stops.changed().await;
+            },
+            DRAIN_DEADLINE,
+        )
+        .await
+    });
+
+    signalled().await;
+    tracing::info!("shutting down: no new connections will be accepted");
+    let _ = stopping.send(true);
+    let _ = delivery_stops.changed().await;
+
+    // Concurrently: the listener drains its sessions while the delivery worker
+    // drains its attempts. Serially would double the worst case for no reason —
+    // they wait on different things.
+    let (served, drained) = tokio::join!(served, stop_delivery.drain(DRAIN_DEADLINE));
+    match drained {
+        delivery::Drained::Complete => tracing::info!("delivery worker idle"),
+        delivery::Drained::Abandoned { in_flight } => tracing::warn!(
+            in_flight,
+            "shutting down with deliveries in flight; their claims are fenced and \
+             the rows return to the queue when the leases expire"
+        ),
+    }
+
+    // Signalled *and* joined, through the supervisor. Last, because it is the
+    // one worker whose work is instantaneous: it publishes a table or it does
+    // not.
     let (stopper, supervisor) = stop_reload;
     stopper.stop_and_join(supervisor).await;
 
-    // The delivery loop stops taking new work; attempts already in flight are
-    // left to finish or to be reclaimed by lease expiry after a restart. Not
-    // joined, deliberately: a delivery can take the whole forward budget, and
-    // waiting for one would make shutdown hostage to the slowest remote server
-    // currently being tried. The claim token is what makes an unjoined
-    // attempt harmless.
-    stop_delivery.stop();
-    // Supervised so a panic in the loop is reported rather than swallowed, and
-    // not awaited so shutdown does not wait on a delivery in flight.
+    // Supervised so a panic in the loop is reported rather than swallowed.
     drop(stop_delivery.supervise());
 
-    outcome
+    served.unwrap_or(Ok(()))
+}
+
+/// Resolve when the process is asked to stop.
+///
+/// `SIGTERM` as well as `Ctrl-C`, because the former is what an init system
+/// sends and the latter is what a terminal sends: a daemon that only handled
+/// the second would be killed uncleanly by every restart in production, which
+/// is the case this whole path exists for.
+async fn signalled() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                // Without it, `Ctrl-C` still works and a `SIGTERM` still kills
+                // the process — uncleanly, which is worth saying out loud.
+                tracing::error!(error = %e, "cannot listen for SIGTERM; shutdown will not be graceful");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]
@@ -2047,6 +2124,136 @@ mod tests {
         );
 
         deliverer.stop();
+    }
+
+    #[tokio::test]
+    async fn draining_an_idle_worker_completes() {
+        // Nothing in flight, so shutdown does not have to wait at all. The
+        // useful half of this is what it proves about the loop: the stop signal
+        // wakes it out of its idle sleep rather than being noticed a poll
+        // later.
+        let tmp = TempDir::new("drain-idle");
+        let (peer_addr, _transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (_queue, deliverer) = delivery_fixture(tmp.path(), peer_addr, &[], 1, false).await;
+
+        let drained = tokio::time::timeout(
+            Duration::from_secs(2),
+            deliverer.drain(Duration::from_secs(1)),
+        )
+        .await
+        .expect("the drain did not return within its own bound");
+
+        assert_eq!(drained, delivery::Drained::Complete);
+    }
+
+    #[tokio::test]
+    async fn a_drained_worker_stops_claiming_rather_than_carrying_on() {
+        // The ordering rule from the other side. Draining first and stopping
+        // afterwards would wait on work the worker is still taking on: the
+        // queue refills the moment a permit frees, so the drain either returns
+        // by luck or never converges.
+        let tmp = TempDir::new("drain-stops-claiming");
+
+        // One connection, then nothing: every attempt after the first fails to
+        // connect immediately, so the worker gets through the backlog fast if
+        // it is still running.
+        let (peer_addr, _transcript) = pigeon_testkit::Peer::new().close().spawn().await;
+
+        let destinations: Vec<String> = (0..20).map(|i| format!("d{i}@example.net")).collect();
+        let refs: Vec<&str> = destinations.iter().map(String::as_str).collect();
+        let (queue, deliverer) = delivery_fixture(tmp.path(), peer_addr, &refs, 1, true).await;
+
+        async fn attempted(queue: &Queue) -> i64 {
+            let conn = queue.conn.lock().await;
+            conn.query_row("SELECT coalesce(sum(attempts), 0) FROM delivery", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        }
+
+        // Let it get going, so the test is about a worker with a backlog.
+        for _ in 0..100 {
+            if attempted(&queue).await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        deliverer.drain(Duration::from_secs(2)).await;
+        let settled = attempted(&queue).await;
+
+        // Nothing further is claimed or attempted after the drain returns.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            attempted(&queue).await,
+            settled,
+            "the worker kept claiming after it was drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_in_flight_is_abandoned_at_the_bound_and_left_fenced() {
+        // The other half of the rule: one attempt may legitimately run for the
+        // whole forward budget, so shutdown is bounded rather than patient. The
+        // row it abandons is not lost — the claim is fenced by a token nothing
+        // else can produce, and the lease returns the row to the queue.
+        let tmp = TempDir::new("drain-inflight");
+
+        // A peer that answers the greeting and then says nothing, so the
+        // attempt is still running when the bound expires.
+        let (peer_addr, _transcript) = pigeon_testkit::Peer::new()
+            .send("220 peer.test ESMTP")
+            .stall(Duration::from_secs(30))
+            .close()
+            .spawn()
+            .await;
+
+        let (queue, deliverer) =
+            delivery_fixture(tmp.path(), peer_addr, &["a@example.net"], 1, true).await;
+
+        // Wait until the row is actually claimed, or the test would be about
+        // an idle worker again.
+        let mut claimed = false;
+        for _ in 0..100 {
+            let conn = queue.conn.lock().await;
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM delivery WHERE claimed_by IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            drop(conn);
+            if n > 0 {
+                claimed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(claimed, "the worker never claimed the row");
+
+        let drained = deliverer.drain(Duration::from_millis(200)).await;
+        assert_eq!(
+            drained,
+            delivery::Drained::Abandoned { in_flight: 1 },
+            "the drain waited for an attempt it should have abandoned"
+        );
+
+        // Still claimed, with a token and a lease: reclaimable, not lost.
+        let conn = queue.conn.lock().await;
+        let (claimed_by, token, lease): (Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT claimed_by, claim_token, lease_expires_at FROM delivery",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(claimed_by.is_some(), "the abandoned claim was released");
+        assert!(token.is_some(), "the abandoned claim carries no fence");
+        assert!(
+            lease.is_some(),
+            "the abandoned claim has no lease to expire"
+        );
     }
 
     #[tokio::test]

@@ -41,6 +41,22 @@ const BACKOFF_CEILING: i64 = 21600;
 pub struct Deliverer {
     stop: watch::Sender<bool>,
     handle: JoinHandle<()>,
+    /// One permit per concurrent attempt. Holding all of them means nothing is
+    /// in flight, which is what [`Deliverer::drain`] waits for.
+    permits: Arc<Semaphore>,
+    concurrency: usize,
+}
+
+/// How a drain ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Drained {
+    /// Nothing was in flight by the time the bound expired.
+    Complete,
+    /// Attempts were still running. Not a failure: every claim carries a
+    /// unique token, so an attempt abandoned here cannot complete a row that
+    /// has since been reclaimed, and the row returns to the queue when its
+    /// lease expires.
+    Abandoned { in_flight: usize },
 }
 
 /// Everything the loop needs, so its signature does not grow a parameter per
@@ -66,7 +82,9 @@ pub struct DeliveryConfig<R: MxLookup> {
 impl Deliverer {
     pub fn start<R: MxLookup + 'static>(config: DeliveryConfig<R>) -> Self {
         let (stop, mut stopped) = watch::channel(false);
-        let permits = Arc::new(Semaphore::new(config.concurrency));
+        let concurrency = config.concurrency;
+        let permits = Arc::new(Semaphore::new(concurrency));
+        let for_drain = Arc::clone(&permits);
 
         let handle = tokio::spawn(async move {
             let DeliveryConfig {
@@ -130,7 +148,17 @@ impl Deliverer {
                     // rather than being held across the sleep, so a burst of
                     // work is not throttled by an idle loop.
                     drop(permit);
-                    tokio::time::sleep(IDLE_POLL).await;
+                    // Woken by the stop signal as well as by the timer, so the
+                    // task exits when it is told to rather than up to a poll
+                    // later. No test fails without it — the permit is already
+                    // released above, so a drain still returns promptly — but a
+                    // worker that outlives its own shutdown by two seconds is
+                    // one whose supervisor reports its exit after the process
+                    // has moved on.
+                    tokio::select! {
+                        () = tokio::time::sleep(IDLE_POLL) => {}
+                        _ = stopped.changed() => return,
+                    }
                     continue;
                 };
 
@@ -144,11 +172,40 @@ impl Deliverer {
             }
         });
 
-        Self { stop, handle }
+        Self {
+            stop,
+            handle,
+            permits: for_drain,
+            concurrency,
+        }
     }
 
     pub fn stop(&self) {
         let _ = self.stop.send(true);
+    }
+
+    /// Stop claiming, then wait for attempts already in flight.
+    ///
+    /// The order matters: claiming stops *first*, or the drain waits on work
+    /// the worker is still taking on. What it waits for afterwards is bounded,
+    /// because one attempt may legitimately run for the whole forward budget —
+    /// half an hour against a slow receiver — and a shutdown that waited for
+    /// that is a shutdown nobody will use.
+    ///
+    /// Leaving an attempt running is safe by construction rather than by luck:
+    /// the claim it holds is fenced by a token nothing else can produce, so its
+    /// completion cannot land on a row that has since been reclaimed, and the
+    /// row itself returns to the queue when the lease expires.
+    pub async fn drain(&self, bound: Duration) -> Drained {
+        self.stop();
+
+        let all = self.permits.acquire_many(self.concurrency as u32);
+        match tokio::time::timeout(bound, all).await {
+            Ok(_) => Drained::Complete,
+            Err(_) => Drained::Abandoned {
+                in_flight: self.concurrency - self.permits.available_permits(),
+            },
+        }
     }
 
     /// Wait for the loop to finish, reporting how it ended.

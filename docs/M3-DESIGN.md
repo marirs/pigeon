@@ -914,6 +914,37 @@ message's confidentiality.
 
 ---
 
+## 11.6 Shutdown
+
+Two phases, in this order:
+
+1. **Stop accepting and stop claiming.** The listener is closed and the delivery
+   worker stops taking rows.
+2. **Drain what is already in progress**, bounded by `DRAIN_DEADLINE` (20s).
+
+Reversing them does not converge: a drain that runs while connections are still
+arriving and rows are still being claimed waits on work the daemon is still
+taking on. The two are signalled by one channel, so the listener and the worker
+stop at the same instant rather than in whatever order the shutdown code is
+written in, and they drain concurrently — they wait on different things.
+
+The bound is not an approximation of patience. One delivery may legitimately run
+for the whole forward budget, half an hour against a slow receiver, and a
+shutdown that waited for that is one nobody will use. What is left running at
+the bound is safe by construction:
+
+- **A session cut before its `250`** never had one. Acceptance is durable
+  exactly when the queue transaction commits, so the sender retries.
+- **An abandoned delivery attempt** holds a claim fenced by a token nothing else
+  can produce, so its completion cannot land on a row that has since been
+  reclaimed, and the row returns to the queue when its lease expires.
+
+`SIGTERM` as well as `Ctrl-C`: the former is what an init system sends, and a
+daemon that handled only the latter would be killed uncleanly by every restart
+in production — which is the case this path exists for.
+
+---
+
 ## 12. Tests
 
 Every property with the mutation that must break it, in the discipline the

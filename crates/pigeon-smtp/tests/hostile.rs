@@ -417,3 +417,115 @@ async fn a_session_cannot_be_held_open_for_ever_by_staying_busy() {
         "a busy session outlived its maximum lifetime"
     );
 }
+
+// --------------------------------------------------------- graceful shutdown
+
+/// Serve until told to stop, and report when the server has finished draining.
+async fn start_stoppable(
+    sink: LocalOnly,
+    config: ServerConfig,
+    drain: Duration,
+) -> (
+    SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let _ = pigeon_smtp::serve_with_shutdown(
+            listener,
+            config,
+            sink,
+            async {
+                let _ = stopped.await;
+            },
+            drain,
+        )
+        .await;
+    });
+    (addr, stop, handle)
+}
+
+#[tokio::test]
+async fn shutdown_stops_accepting_before_it_drains() {
+    // The order is the design. A drain that runs while connections are still
+    // being accepted does not converge — the process is held open by exactly
+    // the traffic it is trying to stop taking.
+    let sink = LocalOnly::new(&["example.net"]);
+    let (addr, stop, handle) =
+        start_stoppable(sink.clone(), config(), Duration::from_secs(5)).await;
+
+    // One conversation in progress, mid-transaction.
+    let mut c = RawClient::connect(addr).await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(b"EHLO sender.test\r\n").await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(b"MAIL FROM:<a@sender.test>\r\n").await.unwrap();
+    c.read_reply().await.unwrap();
+
+    let _ = stop.send(());
+    // The listener is closed before the drain begins, so a new connection is
+    // refused rather than served. Retried briefly: closing is not instant.
+    let mut refused = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if RawClient::connect(addr).await.is_err() {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "the listener kept accepting after the stop signal");
+
+    // And the conversation that was already open is allowed to finish: its
+    // sender is waiting to be told whether Pigeon took the message.
+    c.send(b"RCPT TO:<hello@example.net>\r\n").await.unwrap();
+    assert_eq!(c.read_reply().await.unwrap().0, 250);
+    c.send(b"DATA\r\n").await.unwrap();
+    assert_eq!(c.read_reply().await.unwrap().0, 354);
+    c.send(b"Subject: hi\r\n\r\nbody\r\n.\r\n").await.unwrap();
+    assert_eq!(
+        c.read_reply().await.unwrap().0,
+        250,
+        "a session in progress was cut off by shutdown"
+    );
+    assert_eq!(sink.count(), 1);
+
+    drop(c);
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the server did not finish draining")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_session_that_will_not_end_does_not_hold_shutdown_open() {
+    // The bound. One idle connection would otherwise keep the process alive for
+    // the whole command timeout — five minutes — and a hostile one for as long
+    // as it liked. Nothing is lost by cutting it: acceptance is durable exactly
+    // when the queue transaction commits, and a session cut before its `250`
+    // never had one.
+    let sink = LocalOnly::new(&["example.net"]);
+    let (addr, stop, handle) =
+        start_stoppable(sink.clone(), config(), Duration::from_millis(200)).await;
+
+    let mut c = RawClient::connect(addr).await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(b"EHLO sender.test\r\n").await.unwrap();
+    c.read_reply().await.unwrap();
+
+    let _ = stop.send(());
+
+    // Held open deliberately: the client says nothing more.
+    tokio::time::timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("an idle session held shutdown open past the drain bound")
+        .unwrap();
+
+    assert_eq!(
+        sink.count(),
+        0,
+        "nothing was accepted from the idle session"
+    );
+}

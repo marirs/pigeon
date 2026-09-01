@@ -191,7 +191,7 @@ mail that providers reject.**
 - [x] STARTTLS
 - [x] SMTP timeouts, connection and size limits
 - [x] malformed message handling
-- [ ] graceful shutdown
+- [x] graceful shutdown
 
 - [x] a routing revision counter, bumped by triggers on the routing tables, so
       queue commits stop waking the reload loader — with a single ordering for
