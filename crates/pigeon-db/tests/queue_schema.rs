@@ -347,3 +347,135 @@ fn deleting_a_message_takes_its_queue_with_it() {
         assert_eq!(n, 0, "{table} outlived its message");
     }
 }
+
+// ------------------------------------------------------- the routing revision
+
+fn revision(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT revision FROM routing_revision WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn routing_changes_advance_the_revision() {
+    // Triggers rather than application code, so no writer can forget: a CLI
+    // command, a repair by hand in sqlite3, or a restore replaying statements
+    // all change what the daemon would serve.
+    let (_t, conn) = migrated("revision");
+    let before = revision(&conn);
+
+    conn.execute(
+        "INSERT INTO destination(local, domain) VALUES('me','example.net')",
+        [],
+    )
+    .unwrap();
+    let after_destination = revision(&conn);
+    assert!(
+        after_destination > before,
+        "a destination did not advance it"
+    );
+
+    conn.execute(
+        "INSERT INTO domain(name, status, inbound_enabled, default_destination_id,
+                            created_at, updated_at)
+         VALUES('example.com','active',1,1,0,0)",
+        [],
+    )
+    .unwrap();
+    let after_domain = revision(&conn);
+    assert!(
+        after_domain > after_destination,
+        "a domain did not advance it"
+    );
+
+    conn.execute(
+        "INSERT INTO alias(domain_id, pattern, kind, created_at) VALUES(1,'hello','forward',0)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        revision(&conn) > after_domain,
+        "an alias did not advance it"
+    );
+
+    // Editing a destination changes where mail goes without touching any row
+    // that names it, which is why it has triggers of its own.
+    let before_edit = revision(&conn);
+    conn.execute("UPDATE destination SET local = 'other'", [])
+        .unwrap();
+    assert!(
+        revision(&conn) > before_edit,
+        "editing a destination did not advance it"
+    );
+
+    // And a key: the snapshot and the signing keys are published together, so a
+    // rotation has to reach the daemon the same way a routing change does.
+    let before_key = revision(&conn);
+    conn.execute(
+        "INSERT INTO dkim_key(domain_id, selector, algorithm, public_key, private_key_path,
+                              state, created_at)
+         VALUES(1,'sel','rsa2048','AAAA','example.com/sel.key','active',0)",
+        [],
+    )
+    .unwrap();
+    assert!(revision(&conn) > before_key, "a key did not advance it");
+}
+
+#[test]
+fn queue_activity_never_advances_the_routing_revision() {
+    // The reason the counter exists. A busy relay commits delivery rows
+    // continuously, and a doorbell that rang for those would have the detector
+    // load and hash the routing tables once a second forever to conclude each
+    // time that nothing routing-related had changed.
+    let (_t, conn) = migrated("revision-queue");
+    let m = message(&conn, "spool-1");
+    let before = revision(&conn);
+
+    let d = queued(&conn, m, "mailbox@provider.example");
+    conn.execute(
+        "INSERT INTO original_recipient(message_id, address) VALUES(?1,'hello@example.com')",
+        [m],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO recipient_delivery(original_recipient_id, delivery_id) VALUES(1, ?1)",
+        [d],
+    )
+    .unwrap();
+    conn.execute(
+        &format!(
+            "UPDATE delivery SET state='delivering', claimed_by='w', claim_token='t',
+                                 lease_expires_at=1, next_attempt_at=NULL WHERE id={d}"
+        ),
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO delivery_event(delivery_id, at, kind) VALUES(?1, 0, 'attempt')",
+        [d],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM message WHERE id = ?1", [m])
+        .unwrap();
+
+    assert_eq!(
+        revision(&conn),
+        before,
+        "queue activity moved the routing revision"
+    );
+}
+
+#[test]
+fn the_revision_has_exactly_one_row() {
+    // A counter with two rows is two counters, and the one a reader happens to
+    // see becomes a matter of ordering.
+    let (_t, conn) = migrated("revision-single");
+    let e = refused(
+        &conn,
+        "INSERT INTO routing_revision(id, revision) VALUES(2, 0)",
+    );
+    assert!(e.contains("CHECK"), "{e}");
+}

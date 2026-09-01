@@ -7,24 +7,38 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pigeon_route::{Publish, Tick, Watcher};
+use pigeon_route::reload::POLL;
 
-/// State the detector cannot see, reconciled by the same worker.
+/// How many polls between reconciliations.
 ///
-/// The database announces its own changes through `data_version`. A file does
-/// not, so whatever watches for one has to look — and it must look from inside
-/// the single publication path, not beside it.
-pub trait Reconcile {
-    /// Republish if what is on disk has changed. `None` when nothing has.
+/// Sixty seconds at a one-second poll. Often enough that a restore is noticed
+/// within a minute, rare enough that the load it costs is not the thing the
+/// revision counter was introduced to avoid.
+const RECONCILE_EVERY: i32 = 60;
+
+/// Everything the worker asks of the thing it publishes into.
+///
+/// One trait, and one implementor in production, because these are the
+/// operations the coordinator serialises (R-6, `M1-RELOAD.md` C-1). Splitting
+/// them across two objects would be splitting the ordering authority.
+pub trait RoutingSource {
+    /// Observe the routing revision and act on it. `None` when nothing changed.
+    ///
+    /// The revision has triggers on the routing tables only, so a busy queue
+    /// never brings the worker here — which is the whole reason it replaced
+    /// `data_version`.
+    fn tick(&self, conn: &rusqlite::Connection) -> Option<Result<(), String>>;
+
+    /// Compare the rows themselves, whatever the counter says.
+    ///
+    /// C-2: a restore can present the same revision over different rows, and
+    /// nothing that only compares numbers can see it.
+    fn reconcile_rows(&self, conn: &rusqlite::Connection) -> Option<Result<(), String>>;
+
+    /// Republish if state outside the database changed — the SRS ring.
     fn reconcile(&self) -> Option<Result<(), String>>;
 }
 
-impl Reconcile for pigeon_route::Router {
-    /// A bare `Router` holds nothing derived from a file.
-    fn reconcile(&self) -> Option<Result<(), String>> {
-        None
-    }
-}
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -84,11 +98,7 @@ impl Reloader {
     ///
     /// The connection is opened inside the worker and owned by it, so it is
     /// closed when the worker ends rather than at process teardown.
-    pub fn start<P: Publish + Reconcile + Send + Sync + 'static>(
-        path: PathBuf,
-        router: Arc<P>,
-        watcher: Watcher,
-    ) -> Self {
+    pub fn start<P: RoutingSource + Send + Sync + 'static>(path: PathBuf, router: Arc<P>) -> Self {
         let (stop, mut stopped) = watch::channel(false);
 
         let handle = tokio::task::spawn_blocking(move || {
@@ -96,7 +106,7 @@ impl Reloader {
             // synchronous SQLite call, and `spawn_blocking` keeps them off the
             // runtime's worker threads. A one-second sleep on an async thread
             // would be worse than the blocking pool it avoids.
-            let mut watcher = watcher;
+            let mut reconcile_countdown = RECONCILE_EVERY;
             let mut conn = match open(&path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -137,36 +147,25 @@ impl Reloader {
                     ),
                 }
 
-                match watcher.tick(&conn, router.as_ref()) {
-                    Tick::Published { domains, rules } => {
-                        // R-3: logged only when the routing input actually
-                        // changed and was published. A version change with an
-                        // unchanged fingerprint is `Unrelated` and says nothing,
-                        // which is what keeps the queue's commits out of this
-                        // log from Milestone 3 onward.
-                        tracing::info!(domains, rules, "routing reloaded");
-                    }
-                    Tick::Invalid { message, logged } => {
-                        if logged {
-                            tracing::warn!(
-                                error = %message,
-                                "the routing configuration in the database cannot be served; \
-                                 the previous table is still in use"
-                            );
-                        }
-                    }
-                    Tick::Transient { message } => {
-                        tracing::debug!(error = %message, "reload deferred");
-                        // A connection-level failure is the one case where the
-                        // version counter itself becomes meaningless, because
-                        // `data_version` is comparable only across calls on one
-                        // connection. Reopening therefore resets the baseline
-                        // rather than adopting the new connection's value.
+                // The routing revision. Unlike `data_version` it does not move
+                // for queue commits, so an idle poll here is one `SELECT`
+                // against a one-row table and nothing else.
+                match router.tick(&conn) {
+                    None => {}
+                    Some(Ok(())) => tracing::info!("routing reloaded"),
+                    Some(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            "the routing configuration in the database cannot be served; \
+                             the previous table is still in use"
+                        );
+
+                        // A connection that has failed makes every observation
+                        // meaningless, so it is replaced rather than trusted.
                         if conn_is_broken(&conn) {
                             match open(&path) {
                                 Ok(fresh) => {
                                     conn = fresh;
-                                    watcher.reconnected();
                                     tracing::info!("reload worker reconnected");
                                 }
                                 Err(e) => {
@@ -175,10 +174,28 @@ impl Reloader {
                             }
                         }
                     }
-                    Tick::Idle | Tick::Unrelated | Tick::Backoff => {}
                 }
 
-                std::thread::sleep(watcher.interval());
+                // Reconciliation, on a slower cadence: it loads the routing
+                // tables whatever the counter says, which is what makes the
+                // counter safe to trust in between (C-2). Every poll would undo
+                // the point of having a counter at all.
+                reconcile_countdown -= 1;
+                if reconcile_countdown <= 0 {
+                    reconcile_countdown = RECONCILE_EVERY;
+                    match router.reconcile_rows(&conn) {
+                        None => {}
+                        Some(Ok(())) => tracing::warn!(
+                            "the routing tables differ from what is published at the same \
+                             revision; republished"
+                        ),
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "routing reconciliation failed")
+                        }
+                    }
+                }
+
+                std::thread::sleep(POLL);
             }
         });
 
@@ -385,14 +402,33 @@ mod tests {
         }
     }
 
-    fn router() -> Arc<pigeon_route::Router> {
-        Arc::new(pigeon_route::Router::new(pigeon_route::Snapshot::default()))
+    /// A source that does nothing, for the lifecycle tests.
+    ///
+    /// The worker's own properties — that it stops, that it does not leak, that
+    /// its death is reported — are about the loop rather than about routing,
+    /// and a real coordinator here would make them depend on a database.
+    struct Inert;
+
+    impl RoutingSource for Inert {
+        fn tick(&self, _conn: &rusqlite::Connection) -> Option<Result<(), String>> {
+            None
+        }
+        fn reconcile_rows(&self, _conn: &rusqlite::Connection) -> Option<Result<(), String>> {
+            None
+        }
+        fn reconcile(&self) -> Option<Result<(), String>> {
+            None
+        }
+    }
+
+    fn router() -> Arc<Inert> {
+        Arc::new(Inert)
     }
 
     #[tokio::test]
     async fn shutdown_signals_and_joins() {
         let db = Db::new("shutdown");
-        let r = Reloader::start(db.path(), router(), Watcher::new());
+        let r = Reloader::start(db.path(), router());
         let stopper = r.stopper();
         let supervisor = r.supervise();
 
@@ -422,7 +458,7 @@ mod tests {
         // a blocking task is running, so a leaked worker times out here.
         let db = Db::new("dropped");
         {
-            let r = Reloader::start(db.path(), router(), Watcher::new());
+            let r = Reloader::start(db.path(), router());
             drop(r);
         }
 
@@ -437,11 +473,7 @@ mod tests {
         // supervisor then says routing has stopped changing — awaiting the
         // handle alone would pass with all of the reporting deleted.
         let events = events();
-        let r = Reloader::start(
-            PathBuf::from("/nonexistent/directory/pigeon.db"),
-            router(),
-            Watcher::new(),
-        );
+        let r = Reloader::start(PathBuf::from("/nonexistent/directory/pigeon.db"), router());
         let supervisor = r.supervise();
 
         tokio::time::timeout(std::time::Duration::from_secs(4), supervisor)
@@ -521,14 +553,55 @@ mod tests {
         );
     }
 
+    /// A real coordinator over a real database, for the one test that is about
+    /// publication rather than about the loop.
+    fn coordinator(path: &std::path::Path) -> Arc<crate::RuntimeState> {
+        let conn = pigeon_db::open(path).unwrap();
+        let seed = pigeon_route::revision::read(&conn)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
+        Arc::new(crate::RuntimeState {
+            coordinator: std::sync::Mutex::new(pigeon_route::Baseline::new(seed)),
+            current: std::sync::RwLock::new(Arc::new(crate::Runtime {
+                snapshot: Arc::new(pigeon_route::Snapshot::default()),
+                keys: std::collections::HashMap::new(),
+                srs: Arc::new(pigeon_auth::Srs::new(
+                    pigeon_auth::KeyRing::parse(
+                        "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                    )
+                    .unwrap(),
+                    "pigeon.test",
+                )),
+            })),
+            // No ring file: its fingerprint is `None` now and stays `None`, so
+            // ring reconciliation never fires and this test is about routing.
+            ring_fingerprint: std::sync::Mutex::new(None),
+            ring_path: std::path::PathBuf::from("/nonexistent/ring.key"),
+            derive: Box::new(|_| {
+                Ok(crate::Derived {
+                    keys: std::collections::HashMap::new(),
+                    srs: Arc::new(pigeon_auth::Srs::new(
+                        pigeon_auth::KeyRing::parse(
+                            "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                        )
+                        .unwrap(),
+                        "pigeon.test",
+                    )),
+                })
+            }),
+        })
+    }
+
     #[tokio::test]
     async fn the_worker_publishes_a_change() {
-        // End to end through the worker rather than through `Watcher::tick`:
-        // that the loop actually calls the detector, on the connection it
-        // opened, and installs what comes back.
+        // End to end through the worker: that the loop observes the routing
+        // revision on the connection it opened, rebuilds, and installs what
+        // comes back.
         let db = Db::new("publishes");
-        let router = router();
-        let r = Reloader::start(db.path(), Arc::clone(&router), Watcher::new());
+        let runtime = coordinator(&db.path());
+        let r = Reloader::start(db.path(), Arc::clone(&runtime));
 
         let writer = pigeon_db::open(&db.path()).unwrap();
         let me = pigeon_db::repo::Address::parse("me@example.net").unwrap();
@@ -548,7 +621,7 @@ mod tests {
         let mut published = false;
         for _ in 0..40 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let snap = router.for_transaction();
+            let snap = runtime.pin().snapshot.clone();
             let a = pigeon_types::Address::parse("hello@example.com").unwrap();
             if matches!(snap.resolve(&a), pigeon_route::Decision::Forward { .. }) {
                 published = true;
@@ -561,5 +634,50 @@ mod tests {
         stopper.stop_and_join(supervisor).await;
 
         assert!(published, "the worker never published a committed change");
+    }
+
+    #[tokio::test]
+    async fn queue_activity_does_not_wake_the_loader() {
+        // The reason the revision replaced `data_version`. A busy relay commits
+        // delivery rows continuously, and the previous doorbell rang for every
+        // one of them — so the detector loaded and hashed the routing tables
+        // once a second to conclude each time that nothing had changed.
+        let db = Db::new("queue-quiet");
+        let runtime = coordinator(&db.path());
+        let conn = pigeon_db::open(&db.path()).unwrap();
+
+        // Nothing routing-related has changed, so the first tick is quiet.
+        assert!(
+            crate::reload::RoutingSource::tick(runtime.as_ref(), &conn).is_none(),
+            "a fresh database looked like a routing change"
+        );
+
+        // A message and a delivery: exactly the traffic Milestone 3 adds.
+        conn.execute(
+            "INSERT INTO message(spool_id, return_path, original_sender, size_bytes,
+                                 received_at, routing_revision, routing_fingerprint)
+             VALUES('m-1','','a@b.test',1,0,1,x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO delivery(message_id, destination, next_attempt_at)
+             VALUES(1,'x@y.test',0)",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            crate::reload::RoutingSource::tick(runtime.as_ref(), &conn).is_none(),
+            "queue commits woke the routing loader"
+        );
+
+        // And a real routing change still does.
+        let me = pigeon_db::repo::Address::parse("me@example.net").unwrap();
+        pigeon_db::repo::add_domain(&conn, "example.com", Some(&me)).unwrap();
+        assert!(
+            crate::reload::RoutingSource::tick(runtime.as_ref(), &conn).is_some(),
+            "a routing change did not wake the loader"
+        );
     }
 }

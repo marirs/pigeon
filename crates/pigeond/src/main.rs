@@ -197,9 +197,17 @@ fn build_auth(
     let derived = derive(&snapshot).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     tracing::info!(domains = derived.keys.len(), "loaded DKIM signing keys");
 
+    // Seeded from what the database says now, so the first tick after startup
+    // is `Unchanged` rather than a spurious rebuild of the table just loaded.
+    let seed = pigeon_route::revision::read(&started.db)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+
     Ok(Auth {
         pipeline: Arc::new(pipeline),
         runtime: Arc::new(RuntimeState {
+            coordinator: std::sync::Mutex::new(pigeon_route::Baseline::new(seed)),
             current: std::sync::RwLock::new(Arc::new(Runtime {
                 snapshot: Arc::new(snapshot),
                 keys: derived.keys,
@@ -296,6 +304,19 @@ struct Runtime {
 /// key that will not load fails the publication rather than being discovered
 /// one message later.
 struct RuntimeState {
+    /// The coordinator's critical section (R-6, `M1-RELOAD.md` C-1).
+    ///
+    /// Everything that can decide what is served happens inside it: observing
+    /// the revision, loading and validating a snapshot, publishing, and
+    /// reconciling. One lock rather than a compare-and-set on a version number,
+    /// because ordering then comes from the lock — and a candidate built
+    /// outside it cannot exist, which is what makes "a stale candidate may only
+    /// lose publication" true by construction rather than by argument.
+    ///
+    /// Held across a SQLite read, which is affordable here for the reason
+    /// measured in `M3-DESIGN.md` §11: mutations are operator actions, not
+    /// traffic.
+    coordinator: std::sync::Mutex<pigeon_route::Baseline>,
     current: std::sync::RwLock<Arc<Runtime>>,
     /// How keys are derived from a snapshot.
     ///
@@ -352,6 +373,76 @@ impl RuntimeState {
     /// about every time either changed. One publisher, one order.
     ///
     /// `None` when nothing changed.
+    /// Observe the routing revision and act on it, all inside the coordinator.
+    ///
+    /// Returns `None` when there is nothing to do. Queue commits cannot bring
+    /// us here at all: the counter has triggers on the routing tables only.
+    fn tick_routing(&self, conn: &rusqlite::Connection) -> Option<Result<(), String>> {
+        let mut baseline = self.coordinator.lock().expect("coordinator lock poisoned");
+
+        let observed = match pigeon_route::revision::read(conn) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(format!("cannot read the routing revision: {e}"))),
+        };
+
+        match baseline.observe(observed) {
+            pigeon_route::Observation::Unchanged => None,
+            pigeon_route::Observation::Unknown => Some(Err(
+                "the routing revision cannot be read; nothing was published".into(),
+            )),
+            // Both rebuild. A regression has already reset the lineage inside
+            // `observe`, which is what makes the table built here beat whatever
+            // the previous lineage published.
+            pigeon_route::Observation::Advanced | pigeon_route::Observation::Regressed => {
+                Some(self.rebuild(conn))
+            }
+        }
+    }
+
+    /// Load, validate and publish, with the coordinator already held.
+    fn rebuild(&self, conn: &rusqlite::Connection) -> Result<(), String> {
+        let inputs = pigeon_route::load(conn).map_err(|e| e.to_string())?;
+        let built = pigeon_route::Snapshot::build(inputs).map_err(|e| e.to_string())?;
+        pigeon_route::Publish::publish(self, built.snapshot)
+    }
+
+    /// Reconcile: load and compare the rows themselves, whatever the counter
+    /// says.
+    ///
+    /// This is C-2's safety net. A restore can present the same revision over
+    /// different rows — the counter cannot see it, and neither can anything
+    /// that only compares numbers. When the rows differ from what is published,
+    /// the lineage advances so the rebuilt table wins, and the revision is left
+    /// alone because it has not moved.
+    fn reconcile_routing(&self, conn: &rusqlite::Connection) -> Option<Result<(), String>> {
+        let mut baseline = self.coordinator.lock().expect("coordinator lock poisoned");
+
+        let inputs = match pigeon_route::load(conn) {
+            Ok(i) => i,
+            Err(e) => return Some(Err(format!("reconciliation could not load: {e}"))),
+        };
+        let built = match pigeon_route::Snapshot::build(inputs) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(format!("reconciliation could not build: {e}"))),
+        };
+
+        let current = self.pin();
+        if built.snapshot.rule_count() == current.snapshot.rule_count()
+            && built.snapshot.domain_names().count() == current.snapshot.domain_names().count()
+        {
+            // Cheap comparison first. A full fingerprint belongs here and is
+            // what `M1-RELOAD.md` §2 describes; counts are what this snapshot
+            // exposes today, so reconciliation currently catches a restore that
+            // changes the shape of the table and not one that swaps a
+            // destination underneath it. Recorded rather than implied: the
+            // fingerprint is the next piece of this.
+            return None;
+        }
+
+        baseline.diverged();
+        Some(pigeon_route::Publish::publish(self, built.snapshot))
+    }
+
     fn reconcile_ring(&self) -> Option<Result<(), String>> {
         let current = ring_fingerprint(&self.ring_path);
         if current == *self.ring_fingerprint.lock().expect("ring lock poisoned") {
@@ -365,7 +456,15 @@ impl RuntimeState {
     }
 }
 
-impl reload::Reconcile for RuntimeState {
+impl reload::RoutingSource for RuntimeState {
+    fn tick(&self, conn: &rusqlite::Connection) -> Option<Result<(), String>> {
+        self.tick_routing(conn)
+    }
+
+    fn reconcile_rows(&self, conn: &rusqlite::Connection) -> Option<Result<(), String>> {
+        self.reconcile_routing(conn)
+    }
+
     fn reconcile(&self) -> Option<Result<(), String>> {
         self.reconcile_ring()
     }
@@ -1618,8 +1717,8 @@ async fn run() -> io::Result<()> {
     // key, or one still signing with the key that was just retired.
     let stop_reload = booted
         .zip(auth_runtime)
-        .map(|((_, (db_path, _, watcher)), runtime)| {
-            let r = reload::Reloader::start(db_path, runtime, watcher);
+        .map(|((_, (db_path, _, _)), runtime)| {
+            let r = reload::Reloader::start(db_path, runtime);
             // `supervise` consumes the handle and becomes the only join, so the
             // stopper is taken first. Two ways to stop one worker would be two
             // orderings to keep straight.
@@ -2718,6 +2817,7 @@ mod tests {
                 "pigeon.test",
             )),
             runtime: Arc::new(RuntimeState {
+                coordinator: std::sync::Mutex::new(pigeon_route::Baseline::new(0)),
                 current: std::sync::RwLock::new(Arc::new(Runtime {
                     snapshot: Arc::new(snapshot),
                     keys: derived.keys,
@@ -3190,6 +3290,7 @@ mod tests {
         // A state whose key derivation always fails, standing in for a key
         // file that has been removed between reloads.
         let broken = Arc::new(RuntimeState {
+            coordinator: std::sync::Mutex::new(pigeon_route::Baseline::new(0)),
             current: std::sync::RwLock::new(Arc::clone(&before)),
             derive: Box::new(|_| Err("the key file is gone".into())),
             ring_fingerprint: std::sync::Mutex::new(None),

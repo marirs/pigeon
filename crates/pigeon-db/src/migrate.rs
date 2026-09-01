@@ -56,6 +56,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "abandoned-notification",
         sql: include_bytes!("../migrations/0004_abandoned.sql"),
     },
+    Migration {
+        version: 5,
+        name: "routing-revision",
+        sql: include_bytes!("../migrations/0005_routing_revision.sql"),
+    },
 ];
 
 /// What a run did.
@@ -403,6 +408,7 @@ mod tests {
                 "principal_grant",
                 "recipient_delivery",
                 "relay",
+                "routing_revision",
                 "schema_migration",
                 "sender_identity",
                 "setting",
