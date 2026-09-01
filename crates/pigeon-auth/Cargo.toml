@@ -15,6 +15,12 @@ rsa = { workspace = true }
 mail-auth = { workspace = true }
 mail-parser = { workspace = true }
 rustls-pki-types = { workspace = true }
+# Argon2id for application credentials. Password hashing is the one place a
+# constant-time comparison and a memory-hard cost function are both required,
+# and neither is worth hand-rolling.
+argon2 = "0.5"
+getrandom = "0.3"
+
 hmac = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }

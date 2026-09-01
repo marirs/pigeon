@@ -34,6 +34,15 @@ pub enum Command<'a> {
     Quit,
     /// Begin TLS negotiation (RFC 3207).
     StartTls,
+    /// Authenticate (RFC 4954).
+    ///
+    /// The mechanism and, for `PLAIN`, the credentials that may arrive on the
+    /// same line. Both halves are borrowed rather than decoded here: the parser
+    /// deals in syntax, and a base64 blob's meaning is the session's business.
+    Auth {
+        mechanism: &'a str,
+        initial: Option<&'a str>,
+    },
 }
 
 /// Why a command line could not be parsed.
@@ -178,6 +187,22 @@ pub fn parse(line: &[u8]) -> Result<Command<'_>, ParseError> {
         require_no_arg(rest).map(|_| Command::Quit)
     } else if verb.eq_ignore_ascii_case("STARTTLS") {
         require_no_arg(rest).map(|_| Command::StartTls)
+    } else if verb.eq_ignore_ascii_case("AUTH") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Err(ParseError::MissingArgument);
+        }
+        let (mechanism, initial) = match rest.split_once(' ') {
+            Some((m, i)) => (m, Some(i.trim())),
+            None => (rest, None),
+        };
+        // An initial response of `=` means "empty", not "the string =". Sent by
+        // clients whose mechanism has an empty initial response; treating it as
+        // data produces a credential nobody typed.
+        let initial = initial
+            .filter(|i| !i.is_empty())
+            .map(|i| if i == "=" { "" } else { i });
+        Ok(Command::Auth { mechanism, initial })
     } else {
         Err(ParseError::UnknownCommand)
     }

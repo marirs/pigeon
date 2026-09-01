@@ -194,6 +194,48 @@ pub fn too_many_commands() -> Reply {
     Reply::line(421, "Too many commands on this connection")
 }
 
+pub fn authenticated() -> Reply {
+    Reply::line(235, "Authentication successful")
+}
+
+/// Wrong credentials, or a user that does not exist.
+///
+/// One reply for both, deliberately: a distinct "no such user" tells an
+/// attacker which usernames are worth guessing passwords for.
+pub fn authentication_failed() -> Reply {
+    Reply::line(535, "Authentication credentials invalid")
+}
+
+pub fn too_many_auth_failures() -> Reply {
+    Reply::line(421, "Too many authentication failures")
+}
+
+/// A base64 challenge. Empty for `PLAIN`, which has nothing to ask.
+pub fn auth_challenge(challenge: &'static str) -> Reply {
+    Reply::line(334, challenge)
+}
+
+pub fn auth_cancelled() -> Reply {
+    Reply::line(501, "Authentication cancelled")
+}
+
+pub fn auth_bad_encoding() -> Reply {
+    Reply::line(501, "Malformed authentication response")
+}
+
+pub fn auth_mechanism_unsupported() -> Reply {
+    Reply::line(504, "Unsupported authentication mechanism")
+}
+
+pub fn already_authenticated() -> Reply {
+    Reply::line(503, "Already authenticated")
+}
+
+/// Credentials may not cross an unencrypted connection.
+pub fn encryption_required() -> Reply {
+    Reply::line(538, "Encryption required for authentication")
+}
+
 pub fn message_too_large() -> Reply {
     Reply::line(552, "Message exceeds maximum size")
 }

@@ -33,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod credential;
 pub mod dkim;
 pub mod normalize;
 pub mod pipeline;

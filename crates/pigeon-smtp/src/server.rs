@@ -49,6 +49,25 @@ pub trait MessageSink: Clone + Send + Sync + 'static {
     /// sources for one fact.
     fn begin(&self, peer: SocketAddr, sender: &str) -> Self::Transaction;
 
+    /// Check one set of credentials.
+    ///
+    /// `Some(principal)` authenticates the session as that principal; `None`
+    /// refuses. The sink is expected to verify against a stored hash *and* to
+    /// spend the same time when the username does not exist — otherwise the
+    /// response time says which usernames are real.
+    ///
+    /// The default refuses everything, which is what a sink with no notion of
+    /// principals should do: a listener that advertised `AUTH` and then
+    /// accepted anything would be an open relay with a login screen.
+    fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> impl Future<Output = Option<String>> + Send {
+        let _ = (username, password);
+        async { None }
+    }
+
     /// Whether to serve this peer at all.
     ///
     /// Called once, before the banner. This is where a blocklist decision
@@ -820,6 +839,29 @@ async fn step<S: MessageSink>(
     peer: SocketAddr,
     line: &[u8],
 ) -> io::Result<Step> {
+    // A response to an authentication challenge is not a command: the parser
+    // refuses base64 correctly, so the session is asked first.
+    if session.awaiting_auth() {
+        let action = session.auth_line(&String::from_utf8_lossy(line));
+        if let Action::Authenticate { username, password } = action {
+            let principal = sink.authenticate(&username, &password).await;
+            if let Some(name) = &principal {
+                tracing::info!(%peer, principal = %name, "authenticated");
+            } else {
+                tracing::info!(%peer, "authentication failed");
+            }
+            let action = session.authenticated(principal);
+            return match emit(stream, action).await? {
+                Flow::Continue => Ok(Step::Continue),
+                Flow::Stop => Ok(Step::Close),
+            };
+        }
+        return match emit(stream, action).await? {
+            Flow::Continue => Ok(Step::Continue),
+            Flow::Stop => Ok(Step::Close),
+        };
+    }
+
     let cmd = match command::parse(line) {
         Ok(c) => c,
         Err(e) => {
@@ -891,6 +933,22 @@ async fn step<S: MessageSink>(
     // connection loop, which owns the buffers that must not survive it.
     if let Action::StartTls(reply) = action {
         return Ok(Step::StartTls(reply));
+    }
+
+    // Verifying costs an Argon2 hash and needs the sink, so it happens here
+    // rather than inside the state machine, which stays synchronous and pure.
+    if let Action::Authenticate { username, password } = action {
+        let principal = sink.authenticate(&username, &password).await;
+        if let Some(name) = &principal {
+            tracing::info!(%peer, principal = %name, "authenticated");
+        } else {
+            tracing::info!(%peer, "authentication failed");
+        }
+        let action = session.authenticated(principal);
+        return match emit(stream, action).await? {
+            Flow::Continue => Ok(Step::Continue),
+            Flow::Stop => Ok(Step::Close),
+        };
     }
 
     match session.state() {
@@ -976,6 +1034,15 @@ async fn emit(stream: &mut Stream, action: Action) -> io::Result<Flow> {
             write_reply(stream, &r).await?;
             let _ = stream.shutdown().await;
             Ok(Flow::Stop)
+        }
+        Action::Authenticate { .. } => {
+            // Never reached here. Authentication needs the sink, which `emit`
+            // does not have — the connection loop handles it, like STARTTLS,
+            // and for the same reason.
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "authentication must be handled by the connection loop",
+            ))
         }
         Action::StartTls(r) => {
             // Never written here. The upgrade is the connection loop's, because

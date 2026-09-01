@@ -47,6 +47,39 @@ pub const MAX_REFUSALS: usize = 20;
 /// a mailing list relay does that legitimately.
 pub const MAX_COMMANDS: usize = 2_000;
 
+/// Failed authentication attempts tolerated on one connection.
+///
+/// Small on purpose, and separate from the error budget. A client that gets its
+/// own password wrong three times will not get it right on the twentieth, and
+/// every attempt costs this server an Argon2 verification while costing the
+/// client one line — which is the asymmetry an attacker would spend.
+pub const MAX_AUTH_FAILURES: usize = 3;
+
+/// How authentication is going.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Auth {
+    /// Never attempted, or attempted and failed.
+    None,
+    /// A `334` was sent and the next line is the client's response.
+    ///
+    /// The mechanism is carried because `LOGIN` needs two exchanges and
+    /// `PLAIN` one, and the reply to send next depends on which.
+    Awaiting(Pending),
+    /// Authenticated as this principal.
+    As(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pending {
+    /// `AUTH PLAIN` with no initial response: one line, `authzid\0authcid\0pass`.
+    Plain,
+    /// `AUTH LOGIN`, waiting for the username.
+    LoginUsername,
+    /// `AUTH LOGIN`, waiting for the password. Carries the username already
+    /// given.
+    LoginPassword(String),
+}
+
 /// Where a session is in the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -75,6 +108,13 @@ pub enum Action {
     StartTls(Reply),
     /// Send this reply, then close the connection.
     Close(Reply),
+    /// Check these credentials, then tell the session the answer.
+    ///
+    /// The session does not verify anything itself: credentials live in the
+    /// database, checking one costs an Argon2 verification, and neither belongs
+    /// in a state machine that is meant to be synchronous and pure. What it
+    /// owns is *when* authentication may be attempted and what a failure costs.
+    Authenticate { username: String, password: String },
 }
 
 /// The envelope accumulated by a transaction.
@@ -148,6 +188,18 @@ pub struct Session {
     /// Every command seen on this connection, never reset. See
     /// [`MAX_COMMANDS`].
     commands: usize,
+    /// Who the client is, if anyone.
+    auth: Auth,
+    /// Failed authentication attempts on this connection.
+    ///
+    /// Separate from the error budget and much smaller: a client that gets its
+    /// own password wrong three times is not going to get it right on the
+    /// twentieth, and every attempt costs this server an Argon2 verification —
+    /// which is exactly the asymmetry an attacker would use.
+    auth_failures: usize,
+    /// Whether authentication is offered at all. Set by the listener: the
+    /// submission port advertises it and port 25 does not.
+    auth_available: bool,
     /// Refused recipients, counted for the life of the connection.
     ///
     /// Separate from `errors`, which resets on success. A directory harvest is
@@ -205,8 +257,79 @@ impl Session {
             max_message_size,
             errors: 0,
             commands: 0,
+            auth: Auth::None,
+            auth_failures: 0,
+            auth_available: false,
             refusals: 0,
             return_path: None,
+        }
+    }
+
+    /// Offer authentication on this session.
+    ///
+    /// The submission listener sets it; port 25 does not. Advertising `AUTH` on
+    /// the public MX would invite clients to send credentials to a port where
+    /// nothing can use them, and where the connection may not even be
+    /// encrypted.
+    pub fn with_auth(mut self) -> Self {
+        self.auth_available = true;
+        self
+    }
+
+    /// Who the client authenticated as, if anyone.
+    pub fn principal(&self) -> Option<&str> {
+        match &self.auth {
+            Auth::As(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Whether the next line is a response to an authentication challenge
+    /// rather than a command.
+    ///
+    /// The I/O layer has to ask, because a base64 blob is not a command and the
+    /// parser is right to refuse it: `YWxpY2U=` is a syntax error everywhere
+    /// except here.
+    pub fn awaiting_auth(&self) -> bool {
+        matches!(self.auth, Auth::Awaiting(_))
+    }
+
+    /// Consume a line that answers a `334`.
+    pub fn auth_line(&mut self, line: &str) -> Action {
+        let Auth::Awaiting(pending) = self.auth.clone() else {
+            // Only reachable if a caller stopped asking `awaiting_auth` first.
+            return self.protocol_error(reply::bad_sequence());
+        };
+        self.commands += 1;
+        self.auth_response(pending, line.trim())
+    }
+
+    /// Record the outcome of an [`Action::Authenticate`].
+    ///
+    /// Called by the I/O layer once the credentials have been checked. A
+    /// failure counts against a budget of its own and resets the state, so the
+    /// next `AUTH` starts from the beginning rather than continuing a
+    /// half-finished exchange.
+    pub fn authenticated(&mut self, principal: Option<String>) -> Action {
+        match principal {
+            Some(name) => {
+                self.auth = Auth::As(name);
+                // Everything learned before authentication is kept: unlike
+                // STARTTLS, `AUTH` does not change who the peer is talking to
+                // or what they have already said in the clear. RFC 4954 §4
+                // requires the *transaction* to be discarded, which the state
+                // machine has anyway since `AUTH` is only accepted outside one.
+                Action::Reply(reply::authenticated())
+            }
+            None => {
+                self.auth = Auth::None;
+                self.auth_failures += 1;
+                if self.auth_failures >= MAX_AUTH_FAILURES {
+                    self.state = State::Closed;
+                    return Action::Close(reply::too_many_auth_failures());
+                }
+                Action::Reply(reply::authentication_failed())
+            }
         }
     }
 
@@ -302,6 +425,7 @@ impl Session {
                 Action::Close(reply::bye(&self.hostname))
             }
             Command::StartTls => self.start_tls(),
+            Command::Auth { mechanism, initial } => self.auth(mechanism, initial),
         };
 
         // Any command the server accepted clears the error run. The limit is
@@ -362,6 +486,14 @@ impl Session {
             // Lets a sender skip transmitting a message that will be refused.
             std::borrow::Cow::Owned(format!("SIZE {}", self.max_message_size)),
         ];
+        // Only when it can actually be used: advertising `AUTH` before TLS
+        // would invite a client to send credentials in the clear, and a client
+        // that does so has already given them away whatever the server does
+        // next.
+        if self.auth_available && self.tls {
+            ext.push(std::borrow::Cow::Borrowed("AUTH PLAIN LOGIN"));
+        }
+
         // Advertising STARTTLS once TLS is active would invite a client to
         // negotiate twice.
         if self.tls_available && !self.tls {
@@ -489,6 +621,132 @@ impl Session {
         Action::ReadData(reply::start_mail_input())
     }
 
+    /// `AUTH`, and the line that follows a `334`.
+    ///
+    /// Three refusals before any mechanism is considered, in this order:
+    ///
+    /// 1. **Not offered here.** Port 25 does not advertise it and does not
+    ///    accept it. A relay that authenticated on the MX port would be a
+    ///    second way in with no reason to exist.
+    /// 2. **Not encrypted.** Credentials in the clear are credentials given
+    ///    away; RFC 4954 §4 requires refusing, and `538` says why.
+    /// 3. **Already authenticated, or inside a transaction.** Both are
+    ///    sequence errors: re-authenticating mid-message would leave a message
+    ///    whose sender was authorised by one principal and whose body arrived
+    ///    under another.
+    fn auth(&mut self, mechanism: &str, initial: Option<&str>) -> Action {
+        if !self.auth_available {
+            return self.protocol_error(reply::command_unrecognised());
+        }
+        if !self.tls {
+            return self.protocol_error(reply::encryption_required());
+        }
+        if matches!(self.auth, Auth::As(_)) {
+            return self.protocol_error(reply::already_authenticated());
+        }
+        if self.state != State::Ready && self.state != State::Greeting {
+            return self.protocol_error(reply::bad_sequence());
+        }
+
+        // A line arriving while a challenge is outstanding is the response to
+        // it, whatever it looks like: the mechanism decides what the bytes
+        // mean, not the parser.
+        if let Auth::Awaiting(pending) = self.auth.clone() {
+            return self.auth_response(pending, mechanism);
+        }
+
+        match mechanism.to_ascii_uppercase().as_str() {
+            "PLAIN" => match initial {
+                Some(blob) => self.plain(blob),
+                None => {
+                    self.auth = Auth::Awaiting(Pending::Plain);
+                    Action::Reply(reply::auth_challenge(""))
+                }
+            },
+            "LOGIN" => match initial {
+                // The username may ride along, which some clients do.
+                Some(blob) => match decode_base64(blob) {
+                    Some(username) => {
+                        self.auth = Auth::Awaiting(Pending::LoginPassword(username));
+                        Action::Reply(reply::auth_challenge("UGFzc3dvcmQ6"))
+                    }
+                    None => self.protocol_error(reply::auth_bad_encoding()),
+                },
+                None => {
+                    self.auth = Auth::Awaiting(Pending::LoginUsername);
+                    Action::Reply(reply::auth_challenge("VXNlcm5hbWU6"))
+                }
+            },
+            // No CRAM-MD5 and no DIGEST-MD5: both need the password recoverable
+            // on this side, which would mean storing something reversible
+            // instead of an Argon2 hash. A weaker storage format is not worth a
+            // mechanism whose only advantage is over a channel that must be
+            // encrypted anyway.
+            _ => self.protocol_error(reply::auth_mechanism_unsupported()),
+        }
+    }
+
+    /// The client's answer to a `334`.
+    fn auth_response(&mut self, pending: Pending, line: &str) -> Action {
+        // `*` cancels, and is the client's right at any point (RFC 4954 §4).
+        if line == "*" {
+            self.auth = Auth::None;
+            return Action::Reply(reply::auth_cancelled());
+        }
+
+        let Some(decoded) = decode_base64(line) else {
+            self.auth = Auth::None;
+            return self.protocol_error(reply::auth_bad_encoding());
+        };
+
+        match pending {
+            Pending::Plain => self.plain_decoded(&decoded),
+            Pending::LoginUsername => {
+                self.auth = Auth::Awaiting(Pending::LoginPassword(decoded));
+                Action::Reply(reply::auth_challenge("UGFzc3dvcmQ6"))
+            }
+            Pending::LoginPassword(username) => {
+                self.auth = Auth::None;
+                Action::Authenticate {
+                    username,
+                    password: decoded,
+                }
+            }
+        }
+    }
+
+    fn plain(&mut self, blob: &str) -> Action {
+        match decode_base64(blob) {
+            Some(decoded) => self.plain_decoded(&decoded),
+            None => {
+                self.auth = Auth::None;
+                self.protocol_error(reply::auth_bad_encoding())
+            }
+        }
+    }
+
+    /// `authzid\0authcid\0password`, of which the authorisation identity is
+    /// ignored.
+    ///
+    /// Ignored rather than refused: clients send it empty or send the username
+    /// again, and Pigeon has no notion of one principal acting as another. What
+    /// authorises a sender address is the grant on the principal that
+    /// authenticated, which is checked later and cannot be influenced from
+    /// here.
+    fn plain_decoded(&mut self, decoded: &str) -> Action {
+        self.auth = Auth::None;
+        let mut parts = decoded.split('\0');
+        let (_authzid, username, password) = (parts.next(), parts.next(), parts.next());
+
+        match (username, password) {
+            (Some(u), Some(p)) if !u.is_empty() => Action::Authenticate {
+                username: u.to_string(),
+                password: p.to_string(),
+            },
+            _ => self.protocol_error(reply::auth_bad_encoding()),
+        }
+    }
+
     fn start_tls(&mut self) -> Action {
         if !self.tls_available {
             return Action::Reply(reply::tls_not_available());
@@ -517,6 +775,52 @@ impl Session {
         }
         Action::Reply(r)
     }
+}
+
+/// Decode a base64 line from a client.
+///
+/// Standard alphabet, padding required to be well formed but tolerated when
+/// absent: clients differ, and a credential exchange is not the place to be
+/// pedantic about a trailing `=`. Anything that is not base64 at all returns
+/// `None`, which the caller turns into `501` — never into an empty password,
+/// which would be a password nobody typed being checked against a hash.
+fn decode_base64(input: &str) -> Option<String> {
+    const INVALID: u8 = 0xff;
+    let value = |c: u8| -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => INVALID,
+        }
+    };
+
+    let trimmed: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+
+    let mut out = Vec::with_capacity(trimmed.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for byte in trimmed {
+        let v = value(byte);
+        if v == INVALID {
+            return None;
+        }
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+
+    // Credentials are text. A blob that is valid base64 and not valid UTF-8 is
+    // not a password anyone set through this project's own tooling.
+    String::from_utf8(out).ok()
 }
 
 /// Read a `SIZE=` value from ESMTP parameters, if present and well formed.
@@ -647,6 +951,11 @@ mod tests {
     }
 
     fn run(s: &mut Session, line: &[u8]) -> Action {
+        // A challenge response is not a command, and the parser is right to
+        // refuse it: the I/O layer asks the session which one it is.
+        if s.awaiting_auth() {
+            return s.auth_line(String::from_utf8_lossy(line).trim());
+        }
         match parse(line) {
             Ok(cmd) => s.advance(cmd),
             Err(e) => s.advance_parse_error(e),
@@ -658,6 +967,9 @@ mod tests {
             Action::Reply(r) | Action::ReadData(r) | Action::StartTls(r) | Action::Close(r) => {
                 r.code
             }
+            // Not a reply at all: the sink has to answer first. A test that
+            // reaches here is asserting a code for a decision nobody has made.
+            Action::Authenticate { .. } => panic!("authentication has no reply of its own"),
         }
     }
 
@@ -762,6 +1074,180 @@ mod tests {
         // A repeat of one already accepted is still fine — it adds nothing.
         assert_eq!(code(&run(&mut s, b"RCPT TO:<x0@example.net>\r\n")), 250);
         assert_eq!(s.envelope().recipients.len(), MAX_RECIPIENTS);
+    }
+
+    // ----------------------------------------------------------- AUTH (M7)
+
+    fn authenticating() -> Session {
+        let mut s = Session::new("mx1.example.net", true, 1024).with_auth();
+        // TLS first: `AUTH` is refused without it, which is most of the point.
+        run(&mut s, b"EHLO client.test\r\n");
+        run(&mut s, b"STARTTLS\r\n");
+        s.tls_established();
+        run(&mut s, b"EHLO client.test\r\n");
+        s
+    }
+
+    #[test]
+    fn auth_is_refused_in_the_clear() {
+        // Credentials on an unencrypted connection are credentials given away,
+        // whatever the server does next.
+        let mut s = Session::new("mx1.example.net", true, 1024).with_auth();
+        run(&mut s, b"EHLO client.test\r\n");
+        assert_eq!(
+            code(&run(&mut s, b"AUTH PLAIN AGFsaWNlAHNlY3JldA==\r\n")),
+            538
+        );
+    }
+
+    #[test]
+    fn auth_is_not_offered_or_accepted_where_it_is_not_available() {
+        // Port 25 does not advertise it and does not accept it: a relay that
+        // authenticated on the MX port would be a second way in with no reason
+        // to exist.
+        let mut s = Session::new("mx1.example.net", true, 1024);
+        run(&mut s, b"EHLO client.test\r\n");
+        run(&mut s, b"STARTTLS\r\n");
+        s.tls_established();
+        let greeting = run(&mut s, b"EHLO client.test\r\n");
+        let Action::Reply(r) = &greeting else {
+            panic!("{greeting:?}")
+        };
+        assert!(!r.lines.iter().any(|l| l.contains("AUTH")), "{r:?}");
+        assert_eq!(code(&run(&mut s, b"AUTH PLAIN AGEAYg==\r\n")), 500);
+    }
+
+    #[test]
+    fn plain_carries_the_credentials_to_the_sink() {
+        // The state machine decides *when*; the sink decides *whether*. Base64
+        // of "\0alice\0secret".
+        let mut s = authenticating();
+        let action = run(&mut s, b"AUTH PLAIN AGFsaWNlAHNlY3JldA==\r\n");
+        assert_eq!(
+            action,
+            Action::Authenticate {
+                username: "alice".into(),
+                password: "secret".into()
+            }
+        );
+
+        assert_eq!(code(&s.authenticated(Some("alice".into()))), 235);
+        assert_eq!(s.principal(), Some("alice"));
+    }
+
+    #[test]
+    fn plain_without_an_initial_response_takes_one_more_line() {
+        let mut s = authenticating();
+        assert_eq!(code(&run(&mut s, b"AUTH PLAIN\r\n")), 334);
+        assert_eq!(
+            run(&mut s, b"AGFsaWNlAHNlY3JldA==\r\n"),
+            Action::Authenticate {
+                username: "alice".into(),
+                password: "secret".into()
+            }
+        );
+    }
+
+    #[test]
+    fn login_is_two_challenges() {
+        let mut s = authenticating();
+        assert_eq!(code(&run(&mut s, b"AUTH LOGIN\r\n")), 334);
+        // "alice"
+        assert_eq!(code(&run(&mut s, b"YWxpY2U=\r\n")), 334);
+        // "secret"
+        assert_eq!(
+            run(&mut s, b"c2VjcmV0\r\n"),
+            Action::Authenticate {
+                username: "alice".into(),
+                password: "secret".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_client_may_cancel() {
+        let mut s = authenticating();
+        run(&mut s, b"AUTH LOGIN\r\n");
+        assert_eq!(code(&run(&mut s, b"*\r\n")), 501);
+        // And the session is usable afterwards: cancelling is the client's
+        // right, not an error to be punished for.
+        assert_eq!(code(&run(&mut s, b"AUTH LOGIN\r\n")), 334);
+    }
+
+    #[test]
+    fn malformed_credentials_are_refused_rather_than_decoded_to_nothing() {
+        // A blob that is not base64 must not become an empty password checked
+        // against a hash.
+        let mut s = authenticating();
+        assert_eq!(code(&run(&mut s, b"AUTH PLAIN not-base64!!\r\n")), 501);
+
+        let mut s = authenticating();
+        // Valid base64 with no NUL separators is not a PLAIN response.
+        assert_eq!(code(&run(&mut s, b"AUTH PLAIN YWxpY2U=\r\n")), 501);
+    }
+
+    #[test]
+    fn repeated_failures_end_the_connection() {
+        // Every attempt costs this server an Argon2 verification and costs the
+        // client one line. That asymmetry is the whole reason for the budget.
+        let mut s = authenticating();
+        for _ in 0..MAX_AUTH_FAILURES - 1 {
+            run(&mut s, b"AUTH PLAIN AGFsaWNlAHNlY3JldA==\r\n");
+            assert_eq!(code(&s.authenticated(None)), 535);
+        }
+        run(&mut s, b"AUTH PLAIN AGFsaWNlAHNlY3JldA==\r\n");
+        let last = s.authenticated(None);
+        assert_eq!(code(&last), 421);
+        assert!(matches!(last, Action::Close(_)));
+    }
+
+    #[test]
+    fn authenticating_twice_is_a_sequence_error() {
+        // Re-authenticating mid-session would leave a message whose sender was
+        // authorised by one principal and whose body arrived under another.
+        let mut s = authenticating();
+        run(&mut s, b"AUTH PLAIN AGFsaWNlAHNlY3JldA==\r\n");
+        s.authenticated(Some("alice".into()));
+        assert_eq!(
+            code(&run(&mut s, b"AUTH PLAIN AGFsaWNlAHNlY3JldA==\r\n")),
+            503
+        );
+    }
+
+    #[test]
+    fn auth_is_advertised_only_once_encrypted() {
+        let mut s = Session::new("mx1.example.net", true, 1024).with_auth();
+        let plain = run(&mut s, b"EHLO client.test\r\n");
+        let Action::Reply(r) = &plain else { panic!() };
+        assert!(
+            !r.lines.iter().any(|l| l.contains("AUTH")),
+            "AUTH advertised before TLS: {r:?}"
+        );
+
+        run(&mut s, b"STARTTLS\r\n");
+        s.tls_established();
+        let encrypted = run(&mut s, b"EHLO client.test\r\n");
+        let Action::Reply(r) = &encrypted else {
+            panic!()
+        };
+        assert!(
+            r.lines.iter().any(|l| l.contains("AUTH PLAIN LOGIN")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn base64_decoding_accepts_what_clients_send() {
+        assert_eq!(decode_base64("YWxpY2U="), Some("alice".into()));
+        // Padding absent, which some clients omit.
+        assert_eq!(decode_base64("YWxpY2U"), Some("alice".into()));
+        // Whitespace, which others insert.
+        assert_eq!(decode_base64("YWxp Y2U="), Some("alice".into()));
+        assert_eq!(decode_base64(""), Some(String::new()));
+        // Not base64 at all.
+        assert_eq!(decode_base64("!!!"), None);
+        // Valid base64, invalid UTF-8: not a password anything here can set.
+        assert_eq!(decode_base64("//8="), None);
     }
 
     #[test]
