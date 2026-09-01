@@ -24,7 +24,7 @@ use mail_auth::{
 use pigeon_auth::{
     dkim::KeyPair,
     pipeline::{FromAddress, Pipeline, Rewrite, SigningKey},
-    verify::{Envelope, Verifier},
+    verify::Envelope,
 };
 
 // ------------------------------------------------------------------- the stub
@@ -144,7 +144,7 @@ async fn pigeons_own_signature_verifies_against_the_message_it_sent() {
         &pair.txt_record(),
     );
 
-    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN);
+    let pipeline = Pipeline::new(pigeon_testkit::dns::offline_verifier(), DOMAIN);
     let signing = SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap();
 
     let out = pipeline
@@ -199,7 +199,7 @@ async fn the_arc_set_verifies_against_the_message_it_sent() {
         &pair.txt_record(),
     );
 
-    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN);
+    let pipeline = Pipeline::new(pigeon_testkit::dns::offline_verifier(), DOMAIN);
     let signing = SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap();
 
     let out = pipeline
@@ -256,7 +256,7 @@ async fn a_chain_that_arrived_failed_is_not_extended() {
          From: <alice@sender.example>\r\nSubject: hi\r\n\r\nbody\r\n"
     );
 
-    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN);
+    let pipeline = Pipeline::new(pigeon_testkit::dns::offline_verifier(), DOMAIN);
     let signing = SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap();
 
     let out = pipeline
@@ -303,7 +303,7 @@ async fn tampering_with_the_rewritten_from_breaks_the_signature() {
         &pair.txt_record(),
     );
 
-    let pipeline = Pipeline::new(Verifier::from_system().unwrap(), DOMAIN);
+    let pipeline = Pipeline::new(pigeon_testkit::dns::offline_verifier(), DOMAIN);
     let signing = SigningKey::from_pkcs8_pem(pair.private_pem(), DOMAIN, SELECTOR).unwrap();
 
     let out = pipeline

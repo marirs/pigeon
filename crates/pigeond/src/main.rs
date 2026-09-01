@@ -182,11 +182,18 @@ fn build_auth(
     // paths under the key that was just displaced.
     let ring_for_derive = ring_path.clone();
     let derive: Deriver = Box::new(move |snapshot| {
-        let ring = pigeon_auth::KeyRing::load(&ring_for_derive)
+        // Read once, then hashed and parsed from the same bytes. Hashing the
+        // file separately would leave a window where the recorded fingerprint
+        // belongs to a ring that was never loaded, and a rotation landing in it
+        // would be recorded as already published and never republished.
+        let text = std::fs::read_to_string(&ring_for_derive)
+            .map_err(|e| format!("SRS key ring {}: {e}", ring_for_derive.display()))?;
+        let ring = pigeon_auth::KeyRing::parse(&text)
             .map_err(|e| format!("SRS key ring {}: {e}", ring_for_derive.display()))?;
         Ok(Derived {
             keys: load_keys(snapshot, &checked)?,
             srs: Arc::new(pigeon_auth::Srs::new(ring, host.clone())),
+            ring: Some(digest(text.as_bytes())),
         })
     });
 
@@ -195,6 +202,7 @@ fn build_auth(
     // the first message either, and the operator should hear about it once,
     // now, rather than per message.
     let derived = derive(&snapshot).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let ring_seen = derived.ring;
     tracing::info!(domains = derived.keys.len(), "loaded DKIM signing keys");
 
     // Seeded from what the database says now, so the first tick after startup
@@ -207,13 +215,17 @@ fn build_auth(
     Ok(Auth {
         pipeline: Arc::new(pipeline),
         runtime: Arc::new(RuntimeState {
-            coordinator: std::sync::Mutex::new(pigeon_route::Baseline::new(seed)),
-            current: std::sync::RwLock::new(Arc::new(Runtime {
-                snapshot: Arc::new(snapshot),
-                keys: derived.keys,
-                srs: derived.srs,
-            })),
-            ring_fingerprint: std::sync::Mutex::new(ring_fingerprint(&ring_path)),
+            // Seeded with what is being published right here, so the first
+            // reconciliation compares against a recorded value rather than
+            // against "nothing published yet" and republishes the table the
+            // daemon just installed.
+            coordinator: std::sync::Mutex::new({
+                let mut baseline = pigeon_route::Baseline::new(seed);
+                baseline.published(snapshot.fingerprint());
+                baseline
+            }),
+            current: std::sync::RwLock::new(Arc::new(Runtime::assemble(snapshot, derived, seed))),
+            ring_fingerprint: std::sync::Mutex::new(ring_seen),
             ring_path,
             derive,
         }),
@@ -227,9 +239,12 @@ fn build_auth(
 /// poll. A ring that stays unreadable is caught the next time it is loaded,
 /// which reports the reason.
 fn ring_fingerprint(path: &Path) -> Option<[u8; 32]> {
+    Some(digest(&std::fs::read(path).ok()?))
+}
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).ok()?;
-    Some(Sha256::digest(&bytes).into())
+    Sha256::digest(bytes).into()
 }
 
 /// Parse every signing key the snapshot names.
@@ -295,6 +310,65 @@ struct Runtime {
     /// was just displaced — which verifies today and stops verifying when the
     /// operator eventually deletes it.
     srs: Arc<pigeon_auth::Srs>,
+    /// The identity of everything published here, as one hash.
+    ///
+    /// The snapshot's own fingerprint covers the database; this extends it with
+    /// what the runtime is assembled from outside it — the key material
+    /// actually loaded, and the SRS ring. Recorded on every accepted message,
+    /// so "which configuration decided this" is answerable afterwards even
+    /// across a restore that rewound the revision counter.
+    fingerprint: [u8; 32],
+    /// The routing revision this was published at.
+    ///
+    /// Beside the fingerprint rather than looked up separately: an accepted
+    /// message records both, and a reader that took the number from the
+    /// coordinator and the hash from the runtime could catch a publication
+    /// between the two and record a pair that never existed.
+    revision: i64,
+}
+
+impl Runtime {
+    /// Combine a table with what was derived from it, and hash the result.
+    fn assemble(snapshot: pigeon_route::Snapshot, derived: Derived, revision: i64) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let mut h = Sha256::new();
+        h.update(snapshot.fingerprint());
+
+        // Sorted, because a `HashMap`'s order is not a property of the
+        // configuration and would make one runtime hash differently per run.
+        let mut keys: Vec<(&String, [u8; 32])> = derived
+            .keys
+            .iter()
+            .map(|(domain, key)| (domain, key.identity()))
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(b.0));
+        h.update((keys.len() as u64).to_be_bytes());
+        for (domain, identity) in keys {
+            h.update((domain.len() as u64).to_be_bytes());
+            h.update(domain.as_bytes());
+            h.update(identity);
+        }
+
+        // An unreadable ring hashes as its own state rather than as any
+        // particular ring: it is a runtime that could not be assembled from
+        // one, which is not the same as a runtime assembled from an empty one.
+        match derived.ring {
+            Some(ring) => {
+                h.update(b"ring");
+                h.update(ring);
+            }
+            None => h.update(b"no-ring"),
+        }
+
+        Self {
+            snapshot: Arc::new(snapshot),
+            keys: derived.keys,
+            srs: derived.srs,
+            fingerprint: h.finalize().into(),
+            revision,
+        }
+    }
 }
 
 /// The published [`Runtime`], and what it takes to build one.
@@ -345,6 +419,11 @@ type Deriver = Box<dyn Fn(&pigeon_route::Snapshot) -> Result<Derived, String> + 
 struct Derived {
     keys: HashMap<String, pigeon_auth::pipeline::SigningKey>,
     srs: Arc<pigeon_auth::Srs>,
+    /// The hash of the ring bytes these keys were parsed from.
+    ///
+    /// Produced by the deriver rather than read again here, so what is recorded
+    /// as published is exactly what was loaded.
+    ring: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for RuntimeState {
@@ -394,16 +473,37 @@ impl RuntimeState {
             // `observe`, which is what makes the table built here beat whatever
             // the previous lineage published.
             pigeon_route::Observation::Advanced | pigeon_route::Observation::Regressed => {
-                Some(self.rebuild(conn))
+                Some(self.rebuild(conn, &mut baseline))
             }
         }
     }
 
     /// Load, validate and publish, with the coordinator already held.
-    fn rebuild(&self, conn: &rusqlite::Connection) -> Result<(), String> {
+    fn rebuild(
+        &self,
+        conn: &rusqlite::Connection,
+        baseline: &mut pigeon_route::Baseline,
+    ) -> Result<(), String> {
         let inputs = pigeon_route::load(conn).map_err(|e| e.to_string())?;
         let built = pigeon_route::Snapshot::build(inputs).map_err(|e| e.to_string())?;
-        pigeon_route::Publish::publish(self, built.snapshot)
+        self.publish_recording(baseline, built.snapshot)
+    }
+
+    /// Publish, and record in the baseline what was published.
+    ///
+    /// One place, so the recorded fingerprint cannot be the one a *failed*
+    /// publication would have installed: a snapshot whose keys will not load
+    /// leaves both the served runtime and the baseline's record on the previous
+    /// state, and the next reconciliation still sees a difference and retries.
+    fn publish_recording(
+        &self,
+        baseline: &mut pigeon_route::Baseline,
+        snapshot: pigeon_route::Snapshot,
+    ) -> Result<(), String> {
+        let fingerprint = snapshot.fingerprint();
+        self.install(snapshot, baseline.revision)?;
+        baseline.published(fingerprint);
+        Ok(())
     }
 
     /// Reconcile: load and compare the rows themselves, whatever the counter
@@ -426,24 +526,32 @@ impl RuntimeState {
             Err(e) => return Some(Err(format!("reconciliation could not build: {e}"))),
         };
 
-        let current = self.pin();
-        if built.snapshot.rule_count() == current.snapshot.rule_count()
-            && built.snapshot.domain_names().count() == current.snapshot.domain_names().count()
-        {
-            // Cheap comparison first. A full fingerprint belongs here and is
-            // what `M1-RELOAD.md` §2 describes; counts are what this snapshot
-            // exposes today, so reconciliation currently catches a restore that
-            // changes the shape of the table and not one that swaps a
-            // destination underneath it. Recorded rather than implied: the
-            // fingerprint is the next piece of this.
+        // The whole comparison, not a cheaper proxy for it. Counts would agree
+        // across a restore that swaps one destination for another, and once
+        // `RCPT` answers from this table that is misdelivered mail rather than
+        // stale metadata (`M1-RELOAD.md` C-2).
+        //
+        // Compared against what the coordinator recorded publishing, not
+        // against the served runtime: they are the same thing while every
+        // publication goes through here, and the recorded value is the one this
+        // lock owns.
+        if baseline.published_fingerprint() == Some(built.snapshot.fingerprint()) {
             return None;
         }
 
+        // Rows differing at an unmoved revision is exactly what the revision
+        // counter cannot express, so the lineage advances instead: the table
+        // built here has to beat anything the previous lineage published.
         baseline.diverged();
-        Some(pigeon_route::Publish::publish(self, built.snapshot))
+        Some(self.publish_recording(&mut baseline, built.snapshot))
     }
 
     fn reconcile_ring(&self) -> Option<Result<(), String>> {
+        // Under the coordinator like every other publication: a second path
+        // that can install a runtime is a second thing whose ordering against
+        // the first has to be argued about (C-1).
+        let mut baseline = self.coordinator.lock().expect("coordinator lock poisoned");
+
         let current = ring_fingerprint(&self.ring_path);
         if current == *self.ring_fingerprint.lock().expect("ring lock poisoned") {
             return None;
@@ -452,7 +560,7 @@ impl RuntimeState {
         // The table is republished as it stands: what has to be rebuilt is what
         // is *derived* from it, which now includes the ring.
         let snapshot = (*self.pin().snapshot).clone();
-        Some(pigeon_route::Publish::publish(self, snapshot))
+        Some(self.publish_recording(&mut baseline, snapshot))
     }
 }
 
@@ -471,16 +579,34 @@ impl reload::RoutingSource for RuntimeState {
 }
 
 impl pigeon_route::Publish for RuntimeState {
+    /// Publishes at the revision already in force.
+    ///
+    /// Correct for the two callers that reach it: republishing for a changed
+    /// SRS ring, where the routing has not moved, and tests that install a
+    /// table directly. Everything the coordinator publishes goes through
+    /// `publish_recording`, which supplies the revision it observed.
     fn publish(&self, snapshot: pigeon_route::Snapshot) -> Result<(), String> {
+        let revision = self.pin().revision;
+        self.install(snapshot, revision)
+    }
+}
+
+impl RuntimeState {
+    fn install(&self, snapshot: pigeon_route::Snapshot, revision: i64) -> Result<(), String> {
         // Keys first: a snapshot whose keys will not load is not installed at
         // all. The previous runtime keeps serving, which is the same rule the
         // detector applies to a configuration that will not build.
         let derived = (self.derive)(&snapshot)?;
-        *self.current.write().expect("runtime lock poisoned") = Arc::new(Runtime {
-            snapshot: Arc::new(snapshot),
-            keys: derived.keys,
-            srs: derived.srs,
-        });
+
+        // Recorded from what the deriver actually loaded, and only once the
+        // derivation succeeded: a ring recorded as published after a failed
+        // publication would never be republished, and the daemon would keep
+        // signing return paths with the displaced key.
+        let ring = derived.ring;
+        let runtime = Arc::new(Runtime::assemble(snapshot, derived, revision));
+
+        *self.current.write().expect("runtime lock poisoned") = runtime;
+        *self.ring_fingerprint.lock().expect("ring lock poisoned") = ring;
         Ok(())
     }
 }
@@ -676,6 +802,22 @@ impl<R: MxLookup + 'static> MessageSink for SpoolSink<R> {
     }
 }
 
+/// What acceptance records about one message.
+///
+/// A struct rather than four more parameters: these travel together, and
+/// `routing` in particular is only meaningful paired with the envelope it was
+/// pinned for — the point of recording it is that this message was accepted
+/// under *that* configuration.
+struct Admission<'a> {
+    envelope: &'a Envelope,
+    original_sender: &'a str,
+    size: usize,
+    destination: &'a str,
+    /// The runtime pinned at `MAIL FROM`. `None` on the Milestone 0
+    /// environment path, which has no snapshot to pin.
+    routing: Option<&'a Runtime>,
+}
+
 impl<R: MxLookup + 'static> SpoolSink<R> {
     fn accepts_recipient_inner(&self, address: &str) -> bool {
         if self.accept.is_empty() {
@@ -805,14 +947,17 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
                     .admit(
                         queue,
                         &spool_id,
-                        &envelope,
-                        &original_sender,
-                        received.len() + body.len(),
-                        &self
-                            .forwarding
-                            .as_ref()
-                            .map(|f| f.destination.clone())
-                            .unwrap_or_default(),
+                        Admission {
+                            envelope: &envelope,
+                            original_sender: &original_sender,
+                            size: received.len() + body.len(),
+                            destination: &self
+                                .forwarding
+                                .as_ref()
+                                .map(|f| f.destination.clone())
+                                .unwrap_or_default(),
+                            routing: transaction.as_deref(),
+                        },
                     )
                     .await
                 {
@@ -1025,23 +1170,30 @@ impl<R: MxLookup> SpoolSink<R> {
         &self,
         queue: &Queue,
         spool_id: &pigeon_spool::SpoolId,
-        envelope: &Envelope,
-        original_sender: &str,
-        size: usize,
-        destination: &str,
+        message: Admission<'_>,
     ) -> Result<(), (String, bool)> {
         use pigeon_spool::accept::{Acceptance, Destination};
+
+        let Admission {
+            envelope,
+            original_sender,
+            size,
+            destination,
+            routing,
+        } = message;
 
         let acceptance = Acceptance {
             spool_id: spool_id.clone(),
             return_path: envelope.sender.clone(),
             original_sender: original_sender.to_string(),
             size_bytes: size as i64,
-            // Recorded, never re-resolved. Routing from the snapshot arrives
-            // with fan-out; until then there is one destination and the
-            // revision is what the pinned runtime said at acceptance.
-            routing_revision: 0,
-            routing_fingerprint: vec![0; 32],
+            // Recorded, never re-resolved: what decided these rows, taken from
+            // the runtime this transaction was pinned to at `MAIL FROM`. Both
+            // halves come from that one pinned value, so the pair is one the
+            // daemon actually served. Absent only on the Milestone 0
+            // environment path, which has no snapshot to be pinned to.
+            routing_revision: routing.map(|r| r.revision).unwrap_or(0),
+            routing_fingerprint: routing.map(|r| r.fingerprint.to_vec()).unwrap_or_default(),
             original_recipients: envelope.recipients.clone(),
             destinations: vec![Destination {
                 address: destination.to_string(),
@@ -2411,6 +2563,126 @@ mod tests {
         deliverer.stop();
     }
 
+    /// A runtime with a stated revision, a fixed ring, and optionally a key.
+    ///
+    /// Assembled directly rather than published, because what is under test is
+    /// the identity a runtime carries — not how it came to be installed.
+    fn runtime_for(revision: i64, ring: &str, key: Option<&str>) -> Runtime {
+        let mut keys = HashMap::new();
+        if let Some(pem) = key {
+            keys.insert(
+                "example.com".to_string(),
+                pigeon_auth::pipeline::SigningKey::from_pkcs8_pem(pem, "example.com", "sel")
+                    .unwrap(),
+            );
+        }
+        Runtime::assemble(
+            pigeon_route::Snapshot::default(),
+            Derived {
+                keys,
+                srs: Arc::new(pigeon_auth::Srs::new(
+                    pigeon_auth::KeyRing::parse(ring).unwrap(),
+                    "pigeon.test",
+                )),
+                ring: Some(digest(ring.as_bytes())),
+            },
+            revision,
+        )
+    }
+
+    const RING_A: &str = "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const RING_B: &str = "2 2026-02-01T00:00:00Z - HxwdHhkaGxwVFhcYERITFA0ODxAJCgsMBQYHCAECAwQ=";
+
+    #[test]
+    fn the_runtime_fingerprint_covers_what_is_published_outside_the_database() {
+        // The table's own fingerprint answers for the database. It cannot
+        // answer for the two things assembled around it: the key material that
+        // signs, and the ring that issues return paths. A rotation of either
+        // changes what the daemon does with a message, so it has to change the
+        // identity a message is recorded under.
+        let key = e2e_key();
+        let other = pigeon_auth::dkim::KeyPair::generate(2048)
+            .unwrap()
+            .private_pem()
+            .to_string();
+
+        let base = runtime_for(1, RING_A, Some(key));
+
+        assert_eq!(
+            base.fingerprint,
+            runtime_for(1, RING_A, Some(key)).fingerprint,
+            "the same runtime hashed differently twice"
+        );
+        assert_ne!(
+            base.fingerprint,
+            runtime_for(1, RING_B, Some(key)).fingerprint,
+            "a rotated SRS ring did not change the published identity"
+        );
+        assert_ne!(
+            base.fingerprint,
+            runtime_for(1, RING_A, Some(&other)).fingerprint,
+            "new key material under the same selector did not change the \
+             published identity"
+        );
+        assert_ne!(
+            base.fingerprint,
+            runtime_for(1, RING_A, None).fingerprint,
+            "removing the signing key did not change the published identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_records_the_runtime_it_was_pinned_to() {
+        // What "recorded, never re-resolved" means at the boundary: the message
+        // carries the revision *and* the fingerprint of the configuration that
+        // decided its rows, both taken from the one pinned runtime. A restore
+        // that rewinds the counter afterwards cannot make this pair look like
+        // any other configuration's.
+        let tmp = TempDir::new("admit-identity");
+        let (s, db) = queued_sink(tmp.path());
+        let id = s.next_id();
+        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
+        let runtime = runtime_for(7, RING_A, None);
+
+        let envelope = Envelope {
+            sender: "SRS0=tag=AAA=remote.test=alice@pigeon.test".into(),
+            recipients: vec!["hello@example.com".into()],
+        };
+
+        s.admit(
+            s.queue.as_ref().unwrap(),
+            &spool_id,
+            Admission {
+                envelope: &envelope,
+                original_sender: "alice@remote.test",
+                size: 10,
+                destination: "mailbox@provider.example",
+                routing: Some(&runtime),
+            },
+        )
+        .await
+        .expect("admit");
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let (revision, fingerprint): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT routing_revision, routing_fingerprint FROM message WHERE spool_id = ?1",
+                [spool_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            revision, 7,
+            "the accepted message lost its routing revision"
+        );
+        assert_eq!(
+            fingerprint,
+            runtime.fingerprint.to_vec(),
+            "the accepted message was not recorded under the pinned configuration"
+        );
+    }
+
     #[tokio::test]
     async fn admission_writes_the_graph_the_dsn_will_need() {
         // The envelope moved from a sidecar into rows, so what used to be a
@@ -2431,10 +2703,13 @@ mod tests {
         s.admit(
             s.queue.as_ref().unwrap(),
             &spool_id,
-            &envelope,
-            "alice@remote.test",
-            1234,
-            "mailbox@provider.example",
+            Admission {
+                envelope: &envelope,
+                original_sender: "alice@remote.test",
+                size: 1234,
+                destination: "mailbox@provider.example",
+                routing: None,
+            },
         )
         .await
         .expect("admit");
@@ -2488,10 +2763,13 @@ mod tests {
         s.admit(
             s.queue.as_ref().unwrap(),
             &spool_id,
-            &envelope,
-            "",
-            10,
-            "mailbox@provider.example",
+            Admission {
+                envelope: &envelope,
+                original_sender: "",
+                size: 10,
+                destination: "mailbox@provider.example",
+                routing: None,
+            },
         )
         .await
         .expect("admit");
@@ -2524,10 +2802,13 @@ mod tests {
         s.admit(
             queue,
             &spool_id,
-            &envelope,
-            "a@remote.test",
-            10,
-            "m@provider.example",
+            Admission {
+                envelope: &envelope,
+                original_sender: "a@remote.test",
+                size: 10,
+                destination: "m@provider.example",
+                routing: None,
+            },
         )
         .await
         .expect("first admission");
@@ -2536,10 +2817,13 @@ mod tests {
             .admit(
                 queue,
                 &spool_id,
-                &envelope,
-                "a@remote.test",
-                10,
-                "m@provider.example",
+                Admission {
+                    envelope: &envelope,
+                    original_sender: "a@remote.test",
+                    size: 10,
+                    destination: "m@provider.example",
+                    routing: None,
+                },
             )
             .await
             .expect_err("a second admission of the same spool id should fail");
@@ -2801,11 +3085,14 @@ mod tests {
                     );
                 }
             }
-            let ring = pigeon_auth::KeyRing::load(&derive_path)
-                .map_err(|e| format!("fixture ring: {e}"))?;
+            let text =
+                std::fs::read_to_string(&derive_path).map_err(|e| format!("fixture ring: {e}"))?;
+            let ring =
+                pigeon_auth::KeyRing::parse(&text).map_err(|e| format!("fixture ring: {e}"))?;
             Ok(Derived {
                 keys,
                 srs: Arc::new(pigeon_auth::Srs::new(ring, "pigeon.test")),
+                ring: Some(digest(text.as_bytes())),
             })
         });
 
@@ -2813,17 +3100,19 @@ mod tests {
 
         Auth {
             pipeline: Arc::new(pigeon_auth::pipeline::Pipeline::new(
-                pigeon_auth::verify::Verifier::from_system().unwrap(),
+                // Offline: what these tests assert is what the daemon does with
+                // a message, not what the machine's resolver says about one.
+                pigeon_testkit::dns::offline_verifier(),
                 "pigeon.test",
             )),
             runtime: Arc::new(RuntimeState {
-                coordinator: std::sync::Mutex::new(pigeon_route::Baseline::new(0)),
-                current: std::sync::RwLock::new(Arc::new(Runtime {
-                    snapshot: Arc::new(snapshot),
-                    keys: derived.keys,
-                    srs: derived.srs,
-                })),
-                ring_fingerprint: std::sync::Mutex::new(ring_fingerprint(&ring_path)),
+                coordinator: std::sync::Mutex::new({
+                    let mut baseline = pigeon_route::Baseline::new(0);
+                    baseline.published(snapshot.fingerprint());
+                    baseline
+                }),
+                ring_fingerprint: std::sync::Mutex::new(derived.ring),
+                current: std::sync::RwLock::new(Arc::new(Runtime::assemble(snapshot, derived, 0))),
                 ring_path,
                 derive,
             }),

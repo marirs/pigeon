@@ -347,9 +347,19 @@ impl Verifier {
             .map_err(|e| e.to_string())?
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self {
-            authenticator: MessageAuthenticator(resolver),
-        })
+        Ok(Self::with_resolver(MessageAuthenticator(resolver)))
+    }
+
+    /// Build over a caller-supplied resolver.
+    ///
+    /// The injection point tests use: `from_system` reads `/etc/resolv.conf`,
+    /// which makes what a verification returns a property of the machine it
+    /// runs on rather than of the bytes under test. Production keeps calling
+    /// `from_system` and keeps failing when it cannot be read — a daemon that
+    /// silently verified through a resolver that answers nothing would report
+    /// every message as a temporary DNS failure.
+    pub fn with_resolver(authenticator: MessageAuthenticator) -> Self {
+        Self { authenticator }
     }
 
     /// Authenticate the received payload.

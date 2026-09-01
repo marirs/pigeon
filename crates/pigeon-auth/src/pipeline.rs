@@ -27,6 +27,8 @@
 
 use std::sync::Arc;
 
+use sha2::{Digest as _, Sha256 as Sha256Digest};
+
 use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 
 use mail_auth::{
@@ -76,6 +78,15 @@ pub struct SigningKey {
     key: SharedKey,
     domain: String,
     selector: String,
+    /// Which key material this is, without being the key material.
+    ///
+    /// The published runtime's fingerprint has to change when a key file's
+    /// *contents* change, not merely when its path or selector does: rotating a
+    /// key in place under an unchanged selector is otherwise invisible, and a
+    /// message recorded as signed by "sel" would not say which "sel". A hash
+    /// rather than the DER because this value is compared and stored, and the
+    /// private components must not travel with it.
+    identity: [u8; 32],
 }
 
 /// A parsed key that can be handed to `mail-auth` more than once.
@@ -133,11 +144,29 @@ impl SigningKey {
             .map_err(|e| PipelineError::Key(e.to_string()))?;
         let key = RsaKey::<Sha256>::from_key_der(PrivateKeyDer::Pkcs8(der))
             .map_err(|e| PipelineError::Key(e.to_string()))?;
+        let domain = domain.into();
+        let selector = selector.into();
+        // Over the PEM, which is the form on disk, and bound to the identity it
+        // was loaded for so the same file installed under two selectors is two
+        // different signing identities.
+        let mut h = Sha256Digest::new();
+        h.update(domain.as_bytes());
+        h.update(b"\0");
+        h.update(selector.as_bytes());
+        h.update(b"\0");
+        h.update(pem.as_bytes());
+
         Ok(Self {
             key: SharedKey(Arc::new(key)),
-            domain: domain.into(),
-            selector: selector.into(),
+            domain,
+            selector,
+            identity: h.finalize().into(),
         })
+    }
+
+    /// A hash identifying the loaded key material. Never the key itself.
+    pub fn identity(&self) -> [u8; 32] {
+        self.identity
     }
 }
 
@@ -472,11 +501,72 @@ mod tests {
         SigningKey::from_pkcs8_pem(key(), "pigeon.test", "sel").unwrap()
     }
 
-    /// `from_system` reads /etc/resolv.conf and performs no lookup, so this is
-    /// not a network dependency. Nothing below reaches DNS: every path under
-    /// test either has no signatures to verify or fails to parse.
+    #[test]
+    fn a_key_identity_says_which_key_material_this_is() {
+        // What the published runtime's fingerprint uses to notice a rotation.
+        // Rotating a key in place, under a selector that does not change, is
+        // otherwise invisible: the path is the same, the selector is the same,
+        // and every message afterwards is signed by a different key.
+        let other = crate::dkim::KeyPair::generate(2048)
+            .unwrap()
+            .private_pem()
+            .to_string();
+
+        assert_eq!(
+            signing_key().identity(),
+            signing_key().identity(),
+            "the same key loaded twice has two identities"
+        );
+        assert_ne!(
+            signing_key().identity(),
+            SigningKey::from_pkcs8_pem(&other, "pigeon.test", "sel")
+                .unwrap()
+                .identity(),
+            "a rotated key kept its predecessor's identity"
+        );
+        // Bound to who it signs for: the same file installed for two domains or
+        // two selectors is two signing identities, and a runtime that swapped
+        // one for the other would hash the same.
+        assert_ne!(
+            signing_key().identity(),
+            SigningKey::from_pkcs8_pem(key(), "other.test", "sel")
+                .unwrap()
+                .identity(),
+            "the same key under a different domain has one identity"
+        );
+        assert_ne!(
+            signing_key().identity(),
+            SigningKey::from_pkcs8_pem(key(), "pigeon.test", "other")
+                .unwrap()
+                .identity(),
+            "the same key under a different selector has one identity"
+        );
+    }
+
+    /// Offline, so the result is a property of the bytes rather than of the
+    /// machine. Nothing below reaches DNS anyway — every path under test has no
+    /// signatures to verify or fails to parse — but "does not need the network"
+    /// and "cannot use it" are different claims, and only the second one is
+    /// enforceable.
     fn pipeline() -> Pipeline {
-        Pipeline::new(Verifier::from_system().unwrap(), "pigeon.test")
+        // Built here rather than taken from `pigeon-testkit`: testkit depends
+        // on this crate, so the unit-test build would link a second copy of it
+        // and the two `Verifier` types would not be the same type. The
+        // integration tests use testkit's fixture, which is the same resolver.
+        use mail_auth::MessageAuthenticator;
+        use mail_auth::hickory_resolver::{Resolver, config::ResolverConfig};
+
+        let resolver = Resolver::builder_with_config(
+            ResolverConfig::default(),
+            mail_auth::hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+        )
+        .build()
+        .expect("a resolver with no name servers should always build");
+
+        Pipeline::new(
+            Verifier::with_resolver(MessageAuthenticator(resolver)),
+            "pigeon.test",
+        )
     }
 
     fn envelope() -> Envelope<'static> {

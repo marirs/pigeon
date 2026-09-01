@@ -16,8 +16,40 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use mail_auth::{
-    MX, RecordSet, ResolverCache, Txt, common::parse::TxtRecordParser, common::verify::DomainKey,
+    MX, MessageAuthenticator, RecordSet, ResolverCache, Txt, common::parse::TxtRecordParser,
+    common::verify::DomainKey,
 };
+use pigeon_auth::verify::Verifier;
+
+/// A verifier that cannot reach DNS.
+///
+/// Configured with **no** name servers, so a lookup fails in the resolver
+/// rather than travelling anywhere: nothing is read from `/etc/resolv.conf`,
+/// no socket is opened, and the result of a verification depends only on the
+/// bytes under test and on whatever [`DnsStub`] serves from cache.
+///
+/// This is what tests inject in place of `Verifier::from_system`. Two
+/// verification tests have already failed in this repository for an
+/// environmental reason — `no ServerAddresses key in DNS info` — which is a
+/// test reporting on the machine rather than on the code.
+///
+/// Production is deliberately not offered this: the daemon builds from the
+/// system configuration and fails when it cannot, because a daemon verifying
+/// through a resolver that answers nothing would call every message a
+/// temporary DNS failure.
+pub fn offline_verifier() -> Verifier {
+    use mail_auth::hickory_resolver::{Resolver, config::ResolverConfig};
+
+    let resolver = Resolver::builder_with_config(
+        // Default is empty: no name servers, no search domains.
+        ResolverConfig::default(),
+        mail_auth::hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+    )
+    .build()
+    .expect("a resolver with no name servers should always build");
+
+    Verifier::with_resolver(MessageAuthenticator(resolver))
+}
 
 /// Serves one DKIM public key to whoever asks.
 #[derive(Default)]

@@ -70,6 +70,16 @@ pub struct Baseline {
     /// baseline sees "the same rewound database" while the daemon serves
     /// revision 6's routing over revision 5's rows.
     pub revision: i64,
+    /// The fingerprint of the routing last **successfully** published in this
+    /// lineage, or `None` before anything has been.
+    ///
+    /// Beside the revision because it answers the question the revision cannot:
+    /// a restore can present the same number over different rows, and only the
+    /// rows themselves separate "nothing happened" from "everything changed
+    /// underneath us" (C-2). Kept here rather than read back from the served
+    /// runtime so that the value reconciliation compares is the one this lock
+    /// owns and writes.
+    published: Option<[u8; 32]>,
 }
 
 impl Baseline {
@@ -77,7 +87,22 @@ impl Baseline {
         Self {
             lineage: 0,
             revision,
+            published: None,
         }
+    }
+
+    /// Record a successful publication.
+    pub fn published(&mut self, fingerprint: [u8; 32]) {
+        self.published = Some(fingerprint);
+    }
+
+    /// What was last published, if anything.
+    ///
+    /// `None` compares equal to nothing, so a coordinator that has never
+    /// published reconciles into publishing rather than concluding that
+    /// whatever is loaded is already live.
+    pub fn published_fingerprint(&self) -> Option<[u8; 32]> {
+        self.published
     }
 
     /// Classify an observation and update the baseline.

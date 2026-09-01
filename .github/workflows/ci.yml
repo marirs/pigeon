@@ -121,6 +121,31 @@ jobs:
           fi
           echo "SRS tag comparison uses a constant-time equality."
 
+      # Tests must not resolve through the machine they run on. Two
+      # verification tests have already failed here for an environmental
+      # reason -- "no ServerAddresses key in DNS info" -- which is a test
+      # reporting on a laptop rather than on the code. The offline fixture is
+      # `pigeon_testkit::dns::offline_verifier`; production keeps building
+      # from the system configuration and keeps failing when it cannot.
+      - name: Assert integration tests do not use the system resolver
+        run: |
+          # A file may use it only if every test in it is ignored by default,
+          # which is how the two live-DNS suites are marked.
+          offenders=""
+          for f in crates/*/tests/*.rs; do
+            if grep -q 'from_system(' "$f" && ! grep -q '#\[ignore' "$f"; then
+              offenders="$offenders $f"
+            fi
+          done
+          if [ -n "$offenders" ]; then
+            echo "::error::a test builds a resolver from the system configuration:$offenders"
+            echo
+            echo "Inject pigeon_testkit::dns::offline_verifier instead, or mark"
+            echo "the test #[ignore] as the live-DNS suites are."
+            exit 1
+          fi
+          echo "Integration tests resolve offline."
+
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

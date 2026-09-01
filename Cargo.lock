@@ -1198,6 +1198,7 @@ dependencies = [
  "hmac",
  "mail-auth",
  "mail-parser",
+ "pigeon-testkit",
  "pigeon-types",
  "rsa",
  "rustls-pki-types",
@@ -1295,6 +1296,7 @@ name = "pigeon-testkit"
 version = "0.0.1"
 dependencies = [
  "mail-auth",
+ "pigeon-auth",
  "tokio",
 ]
 

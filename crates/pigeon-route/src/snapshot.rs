@@ -128,9 +128,29 @@ pub struct DkimIdentity {
 }
 
 /// An immutable routing table.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Snapshot {
     domains: HashMap<String, Domain>,
+    /// The canonical hash of the inputs this was built from.
+    ///
+    /// Carried by the table rather than recomputed by whoever holds it, because
+    /// the question it answers — "is the published table still the one the
+    /// database describes?" — has to be answerable about a table that has
+    /// already consumed its inputs. See [`crate::reload::fingerprint`] and
+    /// `M1-RELOAD.md` C-2.
+    fingerprint: [u8; 32],
+}
+
+impl Default for Snapshot {
+    /// Written out rather than derived: a derived `[0u8; 32]` would be a
+    /// fingerprint no configuration produces, so an empty table would compare
+    /// unequal to itself and reconciliation would republish it forever.
+    fn default() -> Self {
+        Self {
+            domains: HashMap::new(),
+            fingerprint: crate::reload::fingerprint(&[]),
+        }
+    }
 }
 
 // ------------------------------------------------------------------ building
@@ -329,6 +349,8 @@ impl Snapshot {
     /// transaction — so a row that violates one cannot go live merely because
     /// nobody ran a command.
     pub fn build(inputs: Vec<DomainInput>) -> Result<Built, BuildError> {
+        // Taken from the inputs, before building consumes them.
+        let fingerprint = crate::reload::fingerprint(&inputs);
         let mut domains = HashMap::with_capacity(inputs.len());
         let mut reports = Vec::new();
 
@@ -338,7 +360,10 @@ impl Snapshot {
             domains.insert(name, domain);
         }
 
-        let snapshot = Snapshot { domains };
+        let snapshot = Snapshot {
+            domains,
+            fingerprint,
+        };
         snapshot.check_for_loops()?;
         Ok(Built { snapshot, reports })
     }
@@ -538,6 +563,15 @@ impl Snapshot {
     ///
     /// A reload that says only "published" tells an operator nothing about
     /// what changed; the counts are the cheapest thing that does.
+    /// The canonical hash of everything this table was built from.
+    ///
+    /// What reconciliation compares. Two tables with the same fingerprint were
+    /// built from the same routing; two with different fingerprints were not,
+    /// whatever their revision numbers say.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+
     pub fn rule_count(&self) -> usize {
         self.domains
             .values()

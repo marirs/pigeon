@@ -16,3 +16,8 @@ tokio = { workspace = true }
 # consults a cache before the resolver — so serving the record from one is how
 # a signature gets verified with no packet leaving the machine.
 mail-auth = { workspace = true }
+
+# For the offline verifier: `Verifier` is what the pipeline authenticates
+# through, and a deterministic test has to hand it a resolver that cannot
+# answer from the machine it happens to run on.
+pigeon-auth = { workspace = true }

@@ -23,3 +23,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+# For the offline verifier. A dev-dependency cycle — testkit depends on this
+# crate — which Cargo permits precisely because it does not affect the library
+# anyone builds.
+pigeon-testkit = { workspace = true }

@@ -555,6 +555,23 @@ mod tests {
 
     /// A real coordinator over a real database, for the one test that is about
     /// publication rather than about the loop.
+    /// What the deriver returns for these tests: no keys, a fixed ring, and no
+    /// ring fingerprint — so ring reconciliation never fires and the tests are
+    /// about routing.
+    fn derived() -> crate::Derived {
+        crate::Derived {
+            keys: std::collections::HashMap::new(),
+            srs: Arc::new(pigeon_auth::Srs::new(
+                pigeon_auth::KeyRing::parse(
+                    "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                )
+                .unwrap(),
+                "pigeon.test",
+            )),
+            ring: None,
+        }
+    }
+
     fn coordinator(path: &std::path::Path) -> Arc<crate::RuntimeState> {
         let conn = pigeon_db::open(path).unwrap();
         let seed = pigeon_route::revision::read(&conn)
@@ -563,34 +580,21 @@ mod tests {
             .unwrap_or(0);
 
         Arc::new(crate::RuntimeState {
-            coordinator: std::sync::Mutex::new(pigeon_route::Baseline::new(seed)),
-            current: std::sync::RwLock::new(Arc::new(crate::Runtime {
-                snapshot: Arc::new(pigeon_route::Snapshot::default()),
-                keys: std::collections::HashMap::new(),
-                srs: Arc::new(pigeon_auth::Srs::new(
-                    pigeon_auth::KeyRing::parse(
-                        "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
-                    )
-                    .unwrap(),
-                    "pigeon.test",
-                )),
-            })),
+            coordinator: std::sync::Mutex::new({
+                let mut baseline = pigeon_route::Baseline::new(seed);
+                baseline.published(pigeon_route::Snapshot::default().fingerprint());
+                baseline
+            }),
+            current: std::sync::RwLock::new(Arc::new(crate::Runtime::assemble(
+                pigeon_route::Snapshot::default(),
+                derived(),
+                seed,
+            ))),
             // No ring file: its fingerprint is `None` now and stays `None`, so
             // ring reconciliation never fires and this test is about routing.
             ring_fingerprint: std::sync::Mutex::new(None),
             ring_path: std::path::PathBuf::from("/nonexistent/ring.key"),
-            derive: Box::new(|_| {
-                Ok(crate::Derived {
-                    keys: std::collections::HashMap::new(),
-                    srs: Arc::new(pigeon_auth::Srs::new(
-                        pigeon_auth::KeyRing::parse(
-                            "1 2026-01-01T00:00:00Z - AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
-                        )
-                        .unwrap(),
-                        "pigeon.test",
-                    )),
-                })
-            }),
+            derive: Box::new(|_| Ok(derived())),
         })
     }
 
@@ -634,6 +638,89 @@ mod tests {
         stopper.stop_and_join(supervisor).await;
 
         assert!(published, "the worker never published a committed change");
+    }
+
+    #[tokio::test]
+    async fn a_restore_that_swaps_a_destination_is_republished() {
+        // C-2, and the reason reconciliation compares the rows themselves. A
+        // restore can present the same revision over different routing: the
+        // counter says nothing happened, and every recipient this table
+        // resolves goes to a mailbox the operator did not configure.
+        let db = Db::new("same-revision-restore");
+        let runtime = coordinator(&db.path());
+        let conn = pigeon_db::open(&db.path()).unwrap();
+
+        let me = pigeon_db::repo::Address::parse("me@example.net").unwrap();
+        pigeon_db::repo::add_domain(&conn, "example.com", Some(&me)).unwrap();
+        conn.execute("UPDATE domain SET status = 'active'", [])
+            .unwrap();
+        pigeon_db::repo::add_alias(
+            &conn,
+            "example.com",
+            "hello",
+            pigeon_db::repo::AliasKind::Forward,
+            &[],
+        )
+        .unwrap();
+
+        crate::reload::RoutingSource::tick(runtime.as_ref(), &conn)
+            .expect("a routing change should have been observed")
+            .expect("the first publication should succeed");
+        assert_eq!(destination_of(&runtime), "me@example.net");
+
+        let revision = pigeon_route::revision::read(&conn).unwrap().unwrap();
+
+        // The restore: one destination swapped, and the counter put back where
+        // it was. Every count is unchanged — one domain, one alias — so
+        // nothing about the *shape* of the table gives this away.
+        conn.execute("UPDATE destination SET local = 'someone-else'", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE routing_revision SET revision = ?1 WHERE id = 1",
+            [revision],
+        )
+        .unwrap();
+
+        assert!(
+            crate::reload::RoutingSource::tick(runtime.as_ref(), &conn).is_none(),
+            "the revision counter claimed to have seen a restore it cannot see"
+        );
+        assert_eq!(
+            destination_of(&runtime),
+            "me@example.net",
+            "the table changed without a publication"
+        );
+
+        crate::reload::RoutingSource::reconcile_rows(runtime.as_ref(), &conn)
+            .expect("reconciliation should have found the difference")
+            .expect("the republication should succeed");
+
+        assert_eq!(
+            destination_of(&runtime),
+            "someone-else@example.net",
+            "reconciliation did not republish the restored routing"
+        );
+
+        // And it is not a change any more: a second reconciliation over the
+        // same rows must be quiet, or the daemon republishes forever.
+        assert!(
+            crate::reload::RoutingSource::reconcile_rows(runtime.as_ref(), &conn).is_none(),
+            "reconciliation republished a table it had just published"
+        );
+    }
+
+    /// Where `hello@example.com` resolves in the published table.
+    fn destination_of(runtime: &crate::RuntimeState) -> String {
+        let snapshot = runtime.pin().snapshot.clone();
+        let address = pigeon_types::Address::parse("hello@example.com").unwrap();
+        match snapshot.resolve(&address) {
+            pigeon_route::Decision::Forward { destinations, .. } => destinations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            other => panic!("hello@example.com does not forward: {other:?}"),
+        }
     }
 
     #[tokio::test]

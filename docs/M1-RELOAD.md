@@ -94,6 +94,36 @@ A commit that did not touch routing is consumed silently. This is also what
 makes R-3 implementable: "log when routing changed" is not the same question as
 "log when the database changed", and only the fingerprint can tell them apart.
 
+#### What the fingerprint covers
+
+Every input the published runtime is built from, encoded **length-delimited** and
+in sorted order:
+
+- domains, their gates and plus-addressing;
+- aliases, the rule *kind* (a reject and an empty forward are different answers
+  to one address), and every resolved destination, sorted;
+- the default destination and the catch-all, including "inherit";
+- destination values with their stored case — the local part belongs to the
+  destination host, so `Bob@x` and `bob@x` are different mailboxes;
+- the forwarding policy, which decides what is signed and under whose identity;
+- the active DKIM selector, algorithm and key path.
+
+The daemon extends that hash with what is published *around* the table and lives
+outside the database: the identity of the key material actually loaded, and the
+SRS ring. Those are published in the same swap as the table (`Runtime`), so they
+belong to the same identity — and a key rotated in place under an unchanged
+selector is otherwise invisible.
+
+Length-delimited rather than separated by a delimiter: with separators, a value
+containing the separator lets two different configurations hash the same, and a
+routing fingerprint that collides is exactly the restore reconciliation cannot
+detect.
+
+The fingerprint is recorded on every accepted message alongside the revision
+(`message.routing_revision`, `message.routing_fingerprint`), both taken from the
+runtime pinned at `MAIL FROM`, so "which configuration decided these rows" stays
+answerable across a restore that rewound the counter.
+
 #### What the fingerprint does not remove
 
 It suppresses publication and logging. It does not suppress the **read** — the
@@ -731,7 +761,9 @@ so a redundant alias introduced at runtime is not silent.
 | Design | Where |
 |---|---|
 | §2 detector, §3 ordering, §4 failure | `pigeon-route/src/reload.rs` — `Watcher::tick` |
-| §2 fingerprint | same file — `fingerprint` |
+| §2 fingerprint | same file — `fingerprint` (`pigeon-route/tests/fingerprint.rs`) |
+| Published runtime identity | `pigeond/src/main.rs` — `Runtime::assemble` |
+| C-2 same-revision restore | same file — `RuntimeState::reconcile_routing` |
 | Startup handover | same file — `initial` |
 | §6 worker, supervision, shutdown | `pigeond/src/reload.rs` |
 

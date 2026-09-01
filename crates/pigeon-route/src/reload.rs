@@ -344,51 +344,138 @@ fn load_and_fingerprint(conn: &Connection) -> Result<(Vec<DomainInput>, [u8; 32]
 
 /// A canonical hash of everything the routing table is built from.
 ///
-/// Canonical because the comparison has to answer "is this the same routing" and
-/// not "did these rows arrive in the same order". `load` already returns domains
-/// and aliases in a stated order; destinations are sorted here so a fan-out
-/// listed differently does not read as a change.
-fn fingerprint(inputs: &[DomainInput]) -> [u8; 32] {
+/// Canonical because the comparison has to answer "is this the same routing"
+/// and not "did these rows arrive in the same order", and because a *restore*
+/// can present the same revision number over different rows — the case
+/// `M1-RELOAD.md` C-2 exists for, which nothing that compares numbers can see.
+///
+/// # Length-delimited, not delimiter-separated
+///
+/// Every field is written as its length followed by its bytes. Concatenating
+/// with separators is ambiguous whenever a separator can appear in a value, and
+/// a routing fingerprint that collides is a restore that reconciliation cannot
+/// detect: two different configurations hashing the same is exactly the failure
+/// this function exists to prevent.
+///
+/// # What it covers
+///
+/// Every input the published runtime is built from, because anything omitted is
+/// a change that can happen at the same revision and never be noticed:
+/// domains and their gates, aliases and rule kinds, resolved destinations,
+/// the forwarding policy, and the active DKIM key's identity. The daemon
+/// extends it with what lives outside the database — the loaded key material
+/// and the SRS ring — since those are part of the same published state.
+pub fn fingerprint(inputs: &[DomainInput]) -> [u8; 32] {
     let mut h = Sha256::new();
-    for d in inputs {
-        h.update(d.name.as_bytes());
-        h.update([
-            u8::from(d.gate.inbound_enabled),
-            u8::from(d.gate.outbound_enabled),
-            u8::from(d.plus_addressing),
-        ]);
-        h.update(d.gate.status.as_str().as_bytes());
-        match &d.default_destination {
-            Some(dest) => h.update(format!("default={dest}").as_bytes()),
-            None => h.update(b"default=none"),
+
+    // Sorted here rather than trusted from the loader: the comparison must not
+    // depend on a `ORDER BY` staying where it is.
+    let mut domains: Vec<&DomainInput> = inputs.iter().collect();
+    domains.sort_by(|a, b| a.name.cmp(&b.name));
+
+    field(&mut h, b"pigeon-routing-v2");
+    count(&mut h, domains.len());
+
+    for d in domains {
+        field(&mut h, d.name.as_bytes());
+        field(&mut h, d.gate.status.as_str().as_bytes());
+        field(
+            &mut h,
+            &[
+                u8::from(d.gate.inbound_enabled),
+                u8::from(d.gate.outbound_enabled),
+                u8::from(d.plus_addressing),
+            ],
+        );
+
+        // How mail leaves, which decides what is signed and under whose
+        // identity. A restore that only flips this changes every forwarded
+        // message.
+        field(&mut h, forward_policy(d.forwarding.policy).as_bytes());
+        match &d.forwarding.dkim {
+            Some(k) => {
+                field(&mut h, b"dkim");
+                field(&mut h, k.selector.as_bytes());
+                field(&mut h, k.algorithm.as_bytes());
+                // The path, because two domains pointing at different files is
+                // a different runtime even when the selectors match.
+                field(&mut h, k.private_key_path.as_bytes());
+            }
+            None => field(&mut h, b"no-dkim"),
         }
+
+        // Destinations keep the case they were stored with. The domain half is
+        // folded at comparison time by routing, but the local part belongs to
+        // the destination host — `Bob@x` and `bob@x` are different mailboxes,
+        // and a restore that changes one is a change.
+        match &d.default_destination {
+            Some(dest) => {
+                field(&mut h, b"default");
+                field(&mut h, dest.to_string().as_bytes());
+            }
+            None => field(&mut h, b"no-default"),
+        }
+
         match &d.catchall {
             Some(c) => match &c.destination {
                 Some(dests) => {
-                    let mut d: Vec<String> = dests.iter().map(ToString::to_string).collect();
-                    d.sort();
-                    h.update(format!("catchall={}", d.join(",")).as_bytes());
+                    field(&mut h, b"catchall");
+                    sorted_destinations(&mut h, dests);
                 }
-                None => h.update(b"catchall=inherit"),
+                None => field(&mut h, b"catchall-inherit"),
             },
-            None => h.update(b"catchall=none"),
+            None => field(&mut h, b"no-catchall"),
         }
-        for a in &d.aliases {
-            let mut dests: Vec<String> = a.destinations.iter().map(ToString::to_string).collect();
-            dests.sort();
-            h.update(
-                format!(
-                    "alias={} reject={} to={}\x01",
-                    a.pattern,
-                    a.reject,
-                    dests.join(",")
-                )
-                .as_bytes(),
-            );
+
+        let mut aliases: Vec<&crate::snapshot::AliasInput> = d.aliases.iter().collect();
+        aliases.sort_by(|a, b| a.pattern.cmp(&b.pattern));
+        count(&mut h, aliases.len());
+        for a in aliases {
+            field(&mut h, a.pattern.as_bytes());
+            // The rule kind, not merely whether destinations exist: a reject
+            // rule and a forward rule with no destinations are different
+            // answers to the same address.
+            field(&mut h, if a.reject { b"reject" } else { b"forward" });
+            sorted_destinations(&mut h, &a.destinations);
         }
-        h.update(b"\x02");
     }
+
     h.finalize().into()
+}
+
+/// One length-delimited field.
+fn field(h: &mut Sha256, bytes: &[u8]) {
+    h.update((bytes.len() as u64).to_be_bytes());
+    h.update(bytes);
+}
+
+/// The length of a list, so a list boundary cannot read as a field boundary.
+///
+/// No test fails when these are removed, and that is not an accident: every
+/// list here is followed by a marker field — a rule kind, a domain status —
+/// whose values cannot collide with the list's own contents, so the current
+/// encoding is unambiguous without them. They are kept because that argument
+/// depends on which strings those markers can take, and a future field with a
+/// free-form value beside a list would make the encoding ambiguous again
+/// without anything in the fingerprint changing to say so.
+fn count(h: &mut Sha256, n: usize) {
+    h.update((n as u64).to_be_bytes());
+}
+
+fn sorted_destinations(h: &mut Sha256, destinations: &[crate::snapshot::Destination]) {
+    let mut rendered: Vec<String> = destinations.iter().map(ToString::to_string).collect();
+    rendered.sort();
+    count(h, rendered.len());
+    for d in rendered {
+        field(h, d.as_bytes());
+    }
+}
+
+fn forward_policy(policy: pigeon_types::ForwardPolicy) -> &'static str {
+    match policy {
+        pigeon_types::ForwardPolicy::Preserve => "preserve",
+        pigeon_types::ForwardPolicy::RewriteFrom => "rewrite_from",
+    }
 }
 
 /// Why the first snapshot could not be built.
