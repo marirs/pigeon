@@ -2814,6 +2814,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_identical_second_submission_is_accepted_as_its_own_message() {
+        // The duplicate-suppression policy, made falsifiable. Two submissions
+        // with the same envelope, the same recipients and byte-identical
+        // content are two messages, and both are delivered.
+        //
+        // Suppressing the second would be guessing that a sender who sent the
+        // same thing twice meant to send it once. Senders legitimately resend:
+        // a mailing list re-run, a monitoring alert that has not cleared, a
+        // person pressing send again. The failure mode of guessing is silent
+        // and unrecoverable — mail accepted with a `250` and then discarded —
+        // while the failure mode of not guessing is a duplicate the recipient
+        // can see and delete.
+        //
+        // Deduplication is safe in exactly two places: inside one accepted
+        // transaction, where Pigeon knows the recipients belong to one
+        // submission, and against an explicit idempotency identity, which
+        // inbound SMTP does not carry.
+        let tmp = TempDir::new("duplicate");
+        let (s, db) = queued_sink(tmp.path());
+
+        for _ in 0..2 {
+            accept_message(&s, "alice@remote.test", &["hello@example.com"])
+                .await
+                .expect("both submissions should be accepted");
+        }
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            messages, 2,
+            "a repeated submission was suppressed; the sender was told 250 for a message \
+             that will never arrive"
+        );
+
+        let deliveries: i64 = conn
+            .query_row("SELECT count(*) FROM delivery", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(deliveries, 2, "the second submission got no delivery");
+    }
+
+    #[tokio::test]
     async fn each_managed_domain_is_accepted_as_its_own_message() {
         // R-2 through the real path: one submission, two managed domains, two
         // messages with their own bytes and their own delivery sets — and no

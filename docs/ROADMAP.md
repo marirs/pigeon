@@ -185,7 +185,8 @@ mail that providers reject.**
 - [ ] DSN generation
 - [ ] body deletion once all recipients are terminal
 - [x] delivery metadata retention
-- [ ] duplicate suppression
+- [x] duplicate suppression (declined by policy: §6.2 — safe only within one
+      accepted transaction, which is what the acceptance path already does)
 - [ ] loop detection at delivery, as a backstop for chains leaving and
       re-entering through systems Pigeon cannot see
 - [x] STARTTLS

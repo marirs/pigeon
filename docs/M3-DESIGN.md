@@ -384,6 +384,33 @@ made this trade once, in the same words: **duplication is the recoverable
 failure.** A duplicate is visible to the recipient and annoying; a loss is
 invisible to everyone.
 
+### 6.2 Duplicate suppression: where it is safe, and where it is guessing
+
+Deduplication is safe in exactly two places:
+
+- **Within one accepted transaction.** Pigeon knows those recipients belong to
+  one submission, so a repeated `RCPT` is recorded once and several recipients
+  resolving to one mailbox become one delivery (§5). Nothing is guessed.
+- **Against an explicit idempotency identity** — a caller saying "this is the
+  same request as before". Inbound SMTP carries no such thing.
+
+Everything else is guessing, and it is **not done**:
+
+- **Not by `Message-ID`.** It is written by the sender, is not unique in
+  practice, and is trivially reused by broken clients.
+- **Not by body hash.** Byte-identical mail is sent again on purpose: a
+  mailing-list re-run, a monitoring alert that has not cleared, a person
+  pressing send twice.
+- **Not by envelope equality.** Same sender, same recipient, same content is a
+  description of ordinary repeated mail.
+
+The asymmetry decides it. Suppressing wrongly means a message accepted with a
+`250` and then discarded — silent, and unrecoverable because Pigeon keeps no
+copy. Not suppressing means a duplicate the recipient can see and delete. The
+lost-`250` duplicate is inherent to at-least-once SMTP and every MTA has it;
+inventing a content heuristic to hide it trades a visible annoyance for
+invisible loss, which is the trade this project refuses everywhere else.
+
 What the design does about it:
 
 - **The window is bounded** — it is one commit, not a delivery.
