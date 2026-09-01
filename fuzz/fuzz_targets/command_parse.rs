@@ -44,6 +44,17 @@ fuzz_target!(|data: &[u8]| {
             assert_no_injection("path", path);
             assert_no_injection("params", params);
         }
+        Command::Auth {
+            mechanism,
+            initial,
+        } => {
+            // Both reach a reply or a credential check, so both reach somewhere
+            // an injected CRLF would be two lines instead of one.
+            assert_no_injection("mechanism", mechanism);
+            if let Some(initial) = initial {
+                assert_no_injection("initial response", initial);
+            }
+        }
         Command::Data
         | Command::Rset
         | Command::Noop

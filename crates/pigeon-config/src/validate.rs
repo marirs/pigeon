@@ -479,6 +479,7 @@ mod tests {
     fn good(tmp: &TempDir) -> Config {
         Config {
             hostname: "mx1.example.test".into(),
+            user: None,
             database: tmp.0.join("pigeon.db"),
             spool: tmp.0.join("spool"),
             keys: tmp.dir("keys", 0o700),

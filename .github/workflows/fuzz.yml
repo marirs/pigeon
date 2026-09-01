@@ -39,6 +39,8 @@ jobs:
           - line_reader
           - address_parse
           - delivery_client
+          - message_pipeline
+          - dns_answer
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

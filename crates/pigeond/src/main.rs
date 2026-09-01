@@ -37,6 +37,7 @@ mod delivery;
 mod health;
 mod metrics;
 mod notify;
+mod privilege;
 mod reload;
 mod routing;
 mod scanner;
@@ -1780,6 +1781,13 @@ async fn run() -> io::Result<()> {
         return_path,
         ..Default::default()
     };
+
+    // Both listeners are bound; nothing after this needs privilege. Dropping
+    // here rather than earlier is the whole ordering: earlier and the bind
+    // fails, later and there is a window where a message from a stranger is
+    // parsed as root.
+    privilege::drop_privilege(started.config.config().user.as_deref())
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
 
     // The submission listener, when one is configured. Its own listener and
     // its own sink: the two ports ask opposite questions — the MX asks whether

@@ -209,3 +209,47 @@ A stable release should not ship until:
 - sender authorization tests pass
 - dependency audit passes
 - threat model reviewed
+
+---
+
+## Reporting a vulnerability
+
+Email **sg@nirvana.me** with `pigeon security` in the subject. Please include
+what you did, what happened, and what you expected — a reproduction is worth
+more than a classification.
+
+**Please do not open a public issue for anything that lets somebody read mail,
+send as somebody else, or take over the host.** An open relay or a signing-key
+disclosure is exploitable by anyone reading the tracker within hours of it
+appearing there.
+
+What to expect:
+
+- **Acknowledgement within 72 hours.** This is one person's project, not a
+  vendor with a rota; if you have not heard back in a week, send it again.
+- **An assessment, in the open, of what it means.** Including "this is a
+  problem and here is why it is not being fixed yet", which is sometimes the
+  honest answer for a project at this stage.
+- **A fix and a release** for anything in the "defended" column of
+  [THREAT-MODEL.md](THREAT-MODEL.md), which is the list this project claims to
+  hold.
+- **Credit in the release notes** unless you would rather not have it.
+
+Anything in the "not defended" section of the threat model is documented rather
+than fixed. Reports about those are still welcome — the useful outcome is
+usually that the documentation was wrong about the *scope* of the gap — but
+they will not be treated as vulnerabilities.
+
+### Scope
+
+In scope: the daemon, the CLI, the packaged systemd unit and Dockerfile, and
+anything that reaches them from the network.
+
+Out of scope: findings that require an attacker who already has the machine or
+the database file, denial of service through raw volume against a single host
+with no rate-limit bypass, and reports about the deliberate decisions listed in
+the threat model.
+
+### No bounty
+
+There is no money. There is a fast reply, a fix, and credit.

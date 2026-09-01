@@ -67,6 +67,15 @@ pub struct Config {
     /// remote, so it warns rather than aborting — see `pigeond`.
     pub hostname: String,
 
+    /// The account to become once the listeners are bound.
+    ///
+    /// Only consulted when the process is running as root: binding port 25
+    /// needs privilege and serving mail does not, so a parser bug reachable by
+    /// anyone on the internet should not be a root bug. Under the packaged
+    /// systemd unit the process never has root to drop and this is ignored.
+    #[serde(default)]
+    pub user: Option<String>,
+
     pub database: PathBuf,
     pub spool: PathBuf,
 

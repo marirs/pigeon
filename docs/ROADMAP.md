@@ -353,18 +353,18 @@ Adding a second MX record alone is not a high-availability design.
 
 ## Milestone 9 — Security hardening
 
-- [ ] secret redaction
-- [ ] key file permissions
-- [ ] privilege dropping
-- [ ] optional container confinement
-- [ ] SMTP command fuzzing
-- [ ] MIME parser fuzzing
-- [ ] DNS response fuzzing
-- [ ] SQLite corruption tests
-- [ ] queue crash tests
-- [ ] dependency review
-- [ ] threat model
-- [ ] responsible disclosure process
+- [x] secret redaction
+- [x] key file permissions
+- [x] privilege dropping
+- [x] optional container confinement
+- [x] SMTP command fuzzing
+- [x] MIME parser fuzzing
+- [x] DNS response fuzzing
+- [x] SQLite corruption tests
+- [x] queue crash tests
+- [x] dependency review
+- [x] threat model
+- [x] responsible disclosure process
 
 ---
 

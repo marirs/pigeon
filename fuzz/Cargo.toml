@@ -16,6 +16,10 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 pigeon-smtp = { path = "../crates/pigeon-smtp" }
 pigeon-types = { path = "../crates/pigeon-types" }
+# The pipeline's own conversion, and MX ordering: both take bytes from people
+# who are not this operator.
+pigeon-auth = { path = "../crates/pigeon-auth" }
+pigeon-dns = { path = "../crates/pigeon-dns" }
 tokio = { version = "1", features = ["rt", "io-util", "time", "macros", "test-util"] }
 
 [[bin]]
@@ -54,3 +58,15 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "message_pipeline"
+path = "fuzz_targets/message_pipeline.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dns_answer"
+path = "fuzz_targets/dns_answer.rs"
+test = false
+doc = false
