@@ -153,6 +153,19 @@ pub enum DataStatus {
     /// the connection stays in sync and can be answered with 552 rather than
     /// dropped.
     TooLarge,
+    /// The body contains a NUL octet, which no message may (RFC 5321 §2.3.1,
+    /// RFC 5322 §2.1: a message is US-ASCII text in lines, and NUL is not
+    /// text). Scanning continues for the same reason `TooLarge` does.
+    ///
+    /// Refused rather than carried, for the reason `normalize` gives about
+    /// bare CR: one set of bytes must not be two different messages. A NUL
+    /// truncates the message for every parser written in C and is an ordinary
+    /// octet to the rest, so what Pigeon signs is not what the receiver reads —
+    /// and a forwarder is the ideal machine for laundering that difference,
+    /// because it re-emits a stranger's bytes from a trusted host.
+    ///
+    /// Stripping it instead would be silently altering somebody's mail.
+    ContainsNul,
 }
 
 /// Where the terminator scan is, between chunks.
@@ -184,6 +197,8 @@ pub struct DataReader {
     max: usize,
     overflow: bool,
     complete: bool,
+    /// Set by any NUL anywhere in the body, including past the size limit.
+    nul: bool,
 }
 
 impl DataReader {
@@ -196,6 +211,7 @@ impl DataReader {
             max,
             overflow: false,
             complete: false,
+            nul: false,
         }
     }
 
@@ -272,6 +288,12 @@ impl DataReader {
     }
 
     fn push(&mut self, b: u8) {
+        // Recorded before the size check: a message that is both too large and
+        // malformed is still malformed, and the flag must not depend on where
+        // in the body the octet fell.
+        if b == 0 {
+            self.nul = true;
+        }
         // Past the limit the bytes are dropped but scanning continues, so the
         // terminator is still found and the session can be answered properly.
         if self.body.len() < self.max {
@@ -282,7 +304,11 @@ impl DataReader {
     }
 
     fn status(&self) -> DataStatus {
-        if self.overflow {
+        if self.nul {
+            // Before the size check, because "this message cannot be relayed at
+            // all" is a more useful answer than "send a smaller one".
+            DataStatus::ContainsNul
+        } else if self.overflow {
             DataStatus::TooLarge
         } else if self.complete {
             DataStatus::Complete
@@ -311,6 +337,16 @@ impl DataReader {
     #[inline]
     pub fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// Whether a NUL octet was seen anywhere in the body.
+    ///
+    /// Meaningful after completion for the same reason `is_too_large` is: the
+    /// terminator is still found, so the connection stays in sync and the
+    /// caller answers rather than dropping the socket.
+    #[inline]
+    pub fn contains_nul(&self) -> bool {
+        self.nul
     }
 
     /// Whether the body exceeded the configured limit.
@@ -395,6 +431,50 @@ mod tests {
         let mut r = LineReader::new(512);
         r.feed(b"NOOP\n");
         assert_eq!(lines(&mut r), vec!["NOOP\n"]);
+    }
+
+    #[test]
+    fn a_nul_anywhere_in_the_body_is_reported() {
+        // A NUL truncates the message for every parser written in C and is an
+        // ordinary octet to the rest, so a relayed one is two different
+        // messages. The scan continues to the terminator either way, so the
+        // session can answer rather than being dropped.
+        let mut r = DataReader::new(1024);
+        let (used, status) = r.feed(b"From: a@b\r\n\r\nbo\0dy\r\n.\r\n");
+        assert_eq!(status, DataStatus::ContainsNul);
+        assert!(r.contains_nul());
+        assert!(r.is_complete(), "the terminator was not found");
+        assert_eq!(used, b"From: a@b\r\n\r\nbo\0dy\r\n.\r\n".len());
+    }
+
+    #[test]
+    fn a_nul_in_a_header_is_reported() {
+        // The header block is the more interesting half: a message whose header
+        // set differs between parsers is one whose signature covers a different
+        // message than the receiver reads.
+        let mut r = DataReader::new(1024);
+        let (_, status) = r.feed(b"Subject: a\0b\r\n\r\nbody\r\n.\r\n");
+        assert_eq!(status, DataStatus::ContainsNul);
+    }
+
+    #[test]
+    fn a_nul_past_the_size_limit_is_still_reported() {
+        // Both faults at once. "This cannot be relayed at all" is the more
+        // useful answer than "send a smaller one", and the flag must not depend
+        // on where in the body the octet fell — past the limit the bytes are
+        // dropped, but the scan still sees them.
+        let mut r = DataReader::new(8);
+        let (_, status) = r.feed(b"aaaaaaaaaaaaaaaa\0aaaa\r\n.\r\n");
+        assert_eq!(status, DataStatus::ContainsNul);
+        assert!(r.is_too_large(), "the size limit was not reached");
+    }
+
+    #[test]
+    fn a_clean_body_is_not_reported_as_malformed() {
+        let mut r = DataReader::new(1024);
+        let (_, status) = r.feed(b"From: a@b\r\n\r\nbody\r\n.\r\n");
+        assert_eq!(status, DataStatus::Complete);
+        assert!(!r.contains_nul());
     }
 
     #[test]

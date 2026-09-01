@@ -295,3 +295,125 @@ async fn partial_command_across_writes_is_reassembled() {
     }
     assert_eq!(c.read_reply().await.unwrap().0, 250);
 }
+
+// ------------------------------------------------------------ malformed input
+
+/// Send one message and return the reply to the terminating dot.
+async fn submit_body(addr: SocketAddr, body: &[u8]) -> (u16, String) {
+    let mut c = RawClient::connect(addr).await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(b"EHLO sender.test\r\n").await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(b"MAIL FROM:<a@sender.test>\r\n").await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(b"RCPT TO:<hello@example.net>\r\n").await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(b"DATA\r\n").await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(body).await.unwrap();
+    c.send(b"\r\n.\r\n").await.unwrap();
+    c.read_reply().await.unwrap()
+}
+
+#[tokio::test]
+async fn a_body_containing_a_nul_is_refused_and_never_delivered() {
+    // A NUL truncates the message for every parser written in C and is an
+    // ordinary octet to the rest, so relaying one launders a difference: what
+    // Pigeon signs is not what the receiver reads. Refused at the end of DATA,
+    // which is still before the `250`, so the message stays the upstream MTA's
+    // to report on.
+    let sink = LocalOnly::new(&["example.net"]);
+    let addr = start(sink.clone(), config()).await;
+
+    let (code, text) = submit_body(addr, b"Subject: hi\r\n\r\nbo\0dy").await;
+    assert_eq!(code, 554, "a NUL body was not refused permanently: {text}");
+    assert_eq!(sink.count(), 0, "a malformed message reached the sink");
+}
+
+#[tokio::test]
+async fn a_refused_body_does_not_poison_the_next_message() {
+    // The transaction is cleared on every outcome, so a refusal must not leave
+    // the connection unusable or the envelope half-populated.
+    let sink = LocalOnly::new(&["example.net"]);
+    let addr = start(sink.clone(), config()).await;
+
+    let mut c = RawClient::connect(addr).await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(b"EHLO sender.test\r\n").await.unwrap();
+    c.read_reply().await.unwrap();
+
+    for (body, want) in [(&b"a\0b"[..], 554u16), (&b"clean"[..], 250)] {
+        c.send(b"MAIL FROM:<a@sender.test>\r\n").await.unwrap();
+        assert_eq!(c.read_reply().await.unwrap().0, 250);
+        c.send(b"RCPT TO:<hello@example.net>\r\n").await.unwrap();
+        assert_eq!(c.read_reply().await.unwrap().0, 250);
+        c.send(b"DATA\r\n").await.unwrap();
+        assert_eq!(c.read_reply().await.unwrap().0, 354);
+        c.send(b"Subject: hi\r\n\r\n").await.unwrap();
+        c.send(body).await.unwrap();
+        c.send(b"\r\n.\r\n").await.unwrap();
+        let (code, text) = c.read_reply().await.unwrap();
+        assert_eq!(code, want, "{text}");
+    }
+
+    assert_eq!(sink.count(), 1, "the clean message was not delivered");
+}
+
+#[tokio::test]
+async fn an_overlong_body_line_is_relayed_rather_than_refused() {
+    // A deliberate non-refusal. RFC 5321 §4.5.3.1.6 caps a line at 1000 octets,
+    // but senders exceed it routinely — unwrapped base64, a pasted URL — and
+    // relays accept it. Refusing would reject deliverable mail that every other
+    // MTA carries; the receiver at the far end is the one entitled to object,
+    // and if it does, the failure is reported through a DSN rather than
+    // guessed at here.
+    let sink = LocalOnly::new(&["example.net"]);
+    let addr = start(sink.clone(), config()).await;
+
+    let long = "x".repeat(5000);
+    let (code, text) = submit_body(addr, format!("Subject: hi\r\n\r\n{long}").as_bytes()).await;
+    assert_eq!(code, 250, "an overlong line was refused: {text}");
+    assert_eq!(sink.count(), 1);
+}
+
+#[tokio::test]
+async fn a_session_cannot_be_held_open_for_ever_by_staying_busy() {
+    // The per-command timeout resets on every command, so a client sending
+    // NOOP every few seconds never idles out. With a connection cap in place
+    // that turns the cap into the means of denial rather than the defence
+    // against it, which is what `max_session` exists to stop.
+    let sink = LocalOnly::new(&["example.net"]);
+    let addr = start(
+        sink,
+        ServerConfig {
+            max_session: Duration::from_millis(300),
+            ..config()
+        },
+    )
+    .await;
+
+    let mut c = RawClient::connect(addr).await.unwrap();
+    c.read_reply().await.unwrap();
+
+    // Busy, never idle: a command every 50ms, well inside the command timeout.
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if c.send(b"NOOP\r\n").await.is_err() {
+                return true;
+            }
+            match c.read_reply().await {
+                Some((421, _)) => return true,
+                Some(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                // The server hung up rather than answering, which is the other
+                // way a lifetime cap can end a session.
+                None => return true,
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        ended.unwrap_or(false),
+        "a busy session outlived its maximum lifetime"
+    );
+}

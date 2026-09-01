@@ -173,6 +173,15 @@ pub fn message_too_large() -> Reply {
     Reply::line(552, "Message exceeds maximum size")
 }
 
+/// The body contains an octet no message may contain.
+///
+/// Permanent: retrying sends the same bytes. Refused at the end of `DATA`,
+/// which is still before the `250` — so the message stays the upstream MTA's
+/// responsibility and it reports the failure to its own sender.
+pub fn message_malformed() -> Reply {
+    Reply::line(554, "Message contains an octet that cannot be relayed")
+}
+
 /// Too many trace headers: the message appears to be looping.
 ///
 /// Permanent, because a message going round in circles will do so again on

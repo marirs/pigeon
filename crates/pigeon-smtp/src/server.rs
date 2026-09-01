@@ -579,13 +579,20 @@ async fn finish_data<S: MessageSink>(
     let envelope = session.envelope().clone();
     let received = received_header(&config.hostname, session, peer, session.is_tls());
     let too_large = reader.is_too_large();
+    let malformed = reader.contains_nul();
     let body = reader.into_body();
 
     // The trace stack is the only loop guard that reaches beyond systems
     // Pigeon can see. Refusing permanently is deliberate: a looping message
     // will loop again on retry, and each pass costs another delivery.
     let hops = count_hops(&body);
-    let outcome = if too_large {
+    let outcome = if malformed {
+        // Before the size check: "this cannot be relayed at all" is a more
+        // useful answer than "send a smaller one", and the sender learns it
+        // while the message is still theirs to report on.
+        tracing::warn!(%peer, "refusing message: the body contains a NUL octet");
+        Err(DataError::Malformed)
+    } else if too_large {
         Err(DataError::TooLarge)
     } else if hops >= MAX_HOPS {
         tracing::warn!(%peer, hops, "refusing message: too many trace hops, likely a loop");

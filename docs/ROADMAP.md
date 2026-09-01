@@ -189,8 +189,8 @@ mail that providers reject.**
 - [ ] loop detection at delivery, as a backstop for chains leaving and
       re-entering through systems Pigeon cannot see
 - [ ] STARTTLS
-- [ ] SMTP timeouts, connection and size limits
-- [ ] malformed message handling
+- [x] SMTP timeouts, connection and size limits
+- [x] malformed message handling
 - [ ] graceful shutdown
 
 - [x] a routing revision counter, bumped by triggers on the routing tables, so

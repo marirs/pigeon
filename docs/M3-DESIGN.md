@@ -823,6 +823,52 @@ resident pages. Peak RSS above is three buffers of a 25 MB message.
 
 ---
 
+## 11.4 Protocol limits and malformed input
+
+The limits are in `ServerConfig` and are compile-time defaults rather than
+configuration: RFC 5321 §4.5.3.2 sets the timeout floors, and a wrong value
+here is a mail outage rather than a tuning mistake. What each one defends
+against is recorded beside it.
+
+| Limit | Value | Without it |
+|---|---|---|
+| `command_timeout` | 300s | a connection held open by never speaking |
+| `data_timeout` | 600s | the same, mid-body |
+| `max_session` | 3600s | a client that stays *busy* — `NOOP` every few seconds resets the command timeout forever, and the connection cap becomes the means of denial rather than the defence against it |
+| `max_connections` | 256 | unbounded concurrent sessions; the surplus waits rather than being refused |
+| `max_message_size` | 50MB | advertised as `SIZE`, and an over-declaration is refused at `MAIL FROM` rather than after the body |
+| `MAX_COMMAND_LINE` | 512 | an unbounded line buffer; an overlong line is reported once and the reader resynchronises |
+| `MAX_HOPS` | 100 | a message going round a loop Pigeon cannot see |
+| recipient cap | — | one transaction fanning out without bound |
+
+### What is refused, and what is carried
+
+**Refused at the end of `DATA`** — still before the `250`, so the message stays
+the upstream MTA's to report on:
+
+- **A NUL octet anywhere in the body** (`554`). A NUL truncates the message for
+  every parser written in C and is an ordinary octet to the rest, so relaying
+  one launders that difference: what Pigeon signs is not what the receiver
+  reads. It is the same hazard `normalize` describes for bare CR, and a
+  forwarder is the ideal machine for laundering it, because it re-emits a
+  stranger's bytes from a trusted host. Stripping it instead would be silently
+  altering somebody's mail.
+
+**Carried, deliberately:**
+
+- **Bare CR and bare LF** are converted to CRLF once, after authentication and
+  before signing (`M2-DESIGN.md` R-1). Conversion rather than refusal because
+  the fault is common and the fix is unambiguous.
+- **Lines longer than 1000 octets.** RFC 5321 §4.5.3.1.6 caps them, but senders
+  exceed it routinely — unwrapped base64, a pasted URL — and relays accept it.
+  Refusing would reject deliverable mail every other MTA carries. The receiver
+  at the far end is entitled to object, and if it does, the failure is reported
+  through a DSN rather than guessed at here.
+- **A message that does not parse at all.** It is forwarded with a trace header
+  and no seal: refusing would lose mail over a parser disagreement.
+
+---
+
 ## 12. Tests
 
 Every property with the mutation that must break it, in the discipline the

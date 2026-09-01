@@ -300,6 +300,7 @@ impl Session {
         Action::Reply(match outcome {
             Ok(id) => reply::queued(&id),
             Err(DataError::TooLarge) => reply::message_too_large(),
+            Err(DataError::Malformed) => reply::message_malformed(),
             Err(DataError::TooManyHops) => reply::too_many_hops(),
             Err(DataError::Temporary) => reply::temporary_failure(),
         })
@@ -497,6 +498,9 @@ pub enum DataError {
     Temporary,
     /// The trace header stack suggests the message is going round in circles.
     TooManyHops,
+    /// The body cannot be relayed as it stands: it carries an octet that makes
+    /// one set of bytes two different messages. See [`crate::codec::DataStatus`].
+    Malformed,
 }
 
 #[cfg(test)]
