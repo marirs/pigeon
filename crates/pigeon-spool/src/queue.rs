@@ -310,6 +310,58 @@ pub fn expire_old(conn: &Connection, horizon_seconds: i64, now: i64) -> rusqlite
     )
 }
 
+/// Delete the records of messages that were settled long enough ago.
+///
+/// The body goes when every delivery is terminal and nothing is owed a report
+/// (`M3-DESIGN.md` §8). The **rows** outlive it, because "what happened to this
+/// message?" is a question an operator asks days later, and answering it from
+/// the log alone is guesswork. This is what eventually collects them.
+///
+/// Age is measured from `body_deleted_at`, which is set exactly when the
+/// message became releasable — so the window is "how long after Pigeon was
+/// finished with a message can its outcome still be explained", which is the
+/// question the window is actually about. A message that is not finished with
+/// has no `body_deleted_at` and is never collected here, however old.
+///
+/// Two things are kept beyond the window regardless:
+///
+/// - **A message some delivery still points at as its `notified_by`.** That row
+///   is the DSN which explains a failure, and deleting it would leave the
+///   failure it reported with a dangling `enqueued` — the notification outcome
+///   unexplainable, which is precisely what retention is for. It becomes
+///   collectable once the failure's own record has gone.
+/// - **Anything not actually settled**: a delivery still in flight, or a report
+///   still owed. `body_deleted_at` should not be set in either case, and this
+///   does not rely on that being true.
+pub fn expire_metadata(
+    conn: &Connection,
+    retain_seconds: i64,
+    now: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        // The `IS NOT NULL` is redundant with the comparison below — SQL
+        // compares NULL to nothing — and is kept because the intent is what a
+        // reader checks: only a message Pigeon has finished with has a window
+        // at all. No mutation can fail on removing it while the comparison
+        // stands, which is the reason it is written down here rather than
+        // assumed.
+        "DELETE FROM message
+          WHERE body_deleted_at IS NOT NULL
+            -- Strictly older, so a message gets the whole window.
+            AND body_deleted_at < ?1
+            AND NOT EXISTS (
+                SELECT 1 FROM delivery d
+                 WHERE d.message_id = message.id
+                   AND (d.state NOT IN ('delivered','failed','expired')
+                        OR d.notification = 'owed')
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM delivery r WHERE r.notified_by = message.id
+            )",
+        [now - retain_seconds],
+    )
+}
+
 /// Whether a delivery still exists and in what state, for tests and for
 /// operator tooling.
 pub fn state_of(conn: &Connection, delivery_id: i64) -> rusqlite::Result<Option<String>> {

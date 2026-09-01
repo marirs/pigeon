@@ -75,6 +75,20 @@ const MAX_CONCURRENT_DELIVERIES: usize = 32;
 /// out first, not whether one does.
 const TOTAL_FORWARD_BUDGET: Duration = Duration::from_secs(1800);
 
+/// How long a settled message's rows are kept after its body is released.
+///
+/// The body goes when Pigeon is finished with the message; the record of what
+/// happened outlives it, because "what happened to this message?" is asked days
+/// later and answering it from the log alone is guesswork.
+///
+/// Fixed rather than configurable, like the horizon: nothing about correctness
+/// depends on it, and it is the kind of knob that is set once and then explains
+/// a surprise years later. If it is ever exposed it must stay well clear of
+/// [`GIVE_UP_AFTER`] plus the time a DSN takes to deliver — a message whose own
+/// record is collected before its bounce is sent is a failure nobody can
+/// explain afterwards.
+const RETAIN_RECORDS_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// How long shutdown waits for work already in progress.
 ///
 /// Bounded because one delivery may legitimately run for the whole
@@ -1688,6 +1702,7 @@ async fn run() -> io::Result<()> {
         concurrency: MAX_CONCURRENT_DELIVERIES,
         lease_seconds: CLAIM_LEASE.as_secs() as i64,
         horizon_seconds: GIVE_UP_AFTER.as_secs() as i64,
+        retain_seconds: RETAIN_RECORDS_FOR.as_secs() as i64,
         worker,
     });
 
@@ -2015,6 +2030,7 @@ mod tests {
             concurrency,
             lease_seconds: 2400,
             horizon_seconds: 5 * 24 * 60 * 60,
+            retain_seconds: RETAIN_RECORDS_FOR.as_secs() as i64,
             worker: "test-worker".into(),
         });
 
@@ -3102,6 +3118,7 @@ mod tests {
             concurrency: MAX_CONCURRENT_DELIVERIES,
             lease_seconds: CLAIM_LEASE.as_secs() as i64,
             horizon_seconds: GIVE_UP_AFTER.as_secs() as i64,
+            retain_seconds: RETAIN_RECORDS_FOR.as_secs() as i64,
             worker: "test-worker".into(),
         });
 

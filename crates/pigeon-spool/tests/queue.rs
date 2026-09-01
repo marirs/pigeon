@@ -525,3 +525,206 @@ fn the_default_lease_outlasts_the_delivery_deadline() {
 fn a_lease_shorter_than_the_deadline_is_refused() {
     queue::assert_lease_exceeds_deadline(60, 1800);
 }
+
+// ------------------------------------------------------- retention of records
+
+/// Settle a message: deliver every destination, then mark its body released.
+fn settle(f: &mut Fixture, at: i64) {
+    let claims = queue::claim(&mut f.conn, "w", LEASE, 10, at, tokens()).unwrap();
+    for claim in claims {
+        queue::complete(
+            &f.conn,
+            &claim,
+            &Outcome::Delivered {
+                code: 250,
+                response: "ok".into(),
+            },
+            at,
+        )
+        .unwrap();
+    }
+    let ids: Vec<i64> = f
+        .conn
+        .prepare("SELECT id FROM message")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for id in ids {
+        pigeon_spool::dsn::mark_body_released(&f.conn, id, at).unwrap();
+    }
+}
+
+fn messages(f: &Fixture) -> i64 {
+    f.conn
+        .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_settled_record_outlives_its_body_and_is_then_collected() {
+    // The two lifetimes of §8. The body goes when Pigeon is finished with the
+    // message; the record of what happened outlives it, because "what happened
+    // to this message?" is asked days later.
+    let mut f = Fixture::new("retain");
+    f.accept("m-1", &["a@example.net"], 1_000, "SRS0=x@pigeon.test");
+    settle(&mut f, 2_000);
+
+    // Inside the window: nothing is collected, however settled.
+    assert_eq!(
+        queue::expire_metadata(&f.conn, 100, 2_050).unwrap(),
+        0,
+        "a record was collected before its window elapsed"
+    );
+    assert_eq!(messages(&f), 1);
+
+    // At the boundary the record still stands: strictly older, so a message
+    // gets the whole window.
+    assert_eq!(queue::expire_metadata(&f.conn, 100, 2_100).unwrap(), 0);
+
+    assert_eq!(queue::expire_metadata(&f.conn, 100, 2_101).unwrap(), 1);
+    assert_eq!(messages(&f), 0);
+
+    // And nothing dangles: the recipients, deliveries and events go with it.
+    for table in [
+        "original_recipient",
+        "delivery",
+        "recipient_delivery",
+        "delivery_event",
+    ] {
+        let n: i64 = f
+            .conn
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "{table} rows outlived the message they describe");
+    }
+}
+
+#[test]
+fn a_message_that_is_not_settled_is_never_collected() {
+    // Age alone is not the rule. A message still being delivered, or still
+    // owing a report, has an outcome nobody has been told yet — collecting it
+    // would delete the only record of an obligation Pigeon has not discharged.
+    let mut f = Fixture::new("retain-unsettled");
+    f.accept("m-1", &["a@example.net"], 1_000, "SRS0=x@pigeon.test");
+
+    // In flight, and ancient.
+    assert_eq!(queue::expire_metadata(&f.conn, 100, 9_000_000).unwrap(), 0);
+    assert_eq!(messages(&f), 1);
+
+    // Failed with a report owed, body marked released anyway — the guard does
+    // not rely on `body_deleted_at` being written correctly.
+    let claim = queue::claim(&mut f.conn, "w", LEASE, 1, 2_000, tokens())
+        .unwrap()
+        .pop()
+        .unwrap();
+    queue::complete(
+        &f.conn,
+        &claim,
+        &Outcome::Failed {
+            code: 550,
+            response: "no such user".into(),
+        },
+        2_000,
+    )
+    .unwrap();
+    pigeon_spool::dsn::mark_body_released(&f.conn, 1, 2_000).unwrap();
+
+    assert_eq!(
+        queue::expire_metadata(&f.conn, 100, 9_000_000).unwrap(),
+        0,
+        "a message still owing a report was collected"
+    );
+}
+
+#[test]
+fn a_record_whose_body_is_still_on_disk_is_not_collected() {
+    // The window is measured from the body's release, so a message whose body
+    // was never released has no window yet — however terminal its deliveries
+    // are. Collecting it would leave the body on disk with nothing pointing at
+    // it, and the sweep would then remove it as an orphan: the record and the
+    // message would disappear in two separate acts nobody ordered.
+    let mut f = Fixture::new("retain-unreleased");
+    f.accept("m-1", &["a@example.net"], 1_000, "SRS0=x@pigeon.test");
+
+    let claim = queue::claim(&mut f.conn, "w", LEASE, 1, 2_000, tokens())
+        .unwrap()
+        .pop()
+        .unwrap();
+    queue::complete(
+        &f.conn,
+        &claim,
+        &Outcome::Delivered {
+            code: 250,
+            response: "ok".into(),
+        },
+        2_000,
+    )
+    .unwrap();
+
+    // Settled, ancient, and its body has not been released.
+    assert_eq!(
+        queue::expire_metadata(&f.conn, 100, 9_000_000).unwrap(),
+        0,
+        "a record was collected while its body was still on disk"
+    );
+}
+
+#[test]
+fn a_report_outlives_the_failure_it_explains() {
+    // The notification outcome has to stay explainable. Collecting the DSN
+    // while the failure still points at it would leave `notification =
+    // 'enqueued'` with nothing to name, which is the one question retention
+    // exists to answer: not just "did this fail?" but "was the sender told?".
+    let mut f = Fixture::new("retain-report");
+    f.accept("m-1", &["a@example.net"], 1_000, "SRS0=x@pigeon.test");
+
+    let claim = queue::claim(&mut f.conn, "w", LEASE, 1, 2_000, tokens())
+        .unwrap()
+        .pop()
+        .unwrap();
+    queue::complete(
+        &f.conn,
+        &claim,
+        &Outcome::Failed {
+            code: 550,
+            response: "no such user".into(),
+        },
+        2_000,
+    )
+    .unwrap();
+
+    // The DSN, and the failure now pointing at it.
+    f.accept("m-2", &["alice@remote.test"], 2_000, "");
+    let report_id: i64 = f
+        .conn
+        .query_row("SELECT id FROM message WHERE spool_id = 'm-2'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    f.conn
+        .execute(
+            "UPDATE delivery SET notification = 'enqueued', notified_by = ?1
+              WHERE message_id = (SELECT id FROM message WHERE spool_id = 'm-1')",
+            [report_id],
+        )
+        .unwrap();
+
+    // Both settled and both far past the window.
+    settle(&mut f, 3_000);
+    assert_eq!(messages(&f), 2);
+
+    // The failure's record goes; the report it points at stays, because until
+    // that moment the report is what explains the failure's notification.
+    assert_eq!(queue::expire_metadata(&f.conn, 100, 9_000).unwrap(), 1);
+    let left: String = f
+        .conn
+        .query_row("SELECT spool_id FROM message", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, "m-2", "the report was collected before the failure");
+
+    // Once nothing points at it, it is collectable in its own right.
+    assert_eq!(queue::expire_metadata(&f.conn, 100, 9_000).unwrap(), 1);
+    assert_eq!(messages(&f), 0);
+}

@@ -74,6 +74,8 @@ pub struct DeliveryConfig<R: MxLookup> {
     pub lease_seconds: i64,
     /// How old a message may get before Pigeon gives up on it.
     pub horizon_seconds: i64,
+    /// How long a settled message's rows are kept after its body is released.
+    pub retain_seconds: i64,
     /// Identifies this process's claims: hostname plus a random boot value,
     /// never a PID, which is reused.
     pub worker: String,
@@ -95,6 +97,7 @@ impl Deliverer {
                 forwarding,
                 lease_seconds,
                 horizon_seconds,
+                retain_seconds,
                 worker,
                 ..
             } = config;
@@ -120,6 +123,7 @@ impl Deliverer {
                     now,
                     horizon_seconds,
                     lease_seconds,
+                    retain_seconds,
                 )
                 .await;
 
@@ -239,6 +243,7 @@ async fn housekeeping(
     now: i64,
     horizon: i64,
     lease: i64,
+    retain: i64,
 ) {
     let mut conn = queue.conn.lock().await;
 
@@ -280,6 +285,17 @@ async fn housekeeping(
             Ok(n) => tracing::info!(count = n, "swept spool files no message refers to"),
             Err(e) => tracing::warn!(error = %e, "cannot sweep the spool"),
         }
+    }
+
+    // Last, and on the settled: the record of a message outlives its body,
+    // because "what happened to this message?" is asked days later and the log
+    // alone is guesswork. Run after the release above so a message settled in
+    // this very pass starts its window from now rather than from the next one.
+    let conn = queue.conn.lock().await;
+    match queue::expire_metadata(&conn, retain, now) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "removed the records of settled messages"),
+        Err(e) => tracing::error!(error = %e, "cannot expire settled message records"),
     }
 }
 

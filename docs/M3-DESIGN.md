@@ -442,8 +442,17 @@ Three lifetimes, deliberately different:
   nothing is still owed a notification. Pigeon is a relay, not an archive — but
   a DSN quotes the original headers, so the body outlives the deliveries by as
   long as the reports take.
-- **The rows** outlive it, for a configurable window, because queue inspection
-  and post-incident debugging without them is guesswork.
+- **The rows** outlive it, for a fixed 30-day window, because queue inspection
+  and post-incident debugging without them is guesswork. The window is measured
+  from `body_deleted_at` — the moment Pigeon was finished with the message — so
+  it answers the question it is actually about: how long after that can the
+  outcome still be explained. Two things are kept regardless of age: anything
+  not actually settled (a delivery in flight, a report owed), and any message a
+  delivery still names as its `notified_by`, because collecting a DSN while the
+  failure it reported still points at it would leave "was the sender told?"
+  unanswerable. Configurability is deferred rather than declined, as with the
+  horizon; if it is exposed it must stay well clear of the horizon plus the time
+  a DSN takes to deliver.
 - **Orphaned spool files** — raw, intermediate or final, written before a crash
   that preceded a commit — are swept periodically: any spool file with no row
   referring to it and no install in progress is removed.

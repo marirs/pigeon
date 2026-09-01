@@ -184,7 +184,7 @@ mail that providers reject.**
 - [ ] bounce generation via the SRS return path
 - [ ] DSN generation
 - [ ] body deletion once all recipients are terminal
-- [ ] delivery metadata retention
+- [x] delivery metadata retention
 - [ ] duplicate suppression
 - [ ] loop detection at delivery, as a backstop for chains leaving and
       re-entering through systems Pigeon cannot see
