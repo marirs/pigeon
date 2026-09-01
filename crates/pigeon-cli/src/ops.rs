@@ -61,6 +61,7 @@ pub fn health(conn: &rusqlite::Connection, spool: Option<&Path>, json: bool) -> 
 
     if json {
         crate::json::ok(serde_json::json!({
+            "node": node_name(),
             "healthy": !unhealthy,
             "schema_version": schema,
             "domains": { "total": domains, "gated": gated },
@@ -75,6 +76,10 @@ pub fn health(conn: &rusqlite::Connection, spool: Option<&Path>, json: bool) -> 
         return Ok(verdict(unhealthy));
     }
 
+    // Named first, because the answer to "is this host working?" is only
+    // useful once you know which host answered. Two nodes serving the same
+    // domains produce identical output otherwise.
+    println!("Node       {}", node_name());
     println!("Schema     v{schema}");
     println!("Domains    {domains} ({gated} gated)");
     println!("Queue      {waiting} waiting, {frozen} frozen, {owed} reports owed");
@@ -99,6 +104,22 @@ pub fn health(conn: &rusqlite::Connection, spool: Option<&Path>, json: bool) -> 
         }
     }
     Ok(verdict(unhealthy))
+}
+
+/// This machine's name, as the operator would recognise it.
+///
+/// The system hostname rather than the configured mail hostname: two nodes
+/// share the mail hostname deliberately — that is what makes them
+/// interchangeable to a sender — so it cannot distinguish them, and
+/// distinguishing them is the whole reason this is printed.
+fn node_name() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 fn verdict(unhealthy: bool) -> u8 {

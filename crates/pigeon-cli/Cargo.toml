@@ -33,6 +33,8 @@ pigeon-dns = { workspace = true }
 pigeon-smtp = { workspace = true }
 # The queue's own semantics: freezing, retrying and what counts as due.
 pigeon-spool = { workspace = true }
+# The configuration checksum two nodes compare.
+sha2 = { workspace = true }
 
 # `statvfs`, for the free space `pigeon health` reports. Already in the graph
 # through every crate that touches the filesystem; named here because this one

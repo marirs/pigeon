@@ -335,13 +335,13 @@ A standard mail client authenticates on 587, sends as an allowed identity, recei
 
 ## Milestone 8 — Second node
 
-- [ ] configuration replication
-- [ ] per-node identity
-- [ ] shared-nothing queue behaviour
-- [ ] duplicate delivery safeguards
-- [ ] node health
-- [ ] failover documentation
-- [ ] rolling upgrade procedure
+- [x] configuration replication
+- [x] per-node identity
+- [x] shared-nothing queue behaviour
+- [x] duplicate delivery safeguards
+- [x] node health
+- [x] failover documentation
+- [x] rolling upgrade procedure
 
 Availability for a forwarder is a easier problem than for a mailbox host: there is no shared mutable state, and a sending server delivers to exactly one MX, so duplicates do not arise naturally. The only genuinely hard part is replicating read-mostly configuration.
 

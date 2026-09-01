@@ -94,6 +94,7 @@ mod check;
 mod import;
 mod ops;
 mod queue;
+mod replicate;
 mod srs;
 
 use std::path::PathBuf;
@@ -217,6 +218,11 @@ enum Command {
         #[command(subcommand)]
         verb: Option<QueueVerb>,
     },
+    /// Keep a second node saying the same thing.
+    Config {
+        #[command(subcommand)]
+        verb: Option<ConfigVerb>,
+    },
     /// Upstream relays this host can send through.
     Relay {
         #[command(subcommand)]
@@ -237,6 +243,17 @@ enum Command {
         #[command(subcommand)]
         verb: Option<SrsVerb>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigVerb {
+    /// Write the routing configuration out, for another node to import.
+    Export {
+        /// Where to write it. Standard output if omitted.
+        to: Option<PathBuf>,
+    },
+    /// One line to compare between nodes.
+    Checksum,
 }
 
 #[derive(Subcommand)]
@@ -800,6 +817,15 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
                 )
             }
         },
+        Command::Config { verb } => {
+            let conn = open_read(cli)?;
+            match verb {
+                None | Some(ConfigVerb::Checksum) => replicate::print_checksum(&conn, cli.json),
+                Some(ConfigVerb::Export { to }) => {
+                    replicate::export(&conn, to.as_deref(), cli.json)
+                }
+            }
+        }
         Command::Relay { verb } => match verb {
             None | Some(RelayVerb::List) => {
                 let conn = open_read(cli)?;
