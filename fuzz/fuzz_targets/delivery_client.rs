@@ -51,6 +51,10 @@ fuzz_target!(|replies: &[u8]| {
             "fuzz.test",
             &envelope,
             &[b"Subject: t\r\n\r\nbody\r\n"],
+            // No TLS: the fuzzer drives the plaintext conversation, and an
+            // upgrade would hand its input to rustls's parser rather than to
+            // the one under test.
+            None,
         )
         .await
         {
