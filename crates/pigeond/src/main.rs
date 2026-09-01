@@ -57,9 +57,6 @@ use tokio::sync::Semaphore;
 /// Where a receiving MTA listens. Overridden only by tests.
 const SUBMISSION_PORT: u16 = 25;
 
-/// How long to wait for a receiving server to answer its door.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Deliveries attempted at once.
 ///
 /// Inbound is capped too. Bounding one direction and not the other does not
