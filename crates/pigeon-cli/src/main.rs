@@ -90,6 +90,7 @@
 //! `--quiet` prints nothing on success and relies on the exit code, which is
 //! also stable — see `docs/CLI.md`.
 
+mod check;
 mod import;
 mod srs;
 
@@ -108,6 +109,10 @@ mod exit {
     pub const USAGE: u8 = 1;
     /// Database failure.
     pub const DATABASE: u8 = 4;
+    /// A check ran and the answer was no. Distinct from `USAGE` so a monitoring
+    /// system can tell "this domain cannot carry mail" from "you typed the
+    /// command wrong".
+    pub const FAILED: u8 = 3;
 
     pub fn code(n: u8) -> ExitCode {
         ExitCode::from(n)
@@ -217,6 +222,8 @@ enum DomainVerb {
     },
     /// Status, destination and alias count.
     Show { domain: String },
+    /// Compare this domain's published DNS with what this host needs.
+    Check { domain: String },
     /// Set where this domain's mail goes by default.
     Forward { domain: String, address: String },
     /// Allow this domain to receive mail.
@@ -229,6 +236,8 @@ enum DomainVerb {
 enum DomainsVerb {
     /// Every domain, with its status.
     List,
+    /// Check every domain's DNS at once.
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -532,6 +541,11 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         },
         Command::Domains { verb } => match verb {
             None | Some(DomainsVerb::List) => domains_list(cli),
+            Some(DomainsVerb::Check) => {
+                let conn = open_read(cli)?;
+                let config = config_for_checks(cli)?;
+                check::all(&conn, &config, cli.json)
+            }
         },
         Command::Alias { verb } => match verb {
             None => {
@@ -790,6 +804,12 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
                 }
             }
             Ok(exit::OK)
+        }
+
+        DomainVerb::Check { domain } => {
+            let conn = open_read(cli)?;
+            let config = config_for_checks(cli)?;
+            check::one(&conn, &config, domain, cli.json)
         }
 
         DomainVerb::Forward { domain, address } => {
@@ -1562,6 +1582,24 @@ fn srs_ring_path(cli: &Cli) -> anyhow::Result<PathBuf> {
              rotating the wrong path writes a ring the daemon will never load."
         ),
     }
+}
+
+/// The configuration the DNS checks need: this host's name, and nothing else.
+///
+/// `--config` is not required. The checks compare a domain's published records
+/// against this host's name, and an operator running the CLI beside the
+/// database has already told us that name — through the configuration file when
+/// there is one, and through `--hostname` when there is not. Refusing to check
+/// DNS without a full daemon configuration would make the most useful
+/// diagnostic the hardest one to run.
+fn config_for_checks(cli: &Cli) -> anyhow::Result<pigeon_config::Config> {
+    if let Some(p) = &cli.config {
+        return Ok(pigeon_config::Config::load(p)?);
+    }
+    anyhow::bail!(
+        "checking DNS needs to know this host's name, which is in the configuration file.\n\n  \
+         pigeon --config /etc/pigeon/pigeon.toml domain check <domain>"
+    )
 }
 
 fn keys_root(cli: &Cli) -> anyhow::Result<PathBuf> {

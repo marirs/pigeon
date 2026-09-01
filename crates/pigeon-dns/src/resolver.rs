@@ -128,6 +128,59 @@ impl SystemResolver {
         Self { inner }
     }
 
+    /// The names an address reverses to.
+    pub async fn lookup_ptr(&self, address: std::net::IpAddr) -> Result<Vec<String>, LookupError> {
+        let answer = self
+            .inner
+            .reverse_lookup(address)
+            .await
+            .map_err(|e| classify(e, &address.to_string()))?;
+
+        Ok(answer
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                hickory_resolver::proto::rr::RData::PTR(ptr) => Some(ptr.to_string()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Look up the `TXT` records for a name.
+    ///
+    /// Chunks are joined without a separator, which is what every consumer of
+    /// TXT does: a long record is published as several quoted strings and means
+    /// the concatenation, not the list.
+    pub async fn lookup_txt(&self, name: &str) -> Result<Vec<String>, LookupError> {
+        let fqdn = if name.ends_with('.') {
+            name.to_string()
+        } else {
+            format!("{name}.")
+        };
+
+        let answer = self
+            .inner
+            .txt_lookup(fqdn.as_str())
+            .await
+            .map_err(|e| classify(e, name))?;
+
+        // Filtered by rdata like the MX path, and for the same reason: the
+        // answer section carries whatever the resolver followed to get here.
+        Ok(answer
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                hickory_resolver::proto::rr::RData::TXT(txt) => Some(
+                    txt.txt_data
+                        .iter()
+                        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Look up the `A` and `AAAA` records for a name.
     ///
     /// Used by the blocklist check, where the *values* are the answer rather

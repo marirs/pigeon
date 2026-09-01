@@ -22,6 +22,7 @@
 pub mod dnsbl;
 pub mod mx;
 pub mod resolver;
+pub mod validate;
 
 pub use mx::{MxError, MxRecord, order_hosts};
 pub use resolver::{FakeResolver, LookupError, MxLookup, SystemResolver};

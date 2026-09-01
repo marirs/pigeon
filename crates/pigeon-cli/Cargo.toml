@@ -19,6 +19,11 @@ serde_json = { workspace = true }
 pigeon-config = { workspace = true }
 pigeon-db = { workspace = true }
 pigeon-auth = { workspace = true }
+
+# One current-thread runtime, for `domain check`: DNS resolution is async and
+# the rest of the CLI is not. Making the whole tool async for one command would
+# be paying for it to look like a daemon.
+tokio = { workspace = true, features = ["rt"] }
 # 32 bytes from the OS for a new SRS key. Already in the graph via `rsa`;
 # named here because this crate relies on it directly.
 getrandom = "0.3"
