@@ -265,6 +265,30 @@ impl SubmissionSink {
             return Err(DataError::Rejected);
         }
 
+        // The header the recipient actually sees. An application granted
+        // `alice@example.com` that submits with `From: ceo@example.com` has
+        // authenticated as itself and is sending as somebody else — the
+        // envelope check alone does not catch it, because DMARC and every
+        // human read the header.
+        //
+        // Compared on the whole address rather than the domain: a grant is per
+        // identity, and "anyone on the domain may claim any address on it" is
+        // exactly the property the per-address grant exists to deny.
+        if let Some(from) = header_from(&message.body) {
+            let permitted = {
+                let conn = self.queue.conn.lock().await;
+                pigeon_db::repo::may_send_as(&conn, principal.id, &from).unwrap_or(false)
+            };
+            if !permitted {
+                tracing::warn!(
+                    principal = %principal.name,
+                    %from,
+                    "refusing a submission: the From: header is not granted to this application"
+                );
+                return Err(DataError::Rejected);
+            }
+        }
+
         if !self.limits.allow(principal.id) {
             tracing::warn!(principal = %principal.name, "rate limiting a submission");
             return Err(DataError::Temporary);
@@ -400,9 +424,100 @@ impl SubmissionSink {
     }
 }
 
+/// The address in the `From:` header, if there is exactly one.
+///
+/// `None` when the header is absent or carries several addresses: absent is a
+/// malformed message that the receiving side will judge, and several is a form
+/// this project does not authorise at all — a grant names one identity, and
+/// there is no rule that says which of two `From:` addresses it would be
+/// checked against.
+fn header_from(body: &[u8]) -> Option<String> {
+    // Header block only: a line in the body that looks like a header is body.
+    let text = String::from_utf8_lossy(body);
+    let head = text.split("\r\n\r\n").next().unwrap_or(&text);
+
+    let mut value: Option<String> = None;
+    let mut lines = head.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(rest) = line
+            .strip_prefix("From:")
+            .or_else(|| line.strip_prefix("from:"))
+        else {
+            continue;
+        };
+        // Folded continuations belong to this header.
+        let mut folded = rest.trim().to_string();
+        while lines
+            .peek()
+            .is_some_and(|l| l.starts_with(' ') || l.starts_with('\t'))
+        {
+            folded.push(' ');
+            folded.push_str(lines.next().unwrap_or("").trim());
+        }
+        if value.is_some() {
+            // Two `From:` headers: receivers disagree about which one counts,
+            // so neither is authorised.
+            return None;
+        }
+        value = Some(folded);
+    }
+
+    let value = value?;
+    if value.contains(',') {
+        // A group or a list. No single identity to check a grant against.
+        return None;
+    }
+
+    // `Display Name <addr>` or a bare address.
+    let address = match (value.find('<'), value.find('>')) {
+        (Some(open), Some(close)) if close > open => value[open + 1..close].to_string(),
+        _ => value.trim().to_string(),
+    };
+
+    (!address.is_empty() && address.contains('@')).then_some(address)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_from_header_is_read_the_way_a_receiver_reads_it() {
+        assert_eq!(
+            header_from(b"From: alice@example.com\r\nSubject: hi\r\n\r\nbody"),
+            Some("alice@example.com".into())
+        );
+        assert_eq!(
+            header_from(b"From: Alice <alice@example.com>\r\n\r\nbody"),
+            Some("alice@example.com".into())
+        );
+        // Folded, which real clients do for long display names.
+        assert_eq!(
+            header_from(b"From: A Very Long Name\r\n <alice@example.com>\r\n\r\nbody"),
+            Some("alice@example.com".into())
+        );
+
+        // A line in the *body* that looks like a header is body.
+        assert_eq!(
+            header_from(b"Subject: hi\r\n\r\nFrom: ceo@example.com\r\n"),
+            None
+        );
+
+        // Two `From:` headers: receivers disagree about which counts, so
+        // neither is authorised.
+        assert_eq!(
+            header_from(b"From: a@example.com\r\nFrom: b@example.com\r\n\r\nbody"),
+            None
+        );
+
+        // A group or list has no single identity to check a grant against.
+        assert_eq!(
+            header_from(b"From: a@example.com, b@example.com\r\n\r\nbody"),
+            None
+        );
+
+        assert_eq!(header_from(b"Subject: hi\r\n\r\nbody"), None);
+    }
 
     #[test]
     fn a_bucket_refills_and_bursts() {

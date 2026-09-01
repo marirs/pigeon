@@ -313,13 +313,13 @@ Backup deserves specific attention. DKIM private keys are the only state that ca
 - [x] password hashing and constant-time comparison
 - [x] sender identity policy
 - [x] per-domain sender allowlist
-- [ ] envelope and header alignment checks
+- [x] envelope and header alignment checks
 - [x] DKIM signing
-- [ ] outbound SPF guidance
+- [x] outbound SPF guidance (`pigeon domain check` prints the record to publish)
 - [x] direct-to-MX delivery
-- [ ] upstream smarthost delivery
-- [ ] per-domain outbound mode
-- [ ] outbound queue and bounce processing
+- [x] upstream smarthost delivery
+- [x] per-domain outbound mode
+- [x] outbound queue and bounce processing
 - [x] per-principal and per-domain rate limits
 - [x] anti-open-relay integration suite — the unauthenticated half landed in
       Milestone 0; the authenticated half is `pigeon-smtp/tests/relay.rs`

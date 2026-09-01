@@ -1850,6 +1850,7 @@ async fn run() -> io::Result<()> {
         horizon_seconds: GIVE_UP_AFTER.as_secs() as i64,
         retain_seconds: RETAIN_RECORDS_FOR.as_secs() as i64,
         worker,
+        secrets: started.config.secrets_root().to_path_buf(),
     });
 
     // The metrics endpoint, when one is configured. Started before the
@@ -2307,6 +2308,7 @@ mod tests {
             horizon_seconds: 5 * 24 * 60 * 60,
             retain_seconds: RETAIN_RECORDS_FOR.as_secs() as i64,
             worker: "test-worker".into(),
+            secrets: dir.to_path_buf(),
         });
 
         (queue, deliverer)
@@ -3703,6 +3705,7 @@ mod tests {
             horizon_seconds: GIVE_UP_AFTER.as_secs() as i64,
             retain_seconds: RETAIN_RECORDS_FOR.as_secs() as i64,
             worker: "test-worker".into(),
+            secrets: dir.to_path_buf(),
         });
 
         // The same return-path check production installs (R-4): a sender whose

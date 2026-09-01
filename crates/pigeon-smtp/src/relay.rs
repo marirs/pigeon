@@ -21,6 +21,23 @@ use crate::session::Envelope;
 /// How long to wait for a TCP connection to one host.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// An upstream that takes this host's mail instead of the recipient's MX.
+///
+/// Configured per domain (`domain.delivery_mode = 'relay'`). Reasons an
+/// operator does this are all about deliverability rather than routing: a
+/// residential address whose port 25 is blocked, an IP with no reputation, a
+/// provider that requires outbound mail to leave through them.
+///
+/// The credential is resolved at delivery rather than held here, so a rotated
+/// secret takes effect on the next attempt rather than at the next restart.
+#[derive(Debug, Clone)]
+pub struct Smarthost {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
 /// Where forwarded mail is sent, and who we claim to be when sending it.
 ///
 /// Generic over the resolver so delivery can be driven by `FakeResolver` in
@@ -175,6 +192,91 @@ impl SelfIdentity {
 /// domain answers from the same mailbox database as the primary, so asking it
 /// about a recipient the primary just refused only wastes time and makes the
 /// sender look like it is probing.
+/// Deliver through a configured upstream rather than the recipient's MX.
+///
+/// No MX lookup, no loop detection against this host's own addresses, and no
+/// host list: the operator named exactly one place for this mail to go. What
+/// stays is the budget and the classification — a smarthost that refuses
+/// permanently is still a permanent failure, and one that is unreachable is
+/// still worth retrying.
+pub async fn forward_via<R: MxLookup>(
+    f: &Forwarding<R>,
+    smarthost: &Smarthost,
+    destination: &str,
+    return_path: &str,
+    message: &[u8],
+) -> Result<String, ForwardError> {
+    let deadline = Instant::now() + f.budget;
+
+    let outgoing = Envelope {
+        sender: return_path.to_string(),
+        recipients: vec![destination.to_string()],
+    };
+
+    let Some(remaining) = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+    else {
+        return Err(ForwardError::Transient(
+            "overall forward budget exhausted".into(),
+        ));
+    };
+
+    let connect = tokio::time::timeout(
+        CONNECT_TIMEOUT.min(remaining),
+        TcpStream::connect((smarthost.host.as_str(), smarthost.port)),
+    );
+
+    let stream = match connect.await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(ForwardError::Transient(format!("{}: {e}", smarthost.host)));
+        }
+        Err(_) => {
+            return Err(ForwardError::Transient(format!(
+                "{}: connect timed out",
+                smarthost.host
+            )));
+        }
+    };
+
+    let parts: [&[u8]; 1] = [message];
+    let login = match (&smarthost.username, &smarthost.password) {
+        (Some(u), Some(p)) => Some(crate::client::Login {
+            username: u,
+            password: p,
+        }),
+        _ => None,
+    };
+
+    let attempt = tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        crate::client::deliver_with_login(
+            stream,
+            &f.ehlo_name,
+            &outgoing,
+            &parts,
+            Some(crate::client::Tls {
+                config: Arc::clone(&f.tls),
+                server_name: smarthost.host.as_str(),
+            }),
+            login,
+        ),
+    );
+
+    match attempt.await {
+        Ok(Ok(accepted)) => Ok(accepted.message),
+        Ok(Err(e)) if e.is_permanent() => {
+            Err(ForwardError::Permanent(format!("{}: {e}", smarthost.host)))
+        }
+        Ok(Err(e)) => Err(ForwardError::Transient(format!("{}: {e}", smarthost.host))),
+        Err(_) => Err(ForwardError::Transient(format!(
+            "{}: forward budget exhausted",
+            smarthost.host
+        ))),
+    }
+}
+
 pub async fn forward<R: MxLookup>(
     f: &Forwarding<R>,
     rotation: u64,

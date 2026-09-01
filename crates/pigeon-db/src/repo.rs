@@ -839,3 +839,95 @@ pub fn may_send_as(conn: &Connection, principal_id: i64, address: &str) -> Resul
     )?;
     Ok(allowed > 0)
 }
+
+/// The upstream a domain's outbound mail goes through, if any.
+///
+/// Keyed on the *sender's* domain rather than the recipient's: a smarthost is
+/// configured because of where mail leaves from — a blocked port 25, an address
+/// with no reputation — and the recipient has no say in it.
+///
+/// The secret is a name resolved against the configured secrets root by the
+/// caller, never a path from the row: a hand-edited row that named
+/// `/etc/shadow` would otherwise be read and sent to an upstream.
+pub fn smarthost_for(conn: &Connection, domain: &str) -> Result<Option<Smarthost>, DbError> {
+    let row = conn
+        .query_row(
+            "SELECT r.host, r.port, r.username, r.secret_ref
+               FROM domain d JOIN relay r ON r.id = d.relay_id
+              WHERE d.name = ?1 AND d.delivery_mode = 'relay'",
+            [domain.to_ascii_lowercase()],
+            |r| {
+                Ok(Smarthost {
+                    host: r.get(0)?,
+                    port: r.get::<_, i64>(1)? as u16,
+                    username: r.get(2)?,
+                    secret_ref: r.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+#[derive(Debug, Clone)]
+pub struct Smarthost {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    /// A name, resolved against the secrets root. Never a path.
+    pub secret_ref: Option<String>,
+}
+
+/// Point a domain's outbound mail at a relay, or back at direct delivery.
+pub fn set_delivery_mode(
+    conn: &Connection,
+    domain: &str,
+    relay: Option<&str>,
+) -> Result<(), DbError> {
+    match relay {
+        Some(name) => {
+            let relay_id: i64 = conn
+                .query_row("SELECT id FROM relay WHERE name = ?1", [name], |r| r.get(0))
+                .optional()?
+                .ok_or_else(|| DbError::NoSuchRelay(name.to_string()))?;
+            conn.execute(
+                "UPDATE domain SET delivery_mode = 'relay', relay_id = ?1, updated_at = ?2
+                  WHERE name = ?3",
+                params![relay_id, now(), domain.to_ascii_lowercase()],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "UPDATE domain SET delivery_mode = 'direct', relay_id = NULL, updated_at = ?1
+                  WHERE name = ?2",
+                params![now(), domain.to_ascii_lowercase()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Record an upstream.
+pub fn add_relay(
+    conn: &Connection,
+    name: &str,
+    host: &str,
+    port: u16,
+    username: Option<&str>,
+    secret_ref: Option<&str>,
+) -> Result<i64, DbError> {
+    // A secret is a name and the schema says so; refusing here says why in the
+    // operator's terms rather than through a constraint error.
+    if let Some(reference) = secret_ref
+        && (reference.contains('/') || reference.contains(std::path::MAIN_SEPARATOR))
+    {
+        return Err(DbError::SecretRefIsNotAName(reference.to_string()));
+    }
+
+    conn.execute(
+        "INSERT INTO relay (name, host, port, username, secret_ref, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![name, host, port as i64, username, secret_ref, now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}

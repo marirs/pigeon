@@ -139,9 +139,24 @@ pub async fn deliver<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    deliver_with_login(stream, ehlo_name, envelope, parts, tls, None).await
+}
+
+/// [`deliver`], authenticating to a smarthost.
+pub async fn deliver_with_login<S>(
+    stream: S,
+    ehlo_name: &str,
+    envelope: &Envelope,
+    parts: &[&[u8]],
+    tls: Option<Tls<'_>>,
+    login: Option<Login<'_>>,
+) -> Result<Accepted, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     match tokio::time::timeout(
         TOTAL_DELIVERY_BUDGET,
-        deliver_inner(stream, ehlo_name, envelope, parts, tls),
+        deliver_inner(stream, ehlo_name, envelope, parts, tls, login),
     )
     .await
     {
@@ -156,6 +171,18 @@ where
 /// against a scripted peer wants. Production always passes one: a server that
 /// advertises `STARTTLS` and is then spoken to in the clear is a downgrade
 /// nobody asked for.
+/// Credentials for a smarthost that requires them.
+///
+/// Only ever sent over TLS: `deliver` refuses to authenticate on a connection
+/// it did not upgrade, because a password sent in the clear is a password given
+/// away — and unlike opportunistic encryption for ordinary delivery, a
+/// smarthost is a host the operator configured and can be expected to present
+/// a working certificate.
+pub struct Login<'a> {
+    pub username: &'a str,
+    pub password: &'a str,
+}
+
 pub struct Tls<'a> {
     pub config: std::sync::Arc<rustls::ClientConfig>,
     /// The host this connection was made to, for SNI. Not used to authenticate
@@ -170,6 +197,7 @@ async fn deliver_inner<S>(
     envelope: &Envelope,
     parts: &[&[u8]],
     tls: Option<Tls<'_>>,
+    login: Option<Login<'_>>,
 ) -> Result<Accepted, ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -222,10 +250,74 @@ where
         // the clear was told by whoever was in the middle.
         let mut io = BufReader::new(upgraded);
         greet(&mut io, ehlo_name).await?;
+
+        if let Some(login) = login {
+            authenticate(&mut io, &login).await?;
+        }
         return transact(io, envelope, parts).await;
     }
 
+    // Credentials never cross an unencrypted connection, whatever the peer
+    // advertises. A smarthost that cannot do TLS is a smarthost this refuses to
+    // log in to, and the delivery defers rather than leaking the password.
+    if login.is_some() {
+        return Err(ClientError::Transient {
+            code: 0,
+            message: "the smarthost offered no STARTTLS, so the credential was not sent".into(),
+        });
+    }
+
     transact(io, envelope, parts).await
+}
+
+/// Log in to a smarthost with `AUTH PLAIN`.
+///
+/// `PLAIN` only: this runs after a successful upgrade, so the channel is
+/// encrypted, and every smarthost that accepts credentials accepts this. A
+/// failure is transient — a smarthost that refuses a password is usually one
+/// whose credentials an operator has just changed, and bouncing the mail would
+/// destroy it over a configuration error.
+async fn authenticate<S>(io: &mut BufReader<S>, login: &Login<'_>) -> Result<(), ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let plain = format!("\0{}\0{}", login.username, login.password);
+    let (code, msg) = command(io, &format!("AUTH PLAIN {}\r\n", base64(plain.as_bytes()))).await?;
+
+    if code == 235 {
+        return Ok(());
+    }
+    Err(ClientError::Transient {
+        code,
+        message: format!("the smarthost refused the credential: {msg}"),
+    })
+}
+
+/// Standard base64, for the one place this client needs it.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Greet, and return the peer's capability lines.

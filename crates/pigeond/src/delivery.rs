@@ -79,6 +79,9 @@ pub struct DeliveryConfig<R: MxLookup> {
     /// Identifies this process's claims: hostname plus a random boot value,
     /// never a PID, which is reused.
     pub worker: String,
+    /// Where relay credentials are resolved from. A name in the database names
+    /// a file here and nowhere else.
+    pub secrets: std::path::PathBuf,
 }
 
 impl Deliverer {
@@ -99,6 +102,7 @@ impl Deliverer {
                 horizon_seconds,
                 retain_seconds,
                 worker,
+                secrets,
                 ..
             } = config;
             let forwarding = Arc::new(forwarding);
@@ -169,8 +173,9 @@ impl Deliverer {
                 let queue = queue.clone();
                 let spool = spool.clone();
                 let forwarding = Arc::clone(&forwarding);
+                let secrets = secrets.clone();
                 tokio::spawn(async move {
-                    attempt(&queue, &spool, &forwarding, &claim).await;
+                    attempt(&queue, &spool, &forwarding, &secrets, &claim).await;
                     drop(permit);
                 });
             }
@@ -299,15 +304,76 @@ async fn housekeeping(
     }
 }
 
+/// The upstream this message's *sender domain* is configured to use.
+///
+/// `None` means direct-to-MX, which is the default and the case for every
+/// forwarded message. A relay whose secret cannot be read is also `None`, with
+/// a loud log line: falling back to direct delivery is what a forwarder without
+/// a smarthost does anyway, and refusing to deliver at all because a file is
+/// unreadable would turn a permissions mistake into stalled mail.
+async fn smarthost_for(
+    queue: &Queue,
+    secrets: &std::path::Path,
+    claim: &Claim,
+) -> Option<pigeon_smtp::relay::Smarthost> {
+    let sender_domain = claim
+        .return_path
+        .rsplit_once('@')
+        .map(|(_, d)| d.to_string())?;
+
+    let configured = {
+        let conn = queue.conn.lock().await;
+        pigeon_db::repo::smarthost_for(&conn, &sender_domain)
+            .ok()
+            .flatten()?
+    };
+
+    // The secret is a *name*, resolved against the configured root and required
+    // to stay inside it: a hand-edited row naming `../../etc/shadow` would
+    // otherwise be read and sent to an upstream.
+    let password = match &configured.secret_ref {
+        Some(name) => {
+            if name.contains('/') || name.contains("..") {
+                tracing::error!(%name, "refusing a relay secret that is a path rather than a name");
+                return None;
+            }
+            match std::fs::read_to_string(secrets.join(name)) {
+                Ok(secret) => Some(secret.trim().to_string()),
+                Err(e) => {
+                    tracing::error!(
+                        %name, error = %e,
+                        "cannot read the relay secret; delivering directly instead"
+                    );
+                    return None;
+                }
+            }
+        }
+        None => None,
+    };
+
+    Some(pigeon_smtp::relay::Smarthost {
+        host: configured.host,
+        port: configured.port,
+        username: configured.username,
+        password,
+    })
+}
+
 /// One attempt: read, transmit, record.
 async fn attempt<R: MxLookup>(
     queue: &Queue,
     spool: &pigeon_spool::Spool,
     forwarding: &Forwarding<R>,
+    secrets: &std::path::Path,
     claim: &Claim,
 ) {
+    // Resolved per attempt rather than held from startup, so a smarthost an
+    // operator adds — or a credential they rotate — takes effect on the next
+    // try rather than the next restart.
+    let smarthost = smarthost_for(queue, secrets, claim).await;
+
     let outcome = match spool.read(&claim.spool_id).await {
-        Ok(bytes) => transmit(forwarding, claim, &bytes).await,
+        Ok(bytes) => transmit(forwarding, smarthost.as_ref(), claim, &bytes).await,
 
         // A body that cannot be read is a *local* integrity failure, and it is
         // reported as one. Recording it as a remote rejection would tell the
@@ -357,20 +423,39 @@ async fn attempt<R: MxLookup>(
 
 async fn transmit<R: MxLookup>(
     forwarding: &Forwarding<R>,
+    smarthost: Option<&pigeon_smtp::relay::Smarthost>,
     claim: &Claim,
     message: &[u8],
 ) -> Outcome {
     // The return path stored at acceptance, never recomputed, and the
     // destination this claim is for.
-    match forward(
-        forwarding,
-        claim.attempts as u64,
-        &claim.destination,
-        &claim.return_path,
-        message,
-    )
-    .await
-    {
+    let attempt = match smarthost {
+        // Configured for the *sender's* domain: an operator points mail at an
+        // upstream because of where it leaves from — a blocked port 25, an
+        // address with no reputation — and the recipient has no say in it.
+        Some(upstream) => {
+            pigeon_smtp::relay::forward_via(
+                forwarding,
+                upstream,
+                &claim.destination,
+                &claim.return_path,
+                message,
+            )
+            .await
+        }
+        None => {
+            forward(
+                forwarding,
+                claim.attempts as u64,
+                &claim.destination,
+                &claim.return_path,
+                message,
+            )
+            .await
+        }
+    };
+
+    match attempt {
         Ok(remote) => Outcome::Delivered {
             code: 250,
             response: remote,

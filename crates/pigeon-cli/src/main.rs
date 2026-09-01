@@ -203,6 +203,11 @@ enum Command {
         #[command(subcommand)]
         verb: Option<QueueVerb>,
     },
+    /// Upstream relays this host can send through.
+    Relay {
+        #[command(subcommand)]
+        verb: Option<RelayVerb>,
+    },
     /// Applications allowed to send mail through this host.
     Auth {
         #[command(subcommand)]
@@ -218,6 +223,27 @@ enum Command {
         #[command(subcommand)]
         verb: Option<SrsVerb>,
     },
+}
+
+#[derive(Subcommand)]
+enum RelayVerb {
+    /// Record an upstream.
+    Add {
+        name: String,
+        host: String,
+        #[arg(long, default_value_t = 587)]
+        port: u16,
+        #[arg(long)]
+        username: Option<String>,
+        /// The *name* of a file in the secrets directory holding the password.
+        ///
+        /// A name and not a path: a row that could name any readable file would
+        /// let a hand edit send `/etc/shadow` to an upstream.
+        #[arg(long)]
+        secret: Option<String>,
+    },
+    /// Every relay this host knows.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -337,6 +363,16 @@ enum DomainVerb {
     Ed25519 { domain: String },
     /// Set where this domain's mail goes by default.
     Forward { domain: String, address: String },
+    /// Send this domain's outbound mail through an upstream relay.
+    ///
+    /// Configured on the *sending* domain: a smarthost is chosen because of
+    /// where mail leaves from — a blocked port 25, an address with no
+    /// reputation — and the recipient has no say in it.
+    Relay {
+        domain: String,
+        /// A relay added with `pigeon relay add`, or `direct` to stop using one.
+        via: String,
+    },
     /// Allow this domain to receive mail.
     Enable { domain: String },
     /// Stop this domain receiving mail.
@@ -749,6 +785,62 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
                 )
             }
         },
+        Command::Relay { verb } => match verb {
+            None | Some(RelayVerb::List) => {
+                let conn = open_read(cli)?;
+                let mut stmt =
+                    conn.prepare("SELECT name, host, port, username FROM relay ORDER BY name")?;
+                let rows: Vec<(String, String, i64, Option<String>)> = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<Result<_, _>>()?;
+
+                if cli.json {
+                    json::ok(serde_json::json!({
+                        "relays": rows.iter().map(|(name, host, port, user)| serde_json::json!({
+                            "name": name, "host": host, "port": port, "username": user,
+                        })).collect::<Vec<_>>(),
+                    }));
+                } else if rows.is_empty() {
+                    println!(
+                        "No relays.\n  pigeon relay add upstream smtp.provider.example --username you --secret upstream.pw"
+                    );
+                } else {
+                    for (name, host, port, user) in &rows {
+                        println!(
+                            "{name}\n  {host}:{port}{}",
+                            user.as_ref()
+                                .map(|u| format!("  as {u}"))
+                                .unwrap_or_default()
+                        );
+                    }
+                }
+                Ok(exit::OK)
+            }
+            Some(RelayVerb::Add {
+                name,
+                host,
+                port,
+                username,
+                secret,
+            }) => {
+                let conn = open_write(cli)?;
+                repo::add_relay(
+                    &conn,
+                    name,
+                    host,
+                    *port,
+                    username.as_deref(),
+                    secret.as_deref(),
+                )?;
+                if cli.json {
+                    json::ok(serde_json::json!({ "relay": name, "host": host, "port": port }));
+                } else {
+                    println!("Added {name} ({host}:{port}).\n");
+                    println!("Point a domain at it:\n  pigeon domain relay example.com {name}");
+                }
+                Ok(exit::OK)
+            }
+        },
         Command::Auth { verb } => match verb {
             None => {
                 print_help("auth");
@@ -992,6 +1084,26 @@ fn domain(cli: &Cli, verb: &DomainVerb) -> anyhow::Result<u8> {
                          pigeon domain enable {}",
                         d.name
                     );
+                }
+            }
+            Ok(exit::OK)
+        }
+
+        DomainVerb::Relay { domain, via } => {
+            let conn = open_write(cli)?;
+            let relay = (via != "direct").then_some(via.as_str());
+            repo::set_delivery_mode(&conn, domain, relay)?;
+
+            if cli.json {
+                json::ok(serde_json::json!({
+                    "domain": domain,
+                    "delivery_mode": if relay.is_some() { "relay" } else { "direct" },
+                    "relay": relay,
+                }));
+            } else {
+                match relay {
+                    Some(name) => println!("{domain} now sends through {name}."),
+                    None => println!("{domain} now delivers directly to each recipient's MX."),
                 }
             }
             Ok(exit::OK)

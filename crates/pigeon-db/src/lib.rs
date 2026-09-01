@@ -102,6 +102,15 @@ pub enum DbError {
     #[error("no application named {0}")]
     NoSuchPrincipal(String),
 
+    #[error("no relay named {0}")]
+    NoSuchRelay(String),
+
+    #[error(
+        "the relay secret {0:?} looks like a path. It is a name, resolved against \
+         the configured secrets directory."
+    )]
+    SecretRefIsNotAName(String),
+
     #[error("domain {0} already exists")]
     DomainExists(String),
 
