@@ -61,6 +61,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "routing-revision",
         sql: include_bytes!("../migrations/0005_routing_revision.sql"),
     },
+    Migration {
+        version: 6,
+        name: "greylist",
+        sql: include_bytes!("../migrations/0006_greylist.sql"),
+    },
 ];
 
 /// What a run did.
@@ -402,6 +407,7 @@ mod tests {
                 "destination",
                 "dkim_key",
                 "domain",
+                "greylist",
                 "message",
                 "original_recipient",
                 "principal",
@@ -452,6 +458,9 @@ mod tests {
                 "domain_by_default_dest",
                 "domain_by_notify_dest",
                 "domain_by_relay",
+                // Greylist retention scans by age; everything else reads it by
+                // key.
+                "greylist_by_last_seen",
                 "principal_grant_by_domain",
                 "principal_grant_domain_wide",
                 "principal_grant_identity",

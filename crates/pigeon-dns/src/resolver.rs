@@ -104,6 +104,52 @@ impl SystemResolver {
     }
 }
 
+impl SystemResolver {
+    /// A resolver with no name servers, which therefore answers nothing.
+    ///
+    /// For deterministic tests. `from_system` reads `/etc/resolv.conf`, which
+    /// makes what a lookup returns a property of the machine the test runs on —
+    /// and two verification tests in this repository have already failed for
+    /// exactly that reason. Every lookup through this one fails in the resolver
+    /// without a packet leaving the process, which is the "could not tell"
+    /// answer the blocklist path is built to handle.
+    ///
+    /// Production keeps `from_system` and keeps failing when it cannot be
+    /// built: a daemon resolving through a resolver that answers nothing would
+    /// defer every delivery.
+    pub fn offline() -> Self {
+        use hickory_resolver::config::ResolverConfig;
+        let inner = hickory_resolver::Resolver::builder_with_config(
+            ResolverConfig::default(),
+            hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+        )
+        .build()
+        .expect("a resolver with no name servers always builds");
+        Self { inner }
+    }
+
+    /// Look up the `A` and `AAAA` records for a name.
+    ///
+    /// Used by the blocklist check, where the *values* are the answer rather
+    /// than somewhere to connect: a list encodes why an address is listed in
+    /// the address it returns.
+    pub async fn lookup_a(&self, name: &str) -> Result<Vec<std::net::IpAddr>, LookupError> {
+        let fqdn = if name.ends_with('.') {
+            name.to_string()
+        } else {
+            format!("{name}.")
+        };
+
+        let answer = self
+            .inner
+            .lookup_ip(fqdn.as_str())
+            .await
+            .map_err(|e| classify(e, name))?;
+
+        Ok(answer.iter().collect())
+    }
+}
+
 impl MxLookup for SystemResolver {
     async fn lookup_mx(&self, domain: &str) -> Result<Vec<MxRecord>, LookupError> {
         // A trailing dot makes the query absolute, so the resolver's search

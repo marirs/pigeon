@@ -32,6 +32,7 @@
 
 pub mod accept;
 pub mod dsn;
+pub mod greylist;
 pub mod queue;
 pub mod report;
 pub mod store;

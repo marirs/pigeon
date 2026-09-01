@@ -42,9 +42,14 @@ impl LocalOnly {
 impl MessageSink for LocalOnly {
     type Transaction = ();
 
-    fn begin(&self) {}
+    fn begin(&self, _peer: std::net::SocketAddr, _sender: &str) {}
 
-    fn accepts_recipient(&self, _txn: &mut (), address: &str, _accepted: &[String]) -> Recipient {
+    async fn accepts_recipient(
+        &self,
+        _txn: &mut (),
+        address: &str,
+        _accepted: &[String],
+    ) -> Recipient {
         let carried = match address.rsplit_once('@') {
             Some((_, domain)) => self.domains.iter().any(|d| d.eq_ignore_ascii_case(domain)),
             None => false,
@@ -527,5 +532,96 @@ async fn a_session_that_will_not_end_does_not_hold_shutdown_open() {
         sink.count(),
         0,
         "nothing was accepted from the idle session"
+    );
+}
+
+// ------------------------------------------------------------ abuse controls
+
+#[tokio::test]
+async fn one_address_cannot_take_every_connection_slot() {
+    // The global cap alone is a denial of service waiting to happen: one host
+    // opening every slot and holding them takes the server away from everyone
+    // else, and it does not have to send a byte to do it.
+    let sink = LocalOnly::new(&["example.net"]);
+    let addr = start(
+        sink,
+        ServerConfig {
+            max_per_address: 2,
+            ..config()
+        },
+    )
+    .await;
+
+    // Two are served.
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut c = RawClient::connect(addr).await.unwrap();
+        assert_eq!(c.read_reply().await.unwrap().0, 220);
+        held.push(c);
+    }
+
+    // The third is refused rather than queued: a queue would let one address
+    // occupy the accept path indefinitely.
+    let mut third = RawClient::connect(addr).await.unwrap();
+    assert_eq!(
+        third.read_reply().await.unwrap().0,
+        421,
+        "a third connection from one address was served"
+    );
+
+    // And the slot comes back when a connection ends, however it ends — here
+    // by hanging up without a QUIT.
+    held.pop();
+    let mut replacement = None;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut c = RawClient::connect(addr).await.unwrap();
+        if c.read_reply().await.unwrap().0 == 220 {
+            replacement = Some(c);
+            break;
+        }
+    }
+    assert!(
+        replacement.is_some(),
+        "the slot was never released after the connection ended"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_cannot_send_commands_for_ever() {
+    // The error budget catches garbage and the refusal budget catches an
+    // address-list walk. Neither catches valid commands: RSET and NOOP reset or
+    // never touch those counters, so a connection can be kept busy indefinitely
+    // for free. The session lifetime bounds the clock; this bounds the work.
+    let sink = LocalOnly::new(&["example.net"]);
+    let addr = start(sink, config()).await;
+
+    let mut c = RawClient::connect(addr).await.unwrap();
+    c.read_reply().await.unwrap();
+    c.send(b"EHLO sender.test\r\n").await.unwrap();
+    c.read_reply().await.unwrap();
+
+    let mut ended = None;
+    for _ in 0..pigeon_smtp::session::MAX_COMMANDS + 10 {
+        if c.send(b"NOOP\r\n").await.is_err() {
+            ended = Some(0);
+            break;
+        }
+        match c.read_reply().await {
+            Some((code, _)) if code == 421 => {
+                ended = Some(code);
+                break;
+            }
+            Some(_) => {}
+            None => {
+                ended = Some(0);
+                break;
+            }
+        }
+    }
+
+    assert!(
+        ended.is_some(),
+        "a connection sent more than the command cap and was still being served"
     );
 }

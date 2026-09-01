@@ -95,6 +95,41 @@ pub struct Config {
 
     #[serde(default)]
     pub alerts: Alerts,
+
+    #[serde(default)]
+    pub abuse: Abuse,
+}
+
+/// Reputation controls: what is refused during the conversation.
+///
+/// Everything here refuses at `RCPT` or earlier, never after acceptance.
+/// Accepting a message and then discarding it is silent loss, and refusing it
+/// while the sender is still connected leaves the report where it belongs —
+/// with the system that has a copy.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Abuse {
+    /// DNS blocklist zones, consulted at connect time in order.
+    ///
+    /// Empty means no blocklist, which is the default: a list is an opinion
+    /// held by somebody else about who may send mail here, and enabling one
+    /// silently would be adopting that opinion on the operator's behalf.
+    #[serde(default)]
+    pub blocklists: Vec<String>,
+
+    /// Addresses never refused by a blocklist or greylisted.
+    ///
+    /// A relay, a backup MX, or the operator's own machine: hosts whose mail is
+    /// wanted whatever a list says about them.
+    #[serde(default)]
+    pub trusted: Vec<std::net::IpAddr>,
+
+    /// Delay before a first-time sender's mail is accepted, in seconds.
+    ///
+    /// Zero disables greylisting. See `pigeon-spool`'s greylist module for what
+    /// the delay is measured between and why it is not a per-message delay.
+    #[serde(default)]
+    pub greylist_seconds: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

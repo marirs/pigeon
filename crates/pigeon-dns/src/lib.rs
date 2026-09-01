@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dnsbl;
 pub mod mx;
 pub mod resolver;
 

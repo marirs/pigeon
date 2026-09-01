@@ -433,6 +433,7 @@ mod tests {
             srs_secret_file: tmp.file("srs.key", 0o600),
             smtp: crate::Smtp::default(),
             alerts: crate::Alerts::default(),
+            abuse: crate::Abuse::default(),
         }
     }
 

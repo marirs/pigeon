@@ -42,7 +42,24 @@ pub trait MessageSink: Clone + Send + Sync + 'static {
     ///
     /// At `MAIL FROM` rather than at the first `RCPT TO`: earlier is safe,
     /// later is not, and this is the point at which the transaction exists.
-    fn begin(&self) -> Self::Transaction;
+    ///
+    /// The peer and the accepted sender are handed over because a recipient
+    /// decision can depend on both — greylisting is keyed on the pair together
+    /// with the recipient — and re-deriving them at `RCPT` would mean two
+    /// sources for one fact.
+    fn begin(&self, peer: SocketAddr, sender: &str) -> Self::Transaction;
+
+    /// Whether to serve this peer at all.
+    ///
+    /// Called once, before the banner. This is where a blocklist decision
+    /// belongs: refusing here costs the sender one connection and this server
+    /// one lookup, while refusing later has already paid for a conversation.
+    ///
+    /// The default serves everyone, so a sink with no opinion says nothing.
+    fn accepts_connection(&self, peer: SocketAddr) -> impl Future<Output = Connection> + Send {
+        let _ = peer;
+        async { Connection::Accept }
+    }
 
     /// Whether this address should be accepted at `RCPT TO`, and what
     /// accepting it means.
@@ -57,12 +74,15 @@ pub trait MessageSink: Clone + Send + Sync + 'static {
     /// address goes later would be routing twice, and the second answer can
     /// differ from the first. What is decided here is recorded here, and
     /// `deliver` consumes it.
+    /// Asynchronous because a decision may need durable state: greylisting
+    /// remembers that this triplet has been seen, and remembering it is a
+    /// write.
     fn accepts_recipient(
         &self,
         transaction: &mut Self::Transaction,
         address: &str,
         accepted: &[String],
-    ) -> Recipient;
+    ) -> impl Future<Output = Recipient> + Send;
 
     /// Take a complete message. The returned id appears in the `250`.
     ///
@@ -73,6 +93,17 @@ pub trait MessageSink: Clone + Send + Sync + 'static {
         transaction: Self::Transaction,
         message: Message,
     ) -> impl Future<Output = Result<String, DataError>> + Send;
+}
+
+/// Whether a peer is served at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Connection {
+    Accept,
+    /// Refused before the banner. The reason is sent to the peer, so it says
+    /// what was decided without saying what would change the decision — reply
+    /// text is attacker-visible, and a blocklist name is a hint about how to
+    /// get around it.
+    Refuse(String),
 }
 
 /// What to do with a recipient.
@@ -210,6 +241,20 @@ pub struct ServerConfig {
     /// Connections served at once. Beyond this, accepts wait rather than being
     /// refused, so a burst queues instead of bouncing.
     pub max_connections: usize,
+    /// Connections served at once **from one address**.
+    ///
+    /// The global cap alone is a denial-of-service waiting to happen: one host
+    /// opening 256 connections and holding them takes the server away from
+    /// everyone else, and it does not have to send a single byte to do it.
+    ///
+    /// Refused rather than queued, unlike the global cap. A queue would let one
+    /// address occupy the accept path indefinitely, and a peer that is already
+    /// running several conversations here is being asked to use them rather
+    /// than being turned away for good — which is why the refusal is `421`.
+    ///
+    /// Generous enough for a legitimate sender with a burst: providers open
+    /// several connections in parallel to the same MX routinely.
+    pub max_per_address: usize,
     /// Longest a single connection may live, however busy it is.
     ///
     /// The per-command timeout resets on every command, so a client sending
@@ -248,6 +293,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("command_timeout", &self.command_timeout)
             .field("data_timeout", &self.data_timeout)
             .field("max_connections", &self.max_connections)
+            .field("max_per_address", &self.max_per_address)
             .field("max_session", &self.max_session)
             .field("tls", &self.tls.is_some())
             .field("return_path", &self.return_path.is_some())
@@ -266,6 +312,7 @@ impl Default for ServerConfig {
             command_timeout: Duration::from_secs(300),
             data_timeout: Duration::from_secs(600),
             max_connections: 256,
+            max_per_address: 20,
             max_session: Duration::from_secs(3600),
             tls: None,
             return_path: None,
@@ -313,6 +360,7 @@ pub async fn serve_with_shutdown<S: MessageSink>(
     let config = Arc::new(config);
     let max = config.max_connections;
     let limit = Arc::new(Semaphore::new(max));
+    let addresses = PerAddress::default();
     let mut shutdown = std::pin::pin!(shutdown);
 
     loop {
@@ -339,11 +387,23 @@ pub async fn serve_with_shutdown<S: MessageSink>(
             Err(_) => break, // semaphore closed: shutting down
         };
 
+        // Per address, and taken *after* the global permit so the two caps
+        // compose rather than racing: a refusal here releases the global permit
+        // immediately by dropping it at the end of the block.
+        let Some(per_address) = addresses.take(peer.ip(), config.max_per_address) else {
+            tracing::debug!(%peer, "refusing a connection: too many from this address");
+            let mut stream = Stream::Plain(stream);
+            let _ = write_reply(&mut stream, &reply::too_many_connections()).await;
+            let _ = stream.shutdown().await;
+            continue;
+        };
+
         let config = Arc::clone(&config);
         let sink = sink.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
+            let _per_address = per_address;
             if let Err(e) = handle(stream, peer, config, sink).await {
                 tracing::debug!(%peer, error = %e, "connection ended");
             }
@@ -372,6 +432,64 @@ pub async fn serve_with_shutdown<S: MessageSink>(
     }
 
     Ok(())
+}
+
+/// How many connections each address currently has.
+///
+/// A map rather than a semaphore per address, because addresses come and go:
+/// what has to be bounded is the count, and an entry that reaches zero is
+/// removed so a scan of the internet cannot make this grow without limit.
+#[derive(Clone, Default)]
+struct PerAddress(Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>);
+
+impl PerAddress {
+    /// Claim a slot for `address`, or `None` if it already has `max`.
+    ///
+    /// The returned guard is the whole point: a counter incremented here and
+    /// decremented "somewhere in the handler" leaks on every early return, and
+    /// the handler has several.
+    fn take(&self, address: std::net::IpAddr, max: usize) -> Option<AddressSlot> {
+        let mut map = match self.0.lock() {
+            Ok(m) => m,
+            // A poisoned lock means a handler panicked while holding it. The
+            // count is unreliable either way, and refusing to proceed would
+            // turn one panic into a listener that answers nobody.
+            Err(e) => e.into_inner(),
+        };
+
+        let n = map.entry(address).or_insert(0);
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(AddressSlot {
+            addresses: self.clone(),
+            address,
+        })
+    }
+}
+
+/// Releases one address's slot when the connection ends, however it ends.
+struct AddressSlot {
+    addresses: PerAddress,
+    address: std::net::IpAddr,
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        let mut map = match self.addresses.0.lock() {
+            Ok(m) => m,
+            Err(e) => e.into_inner(),
+        };
+        if let Some(n) = map.get_mut(&self.address) {
+            *n -= 1;
+            // Removed at zero, so an address that has finished with this server
+            // stops costing it memory.
+            if *n == 0 {
+                map.remove(&self.address);
+            }
+        }
+    }
 }
 
 /// The connection, before and after a `STARTTLS` upgrade.
@@ -497,6 +615,16 @@ async fn handle<S: MessageSink>(
     let started = Instant::now();
 
     tracing::debug!(%peer, "connection opened");
+
+    // Before the banner. A peer refused here is told once and hung up on; a
+    // peer refused later has already been given a conversation to spend.
+    if let Connection::Refuse(reason) = sink.accepts_connection(peer).await {
+        tracing::info!(%peer, %reason, "refusing a connection");
+        let _ = write_reply(&mut stream, &reply::service_refused(&reason)).await;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+
     write_reply(&mut stream, &session.greeting()).await?;
 
     loop {
@@ -566,7 +694,16 @@ async fn handle<S: MessageSink>(
         loop {
             match lines.take_line(&mut line) {
                 Ok(true) => {
-                    match step(&mut transaction, &mut stream, &mut session, &sink, &line).await? {
+                    match step(
+                        &mut transaction,
+                        &mut stream,
+                        &mut session,
+                        &sink,
+                        peer,
+                        &line,
+                    )
+                    .await?
+                    {
                         Step::Continue => {}
                         Step::Close => return Ok(()),
                         Step::StartTls(reply) => {
@@ -680,6 +817,7 @@ async fn step<S: MessageSink>(
     stream: &mut Stream,
     session: &mut Session,
     sink: &S,
+    peer: SocketAddr,
     line: &[u8],
 ) -> io::Result<Step> {
     let cmd = match command::parse(line) {
@@ -710,7 +848,10 @@ async fn step<S: MessageSink>(
         && pigeon_types::Address::parse(path).is_ok()
     {
         let decision = match transaction.as_mut() {
-            Some(txn) => sink.accepts_recipient(txn, path, &session.envelope().recipients),
+            Some(txn) => {
+                sink.accepts_recipient(txn, path, &session.envelope().recipients)
+                    .await
+            }
             // No transaction means no `MAIL FROM`, which the sequence check
             // above has already excluded.
             None => Recipient::Reject,
@@ -753,7 +894,9 @@ async fn step<S: MessageSink>(
     }
 
     match session.state() {
-        State::Mail if starts_transaction => *transaction = Some(sink.begin()),
+        State::Mail if starts_transaction => {
+            *transaction = Some(sink.begin(peer, &session.envelope().sender))
+        }
         State::Mail | State::Rcpt | State::Data => {}
         // Anything else means there is no transaction in progress: `RSET`,
         // a fresh `EHLO`, or a closed session.

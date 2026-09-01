@@ -229,13 +229,13 @@ that.
 
 ## Milestone 4 — Abuse and reputation controls
 
-- [ ] DNSBL checks at connect time
-- [ ] greylisting
+- [x] DNSBL checks at connect time
+- [x] greylisting
 - [ ] content filtering via an external scanner
-- [ ] connections per IP
-- [ ] commands per connection
-- [ ] recipients per message
-- [ ] concurrent connection limits
+- [x] connections per IP
+- [x] commands per connection
+- [x] recipients per message
+- [x] concurrent connection limits
 
 This milestone protects the sending reputation of the host. Forwarding unfiltered spam into a major provider is attributed to the forwarder, not the original sender, and is the fastest route to a blocklisted IP.
 

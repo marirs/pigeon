@@ -754,6 +754,31 @@ struct SpoolSink {
     counter: Arc<AtomicU64>,
     /// Distinguishes identifiers from different runs of the process.
     boot: u32,
+    /// What is refused during the conversation, and to whom it does not apply.
+    abuse: Arc<Abuse>,
+}
+
+/// The reputation controls, resolved once.
+///
+/// Held by the sink rather than read from configuration per connection: these
+/// are consulted on every connection and every recipient, and re-reading a file
+/// there would put an I/O error on the acceptance path.
+struct Abuse {
+    /// Blocklist zones, in the order they are consulted.
+    blocklists: Vec<String>,
+    /// Addresses no control applies to.
+    trusted: std::collections::HashSet<std::net::IpAddr>,
+    /// Zero disables greylisting.
+    greylist_seconds: i64,
+    /// The resolver the blocklists are asked through. The same one delivery
+    /// uses: one DNS stack, one set of answers.
+    resolver: Arc<SystemResolver>,
+}
+
+impl Abuse {
+    fn trusts(&self, peer: std::net::IpAddr) -> bool {
+        self.trusted.contains(&peer.to_canonical())
+    }
 }
 
 /// The message as it arrived, minus the routing that decides what happens to
@@ -837,15 +862,60 @@ async fn authenticate(
 struct Transaction {
     runtime: Arc<Runtime>,
     plan: routing::Plan,
+    /// The client's address, normalised, and the sender it gave. Both are part
+    /// of the greylist key, and both are fixed for the transaction.
+    peer: std::net::IpAddr,
+    sender: String,
 }
 
 impl MessageSink for SpoolSink {
     type Transaction = Transaction;
 
-    fn begin(&self) -> Self::Transaction {
+    fn begin(&self, peer: std::net::SocketAddr, sender: &str) -> Self::Transaction {
         Transaction {
             runtime: self.auth.runtime.pin(),
             plan: routing::Plan::default(),
+            peer: peer.ip().to_canonical(),
+            sender: sender.to_string(),
+        }
+    }
+
+    /// Consult the blocklists, before the banner.
+    ///
+    /// A listing refuses the connection outright: forwarding what a blocklist
+    /// refuses is how a forwarder's own address ends up on one, because the
+    /// receiving provider attributes it to the machine that relayed it rather
+    /// than to whoever wrote it.
+    ///
+    /// Everything else serves the peer. A list that cannot be reached has said
+    /// nothing, and treating silence as a listing would turn somebody else's
+    /// DNS outage into a total mail outage here.
+    async fn accepts_connection(&self, peer: std::net::SocketAddr) -> pigeon_smtp::Connection {
+        use pigeon_dns::dnsbl::Listing;
+
+        if self.abuse.blocklists.is_empty() || self.abuse.trusts(peer.ip()) {
+            return pigeon_smtp::Connection::Accept;
+        }
+
+        match pigeon_dns::dnsbl::check(
+            self.abuse.resolver.as_ref(),
+            peer.ip(),
+            &self.abuse.blocklists,
+        )
+        .await
+        {
+            Listing::Listed { zone, codes } => {
+                tracing::info!(%peer, %zone, ?codes, "refusing a listed address");
+                // The zone is logged and not sent: reply text is
+                // attacker-visible, and naming the list is a hint about which
+                // delisting form to fill in to come back.
+                pigeon_smtp::Connection::Refuse("your address is listed".into())
+            }
+            Listing::NotListed => pigeon_smtp::Connection::Accept,
+            Listing::Unknown { reason } => {
+                tracing::warn!(%peer, %reason, "no blocklist could answer; serving the connection");
+                pigeon_smtp::Connection::Accept
+            }
         }
     }
 
@@ -856,7 +926,7 @@ impl MessageSink for SpoolSink {
     /// domain is carried, whether it is accepting, whether a rule matches, and
     /// where the address resolves to. After the `250` the only remaining answer
     /// is a bounce Pigeon has to generate itself.
-    fn accepts_recipient(
+    async fn accepts_recipient(
         &self,
         transaction: &mut Self::Transaction,
         address: &str,
@@ -866,7 +936,10 @@ impl MessageSink for SpoolSink {
             .plan
             .route(&transaction.runtime.snapshot, address)
         {
-            Ok(()) => Recipient::Accept,
+            // Routed, so the address is real and deliverable. Greylisting is
+            // asked last, deliberately: an address that does not exist should
+            // be told so rather than asked to come back and be told so.
+            Ok(()) => self.greylisted(transaction, address).await,
             Err(routing::Refusal::NoSuchUser) => Recipient::Reject,
             // The address is real and the gate is expected to open, so the
             // sender is told to try again rather than to give up.
@@ -907,7 +980,7 @@ impl SpoolSink {
         message: Message,
     ) -> Result<String, DataError> {
         let id = self.next_id();
-        let Transaction { runtime, plan } = transaction;
+        let Transaction { runtime, plan, .. } = transaction;
         let Message {
             mut envelope,
             peer,
@@ -1108,6 +1181,41 @@ impl SpoolSink {
         // delivery would make Pigeon's response time hostage to the slowest
         // receiving server in the world.
         Ok(id)
+    }
+
+    /// Whether this recipient waits, because the sender has not been seen
+    /// before.
+    ///
+    /// A database failure passes the recipient. The alternative is refusing
+    /// mail because a local write failed, which is a self-inflicted outage —
+    /// and greylisting is a heuristic that is allowed to fail open, unlike
+    /// anything that decides where mail goes.
+    async fn greylisted(&self, transaction: &Transaction, address: &str) -> Recipient {
+        use pigeon_spool::greylist::Verdict;
+
+        if self.abuse.greylist_seconds <= 0 || self.abuse.trusts(transaction.peer) {
+            return Recipient::Accept;
+        }
+
+        let conn = self.queue.conn.lock().await;
+        match pigeon_spool::greylist::check(
+            &conn,
+            transaction.peer,
+            &transaction.sender,
+            address,
+            self.abuse.greylist_seconds,
+            unix_now(),
+        ) {
+            Ok(Verdict::Pass) => Recipient::Accept,
+            Ok(Verdict::Wait { seconds }) => {
+                tracing::debug!(%address, seconds, "greylisting a recipient");
+                Recipient::Defer
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "the greylist could not be consulted; accepting");
+                Recipient::Accept
+            }
+        }
     }
 
     /// Remove spool files that no committed row refers to.
@@ -1827,12 +1935,31 @@ async fn run() -> io::Result<()> {
         }
     };
 
+    let abuse = {
+        let a = &started.config.config().abuse;
+        if !a.blocklists.is_empty() {
+            tracing::info!(zones = ?a.blocklists, "consulting blocklists at connect time");
+        }
+        if a.greylist_seconds > 0 {
+            tracing::info!(seconds = a.greylist_seconds, "greylisting new senders");
+        }
+        Arc::new(Abuse {
+            blocklists: a.blocklists.clone(),
+            trusted: a.trusted.iter().map(|ip| ip.to_canonical()).collect(),
+            greylist_seconds: a.greylist_seconds,
+            // The resolver delivery already built: one DNS stack, one set of
+            // answers, and one place a resolver failure is classified.
+            resolver: Arc::clone(&forwarding.resolver),
+        })
+    };
+
     let sink = SpoolSink {
         queue: queue.clone(),
         spool: pigeon_spool::Spool::new(sink_dir.clone()),
         auth: auth.clone(),
         counter: Arc::new(AtomicU64::new(0)),
         boot: std::process::id(),
+        abuse,
     };
 
     let config = ServerConfig {
@@ -2017,6 +2144,23 @@ mod tests {
         }
     }
 
+    /// No blocklist and no greylist, which is the default configuration and
+    /// what every test that is about something else wants.
+    ///
+    /// The resolver is real but never asked: with no zones configured the
+    /// blocklist check returns before touching it, and with a zero delay the
+    /// greylist writes nothing.
+    fn no_abuse_controls() -> Arc<Abuse> {
+        Arc::new(Abuse {
+            blocklists: Vec::new(),
+            trusted: std::collections::HashSet::new(),
+            greylist_seconds: 0,
+            // Offline: these tests are about what the daemon does with an
+            // answer, not about what this machine's resolver says.
+            resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
+        })
+    }
+
     /// One managed domain, with a catch-all so every local part routes.
     ///
     /// Aliases are the router's own subject; what these tests need is a table
@@ -2072,16 +2216,17 @@ mod tests {
             auth: auth_for(domains, false),
             counter: Arc::new(AtomicU64::new(0)),
             boot: 0x1234_5678,
+            abuse: no_abuse_controls(),
         };
         (sink, db)
     }
 
     /// Route one address the way `RCPT TO` does, and hand back the transaction.
-    fn transaction_for(sink: &SpoolSink, recipients: &[&str]) -> Transaction {
-        let mut txn = sink.begin();
+    async fn transaction_for(sink: &SpoolSink, recipients: &[&str]) -> Transaction {
+        let mut txn = sink.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
         for r in recipients {
             assert_eq!(
-                sink.accepts_recipient(&mut txn, r, &[]),
+                sink.accepts_recipient(&mut txn, r, &[]).await,
                 Recipient::Accept,
                 "the fixture should accept {r}"
             );
@@ -2095,7 +2240,7 @@ mod tests {
         from: &str,
         recipients: &[&str],
     ) -> Result<String, DataError> {
-        let txn = transaction_for(sink, recipients);
+        let txn = transaction_for(sink, recipients).await;
         sink.deliver_inner(
             txn,
             Message {
@@ -2971,6 +3116,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_greylisted_sender_is_deferred_and_admitted_on_the_retry() {
+        // The whole bet, through the sink: a sender nobody has seen is asked to
+        // come back, and when it does the mail is taken. A `4xx` at RCPT leaves
+        // the message with the system that has a copy of it.
+        let tmp = TempDir::new("greylist");
+        let (mut s, db) = queued_sink(tmp.path());
+        s.abuse = Arc::new(Abuse {
+            blocklists: Vec::new(),
+            trusted: std::collections::HashSet::new(),
+            greylist_seconds: 300,
+            resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
+        });
+
+        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
+        assert_eq!(
+            s.accepts_recipient(&mut txn, "hello@example.com", &[])
+                .await,
+            Recipient::Defer,
+            "a first-time sender was not greylisted"
+        );
+
+        // Nothing was accepted, so nothing is owed: the refusal happened while
+        // the sender still had the message.
+        let conn = pigeon_db::open(&db).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 0);
+
+        // The retry, once the delay has passed. Written directly rather than
+        // waiting five minutes, which is the one thing a test cannot do.
+        conn.execute("UPDATE greylist SET first_seen = first_seen - 600", [])
+            .unwrap();
+        drop(conn);
+
+        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
+        assert_eq!(
+            s.accepts_recipient(&mut txn, "hello@example.com", &[])
+                .await,
+            Recipient::Accept,
+            "the retry was refused as well"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trusted_address_is_never_greylisted() {
+        // A backup MX or the operator's own machine. Delaying mail from a host
+        // that was configured as trusted is a delay nobody asked for.
+        let tmp = TempDir::new("greylist-trusted");
+        let (mut s, _db) = queued_sink(tmp.path());
+        s.abuse = Arc::new(Abuse {
+            blocklists: Vec::new(),
+            trusted: ["192.0.2.10".parse().unwrap()].into_iter().collect(),
+            greylist_seconds: 300,
+            resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
+        });
+
+        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
+        assert_eq!(
+            s.accepts_recipient(&mut txn, "hello@example.com", &[])
+                .await,
+            Recipient::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_is_served_when_no_blocklist_is_configured() {
+        // The default. A blocklist is somebody else's opinion about who may
+        // send mail here, and adopting one silently would be adopting it on the
+        // operator's behalf.
+        let tmp = TempDir::new("dnsbl-off");
+        let (s, _db) = queued_sink(tmp.path());
+        assert_eq!(
+            s.accepts_connection("192.0.2.10:2525".parse().unwrap())
+                .await,
+            pigeon_smtp::Connection::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocklist_that_cannot_answer_does_not_refuse() {
+        // The rule the whole check turns on. A list that is down and treated as
+        // "listed" refuses every message from everyone — a total mail outage
+        // produced by somebody else's DNS server — while treating the same
+        // silence as "not listed" forwards spam that would have been refused.
+        // One is recoverable and visible; the other is not.
+        //
+        // The resolver here has no name servers, so every lookup fails without
+        // a packet leaving the process. Which zone is named does not matter,
+        // and that is the point.
+        let tmp = TempDir::new("dnsbl-unreachable");
+        let (mut s, _db) = queued_sink(tmp.path());
+
+        s.abuse = Arc::new(Abuse {
+            blocklists: vec!["blocklist.invalid".into()],
+            trusted: std::collections::HashSet::new(),
+            greylist_seconds: 0,
+            resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
+        });
+
+        // A list that cannot answer must never refuse: somebody else's DNS
+        // outage is not a reason to stop taking mail.
+        assert_eq!(
+            s.accepts_connection("192.0.2.10:2525".parse().unwrap())
+                .await,
+            pigeon_smtp::Connection::Accept,
+            "an unreachable blocklist refused a connection"
+        );
+    }
+
+    #[tokio::test]
     async fn an_identical_second_submission_is_accepted_as_its_own_message() {
         // The duplicate-suppression policy, made falsifiable. Two submissions
         // with the same envelope, the same recipients and byte-identical
@@ -3140,8 +3396,8 @@ mod tests {
         assert_eq!(ids.len(), 1000, "identifier collision within one run");
     }
 
-    #[test]
-    fn rcpt_is_answered_from_the_routing_table() {
+    #[tokio::test]
+    async fn rcpt_is_answered_from_the_routing_table() {
         // The mapping the sink owns: what routing decides becomes what the
         // sender is told, and the difference between the two refusals matters.
         // A permanent refusal for a gated domain would tell a sender to give up
@@ -3166,23 +3422,27 @@ mod tests {
             ],
         );
 
-        let mut txn = s.begin();
+        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
         assert_eq!(
-            s.accepts_recipient(&mut txn, "hello@example.com", &[]),
+            s.accepts_recipient(&mut txn, "hello@example.com", &[])
+                .await,
             Recipient::Accept
         );
         assert_eq!(
-            s.accepts_recipient(&mut txn, "hello@unmanaged.example", &[]),
+            s.accepts_recipient(&mut txn, "hello@unmanaged.example", &[])
+                .await,
             Recipient::Reject,
             "an unmanaged domain was not refused permanently"
         );
         assert_eq!(
-            s.accepts_recipient(&mut txn, "hello@empty.example", &[]),
+            s.accepts_recipient(&mut txn, "hello@empty.example", &[])
+                .await,
             Recipient::Reject,
             "an address nothing routes was not refused permanently"
         );
         assert_eq!(
-            s.accepts_recipient(&mut txn, "hello@gated.example", &[]),
+            s.accepts_recipient(&mut txn, "hello@gated.example", &[])
+                .await,
             Recipient::Defer,
             "a gated domain was refused permanently"
         );
@@ -3203,9 +3463,10 @@ mod tests {
             }],
         );
 
-        let mut txn = s.begin();
+        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
         assert_eq!(
-            s.accepts_recipient(&mut txn, "hello@gated.example", &[]),
+            s.accepts_recipient(&mut txn, "hello@gated.example", &[])
+                .await,
             Recipient::Defer
         );
 
@@ -3297,6 +3558,7 @@ mod tests {
             spool: spool.clone(),
             counter: Arc::new(AtomicU64::new(0)),
             boot: 0x0bad_cafe,
+            abuse: no_abuse_controls(),
         };
 
         let deliverer = delivery::Deliverer::start(delivery::DeliveryConfig {
@@ -4118,7 +4380,7 @@ mod tests {
         let (s, db) = queued_sink(tmp.path());
 
         // One recipient routed, two in the envelope.
-        let txn = transaction_for(&s, &["hello@example.com"]);
+        let txn = transaction_for(&s, &["hello@example.com"]).await;
 
         let outcome = s
             .deliver_inner(
@@ -4162,7 +4424,7 @@ mod tests {
         let (s, db) = queued_sink(tmp.path());
 
         // Routed here, against the table in force now.
-        let txn = transaction_for(&s, &["hello@example.com"]);
+        let txn = transaction_for(&s, &["hello@example.com"]).await;
 
         // The reload lands between `RCPT TO` and `DATA`.
         pigeon_route::Publish::publish(
@@ -4203,7 +4465,7 @@ mod tests {
 
         // And the new table is in force for the *next* transaction, so the test
         // cannot pass by the publication having done nothing.
-        let next = transaction_for(&s, &["hello@example.com"]);
+        let next = transaction_for(&s, &["hello@example.com"]).await;
         let groups = next
             .plan
             .groups(&["hello@example.com".to_string()])

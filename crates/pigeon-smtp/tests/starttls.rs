@@ -26,9 +26,14 @@ struct Recorder {
 impl MessageSink for Recorder {
     type Transaction = ();
 
-    fn begin(&self) {}
+    fn begin(&self, _peer: std::net::SocketAddr, _sender: &str) {}
 
-    fn accepts_recipient(&self, _txn: &mut (), address: &str, _accepted: &[String]) -> Recipient {
+    async fn accepts_recipient(
+        &self,
+        _txn: &mut (),
+        address: &str,
+        _accepted: &[String],
+    ) -> Recipient {
         if address.ends_with("@example.net") {
             Recipient::Accept
         } else {

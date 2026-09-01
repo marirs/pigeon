@@ -34,6 +34,19 @@ pub const MAX_ERRORS: usize = 10;
 /// has a stale address, but does not walk a dictionary.
 pub const MAX_REFUSALS: usize = 20;
 
+/// Commands accepted over one connection, of any kind.
+///
+/// The error budget catches a client sending garbage and the refusal budget
+/// catches one walking an address list. Neither catches a client sending
+/// *valid* commands for ever: `RSET`, `NOOP` and `EHLO` all reset or never
+/// touch those counters, so a connection can be kept busy indefinitely at no
+/// cost to the sender. The session lifetime bounds the wall clock; this bounds
+/// the work.
+///
+/// Generous, because pipelining a hundred recipients is a hundred commands and
+/// a mailing list relay does that legitimately.
+pub const MAX_COMMANDS: usize = 2_000;
+
 /// Where a session is in the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -132,6 +145,9 @@ pub struct Session {
     tls_available: bool,
     max_message_size: usize,
     errors: usize,
+    /// Every command seen on this connection, never reset. See
+    /// [`MAX_COMMANDS`].
+    commands: usize,
     /// Refused recipients, counted for the life of the connection.
     ///
     /// Separate from `errors`, which resets on success. A directory harvest is
@@ -162,6 +178,7 @@ impl std::fmt::Debug for Session {
             .field("envelope", &self.envelope)
             .field("tls", &self.tls)
             .field("errors", &self.errors)
+            .field("commands", &self.commands)
             .field("refusals", &self.refusals)
             .field("return_path", &self.return_path.is_some())
             .finish()
@@ -187,6 +204,7 @@ impl Session {
             tls_available,
             max_message_size,
             errors: 0,
+            commands: 0,
             refusals: 0,
             return_path: None,
         }
@@ -232,6 +250,14 @@ impl Session {
 
     /// Handle a line that failed to parse.
     pub fn advance_parse_error(&mut self, err: ParseError) -> Action {
+        // A line that does not parse is still a command's worth of work, and a
+        // cap that ignored them would be lifted by sending garbage instead.
+        self.commands += 1;
+        if self.commands > MAX_COMMANDS {
+            self.state = State::Closed;
+            return Action::Close(reply::too_many_commands());
+        }
+
         self.errors += 1;
         if self.errors >= MAX_ERRORS {
             self.state = State::Closed;
@@ -246,6 +272,16 @@ impl Session {
 
     /// Handle a parsed command.
     pub fn advance(&mut self, cmd: Command<'_>) -> Action {
+        // Counted before anything else, including the sequence check: a client
+        // that only ever sends commands out of sequence is still spending this
+        // server's time, and the point of the cap is the work rather than the
+        // correctness of what was asked for.
+        self.commands += 1;
+        if self.commands > MAX_COMMANDS {
+            self.state = State::Closed;
+            return Action::Close(reply::too_many_commands());
+        }
+
         if self.state == State::Greeting && !cmd.allowed_before_greeting() {
             return self.protocol_error(reply::bad_sequence());
         }

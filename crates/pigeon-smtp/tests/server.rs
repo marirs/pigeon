@@ -38,9 +38,14 @@ impl TestSink {
 impl MessageSink for TestSink {
     type Transaction = ();
 
-    fn begin(&self) {}
+    fn begin(&self, _peer: std::net::SocketAddr, _sender: &str) {}
 
-    fn accepts_recipient(&self, _txn: &mut (), address: &str, _accepted: &[String]) -> Recipient {
+    async fn accepts_recipient(
+        &self,
+        _txn: &mut (),
+        address: &str,
+        _accepted: &[String],
+    ) -> Recipient {
         if self.allowed.iter().any(|a| a == address) {
             Recipient::Accept
         } else {

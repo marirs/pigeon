@@ -169,6 +169,31 @@ pub fn sender_cannot_be_rewritten() -> Reply {
     Reply::line(550, "Sender address too long to forward")
 }
 
+/// The connection has asked for enough.
+///
+/// `421` rather than a permanent code: the sender has done nothing
+/// unforgivable, and reconnecting is the correct response.
+/// Too many connections from one address.
+///
+/// `421` because the peer is not doing anything wrong in principle — it already
+/// has several conversations open here and is being asked to use them.
+/// No service for this peer, given in place of the banner (RFC 5321 §3.1).
+///
+/// The reason is the caller's, and is deliberately short: reply text is
+/// attacker-visible, and naming the list that refused them is a hint about how
+/// to get around it.
+pub fn service_refused(reason: &str) -> Reply {
+    Reply::owned(554, format!("No service: {reason}"))
+}
+
+pub fn too_many_connections() -> Reply {
+    Reply::line(421, "Too many connections from your address")
+}
+
+pub fn too_many_commands() -> Reply {
+    Reply::line(421, "Too many commands on this connection")
+}
+
 pub fn message_too_large() -> Reply {
     Reply::line(552, "Message exceeds maximum size")
 }
