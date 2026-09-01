@@ -544,14 +544,15 @@ One mutation appeared not to be caught and was mine rather than the suite's:
 properly, it was caught. Worth recording, because a mutation that does not
 mutate reads exactly like a test that does not test.
 
-### What is built and not yet serving
+### What is built and serving
 
-The routing table is loaded, validated and reported at startup. It does **not**
-yet decide acceptance or delivery: those still come from `PIGEON_ACCEPT` and
-`PIGEON_FORWARD_TO`.
+The routing table is loaded, validated and reported at startup, and since
+Milestone 3 it is what decides acceptance and delivery: `RCPT TO` resolves
+against the published snapshot and the resolved destinations become queue rows.
+`PIGEON_ACCEPT` and `PIGEON_FORWARD_TO` are retired.
 
-Wiring acceptance alone would accept mail for an address on the strength of a
-rule and then ignore where that rule points. Connecting both means fanning one
-message out to several destinations, each needing independently durable state so
-a retry knows which already received it — which is Milestone 3. That criterion
+Wiring acceptance alone would have accepted mail for an address on the strength
+of a rule and then ignored where that rule points. Connecting both means fanning
+one message out to several destinations, each needing independently durable state
+so a retry knows which already received it — which is Milestone 3. That criterion
 formally moved there; the reasoning is in `M1-FINDINGS.md` §1.

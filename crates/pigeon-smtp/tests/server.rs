@@ -40,7 +40,7 @@ impl MessageSink for TestSink {
 
     fn begin(&self) {}
 
-    fn accepts_recipient(&self, _txn: &(), address: &str, _accepted: &[String]) -> Recipient {
+    fn accepts_recipient(&self, _txn: &mut (), address: &str, _accepted: &[String]) -> Recipient {
         if self.allowed.iter().any(|a| a == address) {
             Recipient::Accept
         } else {

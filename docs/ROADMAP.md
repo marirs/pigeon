@@ -193,11 +193,11 @@ mail that providers reject.**
 - [ ] malformed message handling
 - [ ] graceful shutdown
 
-- [ ] a routing revision counter, bumped by triggers on the routing tables, so
+- [x] a routing revision counter, bumped by triggers on the routing tables, so
       queue commits stop waking the reload loader — with a single ordering for
       publication that reconciliation does not have to bypass, since a restore
       can present the same revision over different rows (`M1-RELOAD.md` C-1..3)
-- [ ] the daemon's RCPT accept/reject decision and resolved destination set come
+- [x] the daemon's RCPT accept/reject decision and resolved destination set come
       from the routing snapshot, replacing `PIGEON_ACCEPT` and
       `PIGEON_FORWARD_TO`
 

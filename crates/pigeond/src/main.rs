@@ -18,21 +18,28 @@
 //! lifecycle — nothing reaches `Active` without passing every check — not on
 //! process startup.
 //!
-//! # Milestone 0
+//! # What one message goes through
 //!
-//! This is the skeleton. Accepted mail is written to the spool directory and,
-//! when `PIGEON_FORWARD_TO` is set, forwarded to a single hardcoded
-//! destination resolved through its MX records. There is no routing table and
-//! no queue: a forward that fails is logged and the spool copy is left where
-//! it is, for an operator to find. Configuration comes from the environment
-//! because the TOML loader and SQLite schema arrive in Milestone 1.
+//! ```text
+//! MAIL FROM  ->  pin the runtime: the table, the keys and the SRS ring
+//! RCPT TO    ->  route once, record where the address goes
+//! DATA       ->  split by managed domain (R-2), sign each group, spool each
+//!            ->  one transaction inserting every group -> 250
+//! ```
+//!
+//! Configuration comes from `PIGEON_CONFIG` and nowhere else. The Milestone 0
+//! environment runtime — `PIGEON_ACCEPT` deciding recipients, `PIGEON_FORWARD_TO`
+//! naming one destination, and a forward attempted inline after the `250` — is
+//! retired: routing decides both questions now, and a second path that answered
+//! them differently would be an unrouted way to accept and forward mail.
 
 mod delivery;
 mod notify;
 mod reload;
+mod routing;
 mod startup;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -94,7 +101,6 @@ struct Forwarding<R: MxLookup> {
     /// Name given in EHLO. Its forward and reverse DNS must agree with the
     /// sending address or receivers will treat everything as suspect.
     ehlo_name: String,
-    destination: String,
     limit: Arc<Semaphore>,
     /// Always 25 in production. Injectable so a test can point the delivery
     /// path at a scripted peer on an ephemeral port instead of at the internet.
@@ -115,7 +121,6 @@ impl<R: MxLookup> Clone for Forwarding<R> {
         Self {
             resolver: Arc::clone(&self.resolver),
             ehlo_name: self.ehlo_name.clone(),
-            destination: self.destination.clone(),
             limit: Arc::clone(&self.limit),
             port: self.port,
             budget: self.budget,
@@ -633,86 +638,69 @@ struct Queue {
     path: Arc<PathBuf>,
 }
 
-struct SpoolSink<R: MxLookup> {
-    dir: Arc<PathBuf>,
+/// Everything acceptance needs, and nothing delivery does.
+///
+/// No resolver and no destination: where a message goes is decided by routing
+/// at `RCPT TO` and recorded in the queue, and sending it is the delivery
+/// worker's job. The sink writes bytes and rows.
+#[derive(Clone)]
+struct SpoolSink {
     spool: pigeon_spool::Spool,
-    /// Absent on the Milestone 0 environment path, where there is no database
-    /// to queue into.
-    queue: Option<Queue>,
-    /// Absent on the Milestone 0 environment path, where there is no database
-    /// and so no policy, no keys and no SRS ring.
-    auth: Option<Auth>,
-    /// Recipients to accept. Empty means accept anything, which is only
-    /// reasonable while there is no real routing table.
-    accept: Arc<HashSet<String>>,
+    queue: Queue,
+    auth: Auth,
     counter: Arc<AtomicU64>,
     /// Distinguishes identifiers from different runs of the process.
     boot: u32,
-    /// Absent means spool and stop, which is useful for testing the receiver
-    /// without sending anything onward.
-    forwarding: Option<Forwarding<R>>,
 }
 
-// As with `Forwarding`: shared state behind `Arc`, so the resolver itself does
-// not have to be `Clone` for the sink to be.
-impl<R: MxLookup> Clone for SpoolSink<R> {
-    fn clone(&self) -> Self {
-        Self {
-            dir: Arc::clone(&self.dir),
-            spool: self.spool.clone(),
-            queue: self.queue.clone(),
-            auth: self.auth.clone(),
-            accept: Arc::clone(&self.accept),
-            counter: Arc::clone(&self.counter),
-            boot: self.boot,
-            forwarding: self.forwarding.clone(),
-        }
-    }
+/// The message as it arrived, minus the routing that decides what happens to
+/// it.
+///
+/// One struct because these five travel together everywhere: the pipeline
+/// authenticates against the envelope the body came with, and separating them
+/// would let a caller pass one message's body with another's envelope.
+struct Incoming<'a> {
+    peer: std::net::IpAddr,
+    helo: &'a str,
+    envelope: &'a Envelope,
+    received: &'a str,
+    body: &'a [u8],
 }
 
-/// Run the authentication pipeline for this message.
+/// Run the authentication pipeline for one domain group.
 ///
 /// The forwarding policy and the signing key come from the snapshot the
-/// routing decision was made against, selected by the recipient's domain —
-/// the domain Pigeon accepted the mail *for*, which is the identity it
-/// forwards under and the one an ARC seal should carry.
+/// routing decision was made against, selected by the domain Pigeon accepted
+/// the mail *for* — the identity it forwards under and the one an ARC seal
+/// carries.
 ///
-/// One recipient decides it, because fan-out does not exist yet: a message
-/// to several domains is Milestone 3's problem, where each destination gets
-/// independently durable state. Until then the first recipient is the
-/// policy, and that is a documented narrowing rather than an oversight.
+/// One group, one identity: a submission addressed to two managed domains is
+/// two messages with different signed bytes (R-2), so the domain is a
+/// parameter here rather than something guessed from the first recipient.
 async fn authenticate(
     auth: &Auth,
-    runtime: Option<&Arc<Runtime>>,
-    peer: std::net::IpAddr,
-    helo: &str,
-    envelope: &Envelope,
-    received: &str,
-    body: &[u8],
+    runtime: &Runtime,
+    recipient_domain: &str,
+    message: Incoming<'_>,
 ) -> Result<pigeon_auth::pipeline::Outbound, pigeon_auth::pipeline::PipelineError> {
+    let Incoming {
+        peer,
+        helo,
+        envelope,
+        received,
+        body,
+    } = message;
+
     use pigeon_auth::pipeline::Rewrite;
 
     // Pinned at `MAIL FROM`, not read here: the policy that decides how this
     // message is signed must be the one that accepted its recipients. Reading
     // it now would let a reload between `RCPT TO` and the end of `DATA` sign
     // under a configuration that never accepted the message.
-    //
-    // The fallback exists only for the environment path, where there is no
-    // database and every domain is unknown — which resolves to `Preserve` and
-    // no key, the same as an unmanaged domain.
-    let fallback = auth.runtime.pin();
-    let runtime = runtime.unwrap_or(&fallback);
     let snapshot = &runtime.snapshot;
 
-    let recipient_domain = envelope
-        .recipients
-        .first()
-        .and_then(|r| pigeon_types::Address::parse(r).ok())
-        .map(|a| a.domain().to_ascii_lowercase())
-        .unwrap_or_default();
-
-    let forwarding = snapshot.forwarding(&recipient_domain);
-    let signing = runtime.keys.get(&recipient_domain);
+    let forwarding = snapshot.forwarding(recipient_domain);
+    let signing = runtime.keys.get(recipient_domain);
 
     let rewrite = match forwarding.map(|f| f.policy) {
         Some(pigeon_types::ForwardPolicy::RewriteFrom) => {
@@ -737,59 +725,52 @@ async fn authenticate(
         .await
 }
 
-impl<R: MxLookup + 'static> MessageSink for SpoolSink<R> {
-    /// The runtime pinned for this transaction, if there is one to pin.
-    ///
-    /// `None` on the Milestone 0 environment path, where there is no database
-    /// and so no snapshot, no keys and no policy.
-    type Transaction = Option<Arc<Runtime>>;
+/// What one mail transaction pins and decides.
+///
+/// The runtime is pinned at `MAIL FROM` so a reload landing mid-transaction
+/// cannot accept a recipient under one configuration and sign under another.
+/// The plan is filled in at `RCPT TO` and read at `DATA`: routing happens once.
+#[derive(Debug)]
+struct Transaction {
+    runtime: Arc<Runtime>,
+    plan: routing::Plan,
+}
+
+impl MessageSink for SpoolSink {
+    type Transaction = Transaction;
 
     fn begin(&self) -> Self::Transaction {
-        self.auth.as_ref().map(|a| a.runtime.pin())
+        Transaction {
+            runtime: self.auth.runtime.pin(),
+            plan: routing::Plan::default(),
+        }
     }
 
+    /// Route the recipient, and record where it goes.
+    ///
+    /// Everything predictable is decided here, at the last moment refusing is
+    /// still the upstream MTA's problem rather than Pigeon's: whether the
+    /// domain is carried, whether it is accepting, whether a rule matches, and
+    /// where the address resolves to. After the `250` the only remaining answer
+    /// is a bounce Pigeon has to generate itself.
     fn accepts_recipient(
         &self,
-        transaction: &Self::Transaction,
+        transaction: &mut Self::Transaction,
         address: &str,
-        accepted: &[String],
+        _accepted: &[String],
     ) -> Recipient {
-        // Until fan-out exists, one message is forwarded under one domain's
-        // policy and signed with one domain's key — so a second recipient in a
-        // different managed domain would have its policy decided by the order
-        // the sender listed them in. That is a decision belonging to the
-        // sender, which it must not be.
-        //
-        // Deferred rather than rejected: the address is deliverable, just not
-        // alongside the others, so a permanent answer would tell the sender to
-        // give up on a working mailbox. Milestone 3's per-destination state is
-        // what removes the restriction.
-        if let Some(runtime) = transaction
-            && let Some(first) = accepted.first()
-            && let (Ok(new), Ok(old)) = (
-                pigeon_types::Address::parse(address),
-                pigeon_types::Address::parse(first),
-            )
+        match transaction
+            .plan
+            .route(&transaction.runtime.snapshot, address)
         {
-            let new_domain = new.domain().to_ascii_lowercase();
-            let old_domain = old.domain().to_ascii_lowercase();
-            if new_domain != old_domain
-                && runtime.snapshot.forwarding(&new_domain).is_some()
-                && runtime.snapshot.forwarding(&old_domain).is_some()
-            {
-                tracing::debug!(
-                    %address,
-                    first = %first,
-                    "deferring a recipient in a second managed domain"
-                );
-                return Recipient::Defer;
+            Ok(()) => Recipient::Accept,
+            Err(routing::Refusal::NoSuchUser) => Recipient::Reject,
+            // The address is real and the gate is expected to open, so the
+            // sender is told to try again rather than to give up.
+            Err(routing::Refusal::NotAccepting) => {
+                tracing::debug!(%address, "refusing a recipient: the domain is not accepting");
+                Recipient::Defer
             }
-        }
-
-        if self.accepts_recipient_inner(address) {
-            Recipient::Accept
-        } else {
-            Recipient::Reject
         }
     }
 
@@ -802,49 +783,28 @@ impl<R: MxLookup + 'static> MessageSink for SpoolSink<R> {
     }
 }
 
-/// What acceptance records about one message.
+/// One domain group's finished bytes, ready to be queued.
 ///
-/// A struct rather than four more parameters: these travel together, and
-/// `routing` in particular is only meaningful paired with the envelope it was
-/// pinned for — the point of recording it is that this message was accepted
-/// under *that* configuration.
-struct Admission<'a> {
-    envelope: &'a Envelope,
-    original_sender: &'a str,
+/// Built before the acceptance transaction opens and consumed inside it: every
+/// group's body is durable before a single row is written, so the transaction
+/// only inserts (R-2, `M3-DESIGN.md` §4).
+struct Prepared {
+    id: String,
+    spool_id: pigeon_spool::SpoolId,
+    group: routing::Group,
     size: usize,
-    destination: &'a str,
-    /// The runtime pinned at `MAIL FROM`. `None` on the Milestone 0
-    /// environment path, which has no snapshot to pin.
-    routing: Option<&'a Runtime>,
+    /// What the pipeline reported, for the log.
+    outcome: Option<pigeon_auth::pipeline::Outbound>,
 }
 
-impl<R: MxLookup + 'static> SpoolSink<R> {
-    fn accepts_recipient_inner(&self, address: &str) -> bool {
-        if self.accept.is_empty() {
-            return true;
-        }
-        // Folds the domain only, matching `Address::same_mailbox` and RFC 5321
-        // §2.4. Lowercasing the whole address made `Bob@example.com` in the
-        // accept list authorise `bob@example.com` as well — a different
-        // mailbox, and one the operator never listed. Over-accepting is not
-        // mail loss, but it is the same folding mistake that was corrected in
-        // the dedup path, and leaving one half of an invariant undone is how
-        // it comes back.
-        let Ok(parsed) = pigeon_types::Address::parse(address) else {
-            return false;
-        };
-        self.accept
-            .iter()
-            .filter_map(|a| pigeon_types::Address::parse(a).ok())
-            .any(|allowed| allowed.same_mailbox(&parsed))
-    }
-
+impl SpoolSink {
     async fn deliver_inner(
         &self,
-        transaction: Option<Arc<Runtime>>,
+        transaction: Transaction,
         message: Message,
     ) -> Result<String, DataError> {
         let id = self.next_id();
+        let Transaction { runtime, plan } = transaction;
         let Message {
             mut envelope,
             peer,
@@ -853,41 +813,22 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
             body,
         } = message;
 
-        // Authentication happens here, before anything is written, because the
-        // spooled bytes must be the bytes that go on the wire: a retry that
-        // re-derived the relay form would be a second chance to derive it
-        // differently, and the ARC set signs one of the two.
-        //
-        // `received` comes from the SMTP layer, which already built it for this
-        // hop — trace headers are the only cross-system loop guard there is,
-        // and a second generator here would be a second answer to "which host
-        // handled this?".
-        let processed = match &self.auth {
-            Some(auth) => {
-                match authenticate(
-                    auth,
-                    transaction.as_ref(),
-                    peer,
-                    &helo,
-                    &envelope,
-                    &received,
-                    &body,
-                )
-                .await
-                {
-                    Ok(out) => Some(out),
-                    Err(e) => {
-                        // R-8. A rewritten `From:` that cannot be signed fails DMARC
-                        // on a domain Pigeon controls, which is worse than not
-                        // rewriting — so it is never written or sent. 451: the key
-                        // is a local problem and the sender may usefully retry once
-                        // an operator has fixed it.
-                        tracing::error!(%id, error = %e, "refusing a message that cannot be signed");
-                        return Err(DataError::Temporary);
-                    }
-                }
+        // What `RCPT TO` decided, read back. Not re-resolved: routing happens
+        // once per transaction, and a second lookup — even against this same
+        // pinned runtime — would be a second answer that can differ from the
+        // one the recipients were accepted on.
+        let groups = match plan.groups(&envelope.recipients) {
+            Ok(g) if !g.is_empty() => g,
+            Ok(_) => {
+                // No recipients: the session does not reach `DATA` without one,
+                // so this is a wiring bug rather than a client.
+                tracing::error!(%id, "a message reached DATA with no routed recipients");
+                return Err(DataError::Temporary);
             }
-            None => None,
+            Err(e) => {
+                tracing::error!(%id, error = %e, "a recipient was acknowledged without being routed");
+                return Err(DataError::Temporary);
+            }
         };
 
         // What the sender used, kept before SRS replaces it: the DSN and the
@@ -898,10 +839,10 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
         // The envelope sender is rewritten **once**, here, and carried. Deriving
         // it again at delivery would let a key rotation or a date change between
         // the two produce a return path that differs from the one a receiver was
-        // given.
-        if let Some(runtime) = transaction.as_ref()
-            && !envelope.sender.is_empty()
-        {
+        // given. One rewrite for every group, because the return path is a
+        // property of the sender rather than of the domain the mail was
+        // accepted for.
+        if !envelope.sender.is_empty() {
             let (local, domain) = envelope
                 .sender
                 .rsplit_once('@')
@@ -918,213 +859,183 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
             }
         }
 
-        let (received, body) = match &processed {
+        // Every group's bytes, finished and durable, before any row is written.
+        //
+        // Authentication happens here, before anything is written, because the
+        // spooled bytes must be the bytes that go on the wire: a retry that
+        // re-derived the relay form would be a second chance to derive it
+        // differently, and the ARC set signs one of the two.
+        //
+        // `received` comes from the SMTP layer, which already built it for this
+        // hop — trace headers are the only cross-system loop guard there is,
+        // and a second generator here would be a second answer to "which host
+        // handled this?".
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(groups.len());
+        for (n, group) in groups.into_iter().enumerate() {
+            let group_id = format!("{id}-g{n}");
+            let spool_id = match pigeon_spool::SpoolId::new(&group_id) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Generated a few lines above, so this is a bug rather than
+                    // an input problem, and one to fail loudly at.
+                    tracing::error!(%id, error = %e, "generated an unusable spool identifier");
+                    self.discard(&prepared).await;
+                    return Err(DataError::Temporary);
+                }
+            };
+
+            let processed = match authenticate(
+                &self.auth,
+                &runtime,
+                &group.domain,
+                Incoming {
+                    peer,
+                    helo: &helo,
+                    envelope: &envelope,
+                    received: &received,
+                    body: &body,
+                },
+            )
+            .await
+            {
+                Ok(out) => out,
+                Err(e) => {
+                    // R-8. A rewritten `From:` that cannot be signed fails DMARC
+                    // on a domain Pigeon controls, which is worse than not
+                    // rewriting — so it is never written or sent. 451: the key
+                    // is a local problem and the sender may usefully retry once
+                    // an operator has fixed it.
+                    tracing::error!(%id, domain = %group.domain, error = %e, "refusing a message that cannot be signed");
+                    self.discard(&prepared).await;
+                    return Err(DataError::Temporary);
+                }
+            };
+
             // One buffer: the pipeline's output already carries the trace
             // header, the authentication results and the ARC set.
-            Some(out) => ("", out.payload.as_bytes()),
-            None => (received.as_str(), body.as_slice()),
-        };
-
-        let spool_id = match pigeon_spool::SpoolId::new(&id) {
-            Ok(s) => s,
-            Err(e) => {
-                // Generated a few lines above, so this is a bug rather than an
-                // input problem, and one to fail loudly at.
-                tracing::error!(%id, error = %e, "generated an unusable spool identifier");
-                return Err(DataError::Temporary);
-            }
-        };
-
-        let installed = self.install(&spool_id, received, body).await;
-
-        // Queue admission is the acceptance boundary. The spool file is durable
-        // by the time this runs, so the only remaining question is whether the
-        // rows that refer to it exist — and on a failed commit that question is
-        // answered by reading the database back, never by assuming.
-        let admitted = match (&installed, &self.queue) {
-            (Ok(()), Some(queue)) => {
-                match self
-                    .admit(
-                        queue,
-                        &spool_id,
-                        Admission {
-                            envelope: &envelope,
-                            original_sender: &original_sender,
-                            size: received.len() + body.len(),
-                            destination: &self
-                                .forwarding
-                                .as_ref()
-                                .map(|f| f.destination.clone())
-                                .unwrap_or_default(),
-                            routing: transaction.as_deref(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(()) => Ok(()),
-                    Err((why, removable)) => {
-                        if removable {
-                            // Established non-commit: the file is an orphan and
-                            // removing it costs a sweep nothing.
-                            if let Err(e) = self.spool.remove(&spool_id).await {
-                                tracing::warn!(%id, error = %e, "could not remove an orphaned spool file");
-                            }
-                            tracing::error!(%id, error = %why, "nothing was queued");
-                        } else {
-                            // Unknown: the rows may exist and the body must
-                            // stay. Orphan recovery resolves it later; a
-                            // duplicate on retry is survivable and losing the
-                            // body is not.
-                            tracing::error!(
-                                %id,
-                                error = %why,
-                                "keeping the spooled message: the queue transaction's outcome is unknown"
-                            );
-                        }
-                        Err(io::Error::other(why))
-                    }
-                }
-            }
-            // No database: Milestone 0's environment path, where the spool
-            // write is all there is.
-            (Ok(()), None) => Ok(()),
-            (Err(_), _) => Ok(()),
-        };
-
-        match installed.and(admitted) {
-            Ok(()) => {
-                let from = display_sender(&envelope);
-                tracing::info!(
-                    %id,
-                    %from,
-                    to = ?envelope.recipients,
-                    bytes = received.len() + body.len(),
-                    sealed = processed.as_ref().map(|p| p.sealed),
-                    signed = processed.as_ref().map(|p| p.signed),
-                    "accepted"
-                );
-                if let Some(out) = &processed
-                    && let Some(reason) = out.seal_skipped
-                {
-                    // A missing ARC set degrades to the pre-ARC status quo,
-                    // which is survivable — but silently, which is why it is an
-                    // error and not a debug line. `ChainAlreadyFailed` is the
-                    // exception: that one is correct behaviour, not a fault.
-                    match reason {
-                        pigeon_auth::pipeline::SealSkipped::ChainAlreadyFailed => {
-                            tracing::debug!(%id, "not extending a chain that arrived cv=fail");
-                        }
-                        other => {
-                            tracing::error!(%id, reason = ?other, "forwarded without an ARC seal")
-                        }
-                    }
-                }
-
-                // Acknowledge now that the message is durable, and forward
-                // separately. Holding the SMTP session open for the length of
-                // an onward delivery would make Pigeon's response time hostage
-                // to the slowest receiving server in the world.
-                //
-                // Nothing retries yet: a failure here leaves the message in
-                // the spool and says so. The queue arrives in Milestone 3.
-                // Milestone 0's path: with no database there is no queue to
-                // deliver from, so the message is forwarded straight away and
-                // nothing retries it. With a queue, delivery is the worker's
-                // job — acceptance ends at the commit.
-                if let Some(f) = self.forwarding.clone().filter(|_| self.queue.is_none()) {
-                    let rotation = self.counter.load(Ordering::Relaxed);
-                    let id2 = id.clone();
-                    let dir = Arc::clone(&self.dir);
-                    let spool_for_delivery = self.spool.clone();
-                    let spool_id = match pigeon_spool::SpoolId::new(&id) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!(%id, error = %e, "generated an unusable spool id");
-                            return Err(DataError::Temporary);
-                        }
-                    };
-                    let envelope = envelope.clone();
-
-                    // The task carries an identifier, not a message. It re-reads
-                    // the body from the spool file that was just fsynced, so a
-                    // queue of pending deliveries costs a few hundred bytes each
-                    // instead of pinning up to `max_message_size` apiece.
-                    //
-                    // This is why the permit is taken *inside* the task. An
-                    // earlier attempt acquired it before spawning, to bound the
-                    // number of pending tasks — but `deliver` is awaited by the
-                    // SMTP session, so that parked the session on the outbound
-                    // pool and made the 250 hostage to the slowest receiving
-                    // server in the world, which is the exact thing the comment
-                    // above says this design avoids. Worse: the sender times out
-                    // inside its own DATA-ack window and retries, turning an
-                    // unbounded-memory bug into a duplicate-delivery one.
-                    tokio::spawn(async move {
-                        let _permit = match f.limit.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => {
-                                tracing::error!(id = %id2, "delivery limiter closed");
-                                return;
-                            }
-                        };
-
-                        let spooled = match spool_for_delivery.read(&spool_id).await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                tracing::error!(id = %id2, error = %e, "cannot re-read spooled message");
-                                return;
-                            }
-                        };
-
-                        // The spooled file is already header-then-body, so it
-                        // goes out as one part.
-                        let destination = f.destination.clone();
-                        match forward(&f, rotation, &destination, &envelope.sender, &spooled).await
-                        {
-                            Ok(remote) => {
-                                tracing::info!(id = %id2, %remote, "forwarded");
-                                // Pigeon is a relay, not an archive. The spool
-                                // copy exists to survive a crash between
-                                // acceptance and delivery, and that window has
-                                // now closed.
-                                if let Err(e) = discard_spooled(&dir, &id2).await {
-                                    tracing::warn!(id = %id2, error = %e, "could not clean spool");
-                                }
-                            }
-                            // Kept on failure, deliberately: with no retry queue
-                            // yet, this copy is the only thing between a
-                            // transient failure and a lost message.
-                            //
-                            // The permanent/transient split is logged rather
-                            // than acted on, because there is nothing yet to
-                            // act with. Milestone 3's queue is what turns it
-                            // into retry-or-dead-letter; until then it tells an
-                            // operator reading the log whether the message is
-                            // worth resending by hand.
-                            Err(e) => tracing::error!(
-                                id = %id2,
-                                error = %e,
-                                permanent = e.is_permanent(),
-                                "forwarding failed; message left in spool"
-                            ),
-                        }
-                    });
-                }
-
-                Ok(id)
-            }
-            Err(e) => {
+            let payload = processed.payload.as_bytes().to_vec();
+            if let Err(e) = self.install(&spool_id, "", &payload).await {
                 // A 451 tells the sender to try again later. Answering 250 for
                 // a message that never reached disk would silently lose it,
                 // since the sender then considers it delivered.
                 tracing::error!(%id, error = %e, "could not spool message");
-                Err(DataError::Temporary)
+                self.discard(&prepared).await;
+                return Err(DataError::Temporary);
+            }
+
+            prepared.push(Prepared {
+                id: group_id,
+                spool_id,
+                size: payload.len(),
+                group,
+                outcome: Some(processed),
+            });
+        }
+
+        // Queue admission is the acceptance boundary. Every spool file is
+        // durable by the time this runs, so the only remaining question is
+        // whether the rows that refer to them exist — and on a failed commit
+        // that question is answered by reading the database back, never by
+        // assuming.
+        match self
+            .admit(Admission {
+                prepared: &prepared,
+                envelope: &envelope,
+                original_sender: &original_sender,
+                routing: &runtime,
+            })
+            .await
+        {
+            Ok(()) => {}
+            Err((why, removable)) => {
+                if removable {
+                    // Established non-commit: the files are orphans and removing
+                    // them costs a sweep nothing.
+                    self.discard(&prepared).await;
+                    tracing::error!(%id, error = %why, "nothing was queued");
+                } else {
+                    // Unknown: the rows may exist and the bodies must stay.
+                    // Orphan recovery resolves it later; a duplicate on retry is
+                    // survivable and losing the body is not.
+                    tracing::error!(
+                        %id,
+                        error = %why,
+                        "keeping the spooled message: the queue transaction's outcome is unknown"
+                    );
+                }
+                return Err(DataError::Temporary);
+            }
+        }
+
+        for group in &prepared {
+            let sealed = group.outcome.as_ref().map(|p| p.sealed);
+            let signed = group.outcome.as_ref().map(|p| p.signed);
+            tracing::info!(
+                id = %group.id,
+                from = %display_sender(&envelope),
+                domain = %group.group.domain,
+                to = ?group.group.recipients,
+                destinations = group.group.destinations.len(),
+                bytes = group.size,
+                sealed,
+                signed,
+                "accepted"
+            );
+
+            if let Some(out) = &group.outcome
+                && let Some(reason) = out.seal_skipped
+            {
+                // A missing ARC set degrades to the pre-ARC status quo, which is
+                // survivable — but silently, which is why it is an error and not
+                // a debug line. `ChainAlreadyFailed` is the exception: that one
+                // is correct behaviour, not a fault.
+                match reason {
+                    pigeon_auth::pipeline::SealSkipped::ChainAlreadyFailed => {
+                        tracing::debug!(id = %group.id, "not extending a chain that arrived cv=fail");
+                    }
+                    other => {
+                        tracing::error!(id = %group.id, reason = ?other, "forwarded without an ARC seal")
+                    }
+                }
+            }
+        }
+
+        // Acknowledged once the rows are committed. Delivery is the worker's
+        // job: holding the SMTP session open for the length of an onward
+        // delivery would make Pigeon's response time hostage to the slowest
+        // receiving server in the world.
+        Ok(id)
+    }
+
+    /// Remove spool files that no committed row refers to.
+    ///
+    /// Only ever called where non-commit is established — a failure before the
+    /// transaction opened, or a rollback the database reported. Never on an
+    /// uncertain commit, where rows may already point at these files.
+    async fn discard(&self, prepared: &[Prepared]) {
+        for group in prepared {
+            if let Err(e) = self.spool.remove(&group.spool_id).await {
+                tracing::warn!(id = %group.id, error = %e, "could not remove an orphaned spool file");
             }
         }
     }
 }
 
-impl<R: MxLookup> SpoolSink<R> {
+/// What acceptance records about one submission.
+///
+/// A struct rather than four more parameters: these travel together, and
+/// `routing` in particular is only meaningful paired with the envelope it was
+/// pinned for — the point of recording it is that this message was accepted
+/// under *that* configuration.
+struct Admission<'a> {
+    prepared: &'a [Prepared],
+    envelope: &'a Envelope,
+    original_sender: &'a str,
+    /// The runtime pinned at `MAIL FROM`.
+    routing: &'a Runtime,
+}
+
+impl SpoolSink {
     /// A spool identifier that will not collide with one from a previous run.
     ///
     /// The counter restarts at zero on every boot, so `secs-000000` is handed
@@ -1166,51 +1077,62 @@ impl<R: MxLookup> SpoolSink<R> {
     /// The acceptance boundary: `250` means these rows are committed, not that
     /// a forward was attempted. Returns whether the spool file may be removed
     /// on failure — which only an *established* non-commit permits.
-    async fn admit(
-        &self,
-        queue: &Queue,
-        spool_id: &pigeon_spool::SpoolId,
-        message: Admission<'_>,
-    ) -> Result<(), (String, bool)> {
+    /// Queue every group in one transaction, and decide what the sender is told.
+    ///
+    /// The acceptance boundary: `250` means these rows are committed, not that
+    /// a forward was attempted. One transaction for all groups, never one each
+    /// — a `250` covers the whole submission, so a crash between two commits
+    /// would leave the sender told that everything was accepted while half of
+    /// it existed, and their retry would duplicate the half that survived.
+    ///
+    /// Returns whether the spool files may be removed on failure, which only an
+    /// *established* non-commit permits.
+    async fn admit(&self, message: Admission<'_>) -> Result<(), (String, bool)> {
         use pigeon_spool::accept::{Acceptance, Destination};
 
         let Admission {
+            prepared,
             envelope,
             original_sender,
-            size,
-            destination,
             routing,
         } = message;
 
-        let acceptance = Acceptance {
-            spool_id: spool_id.clone(),
-            return_path: envelope.sender.clone(),
-            original_sender: original_sender.to_string(),
-            size_bytes: size as i64,
-            // Recorded, never re-resolved: what decided these rows, taken from
-            // the runtime this transaction was pinned to at `MAIL FROM`. Both
-            // halves come from that one pinned value, so the pair is one the
-            // daemon actually served. Absent only on the Milestone 0
-            // environment path, which has no snapshot to be pinned to.
-            routing_revision: routing.map(|r| r.revision).unwrap_or(0),
-            routing_fingerprint: routing.map(|r| r.fingerprint.to_vec()).unwrap_or_default(),
-            original_recipients: envelope.recipients.clone(),
-            destinations: vec![Destination {
-                address: destination.to_string(),
-                // Every recipient reaches this destination today, because
-                // there is one. A DSN still names the address the sender
-                // wrote, which is the point of recording the mapping at all.
-                from_recipients: (0..envelope.recipients.len()).collect(),
-            }],
-        };
+        let acceptances: Vec<Acceptance> = prepared
+            .iter()
+            .map(|group| Acceptance {
+                spool_id: group.spool_id.clone(),
+                return_path: envelope.sender.clone(),
+                original_sender: original_sender.to_string(),
+                size_bytes: group.size as i64,
+                // Recorded, never re-resolved: what decided these rows, taken
+                // from the runtime this transaction was pinned to at `MAIL
+                // FROM`. Both halves come from that one pinned value, so the
+                // pair is one the daemon actually served.
+                routing_revision: routing.revision,
+                routing_fingerprint: routing.fingerprint.to_vec(),
+                // This group's recipients, not the whole envelope: the indices
+                // below are into *this* list, and a DSN for a failure here must
+                // name the addresses that led to this message.
+                original_recipients: group.group.recipients.clone(),
+                destinations: group
+                    .group
+                    .destinations
+                    .iter()
+                    .map(|d| Destination {
+                        address: d.address.clone(),
+                        from_recipients: d.from_recipients.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let mut conn = queue.conn.lock().await;
-        match pigeon_spool::accept(&mut conn, &queue.path, &[acceptance], now) {
+        let mut conn = self.queue.conn.lock().await;
+        match pigeon_spool::accept(&mut conn, &self.queue.path, &acceptances, now) {
             Ok(_) => Ok(()),
             Err(failure) => {
                 let removable = failure.spool_may_be_removed();
@@ -1249,18 +1171,6 @@ async fn survey_spool(dir: &Path) -> io::Result<SpoolSurvey> {
         }
     }
     Ok(survey)
-}
-
-/// Remove a spooled message once it is safely somewhere else.
-async fn discard_spooled(dir: &Path, id: &str) -> io::Result<()> {
-    // Through the spool, so removal is one implementation: unlink, then flush
-    // the directory, and a missing file is the desired state rather than an
-    // error — the operator may have cleaned up, or a crash may already have
-    // done the work.
-    let spool = pigeon_spool::Spool::new(dir.to_path_buf());
-    let id = pigeon_spool::SpoolId::new(id)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    spool.remove(&id).await.map_err(io::Error::from)
 }
 
 /// Send one message onward.
@@ -1485,10 +1395,6 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     match run().await {
@@ -1512,193 +1418,96 @@ async fn run() -> io::Result<()> {
         )
         .init();
 
-    // Milestone 1 configuration when a file is named, Milestone 0 environment
-    // variables otherwise.
-    //
-    // Both paths exist on purpose and only for now. `startup::start` runs the
-    // whole ordered sequence — validate, migrate, cross-check, probe the spool —
-    // but routing still comes from `PIGEON_ACCEPT`, because the routing snapshot
-    // is what replaces it and the snapshot builder is not written. Wiring the
-    // config file to a routing table that does not exist would be pretending.
-    //
-    // The environment path goes away when the snapshot builder lands, and with
-    // it `PIGEON_ACCEPT` and `PIGEON_FORWARD_TO`.
-    let booted = match std::env::var("PIGEON_CONFIG") {
-        Ok(path) if !path.trim().is_empty() => {
-            let mut started = startup::start(Path::new(path.trim()), |dir| async move {
-                prepare_spool(&dir).await
-            })
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
-
-            if started.migration.is_empty() {
-                tracing::info!(version = started.migration.to, "database schema up to date");
-            } else {
-                tracing::info!(
-                    from = started.migration.from,
-                    to = started.migration.to,
-                    applied = ?started.migration.versions,
-                    backup = ?started.migration.backup,
-                    "database migrated"
-                );
-            }
-            for w in &started.warnings {
-                tracing::warn!("{w}");
-            }
-
-            // The routing table is built and validated — every rule in it has
-            // passed the checks SQLite cannot make — but it is not yet what
-            // decides where mail goes. Acceptance still comes from
-            // `PIGEON_ACCEPT` and delivery from `PIGEON_FORWARD_TO`.
-            //
-            // Wiring acceptance to the snapshot while delivery still goes to
-            // one hardcoded address would accept mail for `hello@example.com`
-            // on the strength of a rule and then ignore where that rule points.
-            // Connecting both means fanning one message out to several
-            // destinations with per-recipient outcomes, which needs the
-            // Milestone 3 queue — finding 19 is the same gap seen from the
-            // delivery side.
-            //
-            // So it is reported rather than half-used, and the log says which.
-            let domains = started.snapshot.domain_names().count();
-            let schema = pigeon_db::schema_version(&started.db).unwrap_or(0);
-            let db_path = started.config.config().database.clone();
-            tracing::info!(schema, "control plane open");
-            tracing::info!(
-                domains,
-                "routing table built and validated. It is not serving yet: acceptance \
-                 still comes from PIGEON_ACCEPT and delivery from PIGEON_FORWARD_TO."
-            );
-
-            // The pieces the reload worker needs, carried forward. It is
-            // deliberately **not** started here: everything between this point
-            // and the listener binding can fail, and a worker started before
-            // them would be left running by an early return.
-            //
-            // That is survivable now — the worker also exits when its stop
-            // sender is dropped — but relying on the escape hatch instead of the
-            // ordering means the next fallible step added above the start is a
-            // hang again.
-            // The snapshot rather than a `Router`: the daemon publishes a
-            // combined runtime — the table *and* the keys derived from it —
-            // and a `Router` here would be a second place a table could be
-            // installed, which is exactly the split this replaces.
-            let snapshot = started.snapshot.clone();
-            let watcher = std::mem::take(&mut started.watcher);
-
-            Some((started, (db_path, snapshot, watcher)))
-        }
-        _ => {
-            tracing::warn!(
-                "PIGEON_CONFIG is unset: running on Milestone 0 environment configuration.                  No database, no routing table, no DNS validation."
-            );
-            None
-        }
-    };
-
-    let listen = match &booted {
-        Some((b, _)) => b.config.config().smtp.inbound.listen.to_string(),
-        None => env_or("PIGEON_LISTEN", "127.0.0.1:2525"),
-    };
-    let hostname = match &booted {
-        Some((b, _)) => b.config.config().hostname.clone(),
-        None => env_or("PIGEON_HOSTNAME", "localhost"),
-    };
-    // The listener config takes `hostname` by value below.
-    let hostname_for_worker = hostname.clone();
-    let spool = match &booted {
-        Some((b, _)) => b.config.config().spool.clone(),
-        None => PathBuf::from(env_or("PIGEON_SPOOL", "./spool")),
-    };
-
-    // Case preserved. The local part belongs to the destination host and only
-    // the domain may be folded, which `accepts_recipient` does at comparison
-    // time — see `Address::same_mailbox`.
-    let accept: HashSet<String> = env_or("PIGEON_ACCEPT", "")
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    // Entries that cannot be parsed would silently never match, so a typo in
-    // the accept list would present as mail being refused for no stated
-    // reason. Local, unambiguous misconfiguration: stop startup.
-    for entry in &accept {
-        if pigeon_types::Address::parse(entry).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("PIGEON_ACCEPT contains an invalid address: {entry:?}"),
-            ));
-        }
-    }
-
-    // Already done inside `startup::start` on the config path, in the ordered
-    // position. Repeating it here would probe twice and, worse, would put step 6
-    // after step 8 for one of the two paths.
-    if booted.is_none() {
-        // An unusable spool is local, unambiguous misconfiguration, so it stops
-        // startup rather than being discovered on the first message.
-        prepare_spool(&spool).await.map_err(|e| {
+    // Configuration comes from a file. There is no environment fallback: the
+    // Milestone 0 runtime — `PIGEON_ACCEPT` deciding recipients and
+    // `PIGEON_FORWARD_TO` naming one destination — is retired, because routing
+    // now decides both and a fallback that answers those questions differently
+    // is a second, unrouted way to accept and forward mail.
+    let config_path = std::env::var("PIGEON_CONFIG")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
             io::Error::new(
-                e.kind(),
-                format!("spool directory {} is unusable: {e}", spool.display()),
+                io::ErrorKind::InvalidInput,
+                "PIGEON_CONFIG is unset. pigeond needs a configuration file: it holds the \n\
+                 database that carries the routing table, the spool directory and the SRS \n\
+                 key ring. See docs/CONFIG.md.",
             )
         })?;
+
+    let mut started = startup::start(Path::new(&config_path), |dir| async move {
+        prepare_spool(&dir).await
+    })
+    .await
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
+
+    if started.migration.is_empty() {
+        tracing::info!(version = started.migration.to, "database schema up to date");
+    } else {
+        tracing::info!(
+            from = started.migration.from,
+            to = started.migration.to,
+            applied = ?started.migration.versions,
+            backup = ?started.migration.backup,
+            "database migrated"
+        );
     }
+    for w in &started.warnings {
+        tracing::warn!("{w}");
+    }
+
+    let domains = started.snapshot.domain_names().count();
+    let schema = pigeon_db::schema_version(&started.db).unwrap_or(0);
+    let db_path = started.config.config().database.clone();
+    tracing::info!(schema, "control plane open");
+    tracing::info!(domains, "routing table serving");
+
+    // The pieces the reload worker needs, carried forward. It is deliberately
+    // **not** started here: everything between this point and the listener
+    // binding can fail, and a worker started before them would be left running
+    // by an early return.
+    //
+    // The snapshot rather than a `Router`: the daemon publishes a combined
+    // runtime — the table *and* the keys derived from it — and a `Router` here
+    // would be a second place a table could be installed.
+    let snapshot = started.snapshot.clone();
+    let watcher = std::mem::take(&mut started.watcher);
+    let _ = watcher;
+
+    let listen = started.config.config().smtp.inbound.listen.to_string();
+    let hostname = started.config.config().hostname.clone();
+    // The listener config takes `hostname` by value below.
+    let hostname_for_worker = hostname.clone();
+    let spool = started.config.config().spool.clone();
     let sink_dir = spool.clone();
 
     let listener = TcpListener::bind(&listen)
         .await
         .map_err(|e| io::Error::new(e.kind(), format!("cannot bind {listen}: {e}")))?;
 
-    if accept.is_empty() {
-        tracing::warn!(
-            "PIGEON_ACCEPT is unset: accepting every recipient. \
-             Set it to a comma-separated list once you have real addresses."
-        );
-    }
-
     tracing::info!(
         %listen,
         %hostname,
         spool = %spool.display(),
-        recipients = accept.len(),
+        domains,
         "pigeond listening"
     );
 
-    // A resolver that cannot be built is local misconfiguration and stops
-    // startup. A resolver that later fails to answer is not, and must not.
-    let forwarding = match std::env::var("PIGEON_FORWARD_TO") {
-        Ok(destination) if !destination.trim().is_empty() => {
-            let destination = destination.trim().to_string();
-
-            // Local, unambiguous misconfiguration, so it stops startup — the
-            // policy this module opens by stating. Checked here rather than
-            // per-message because the alternative is a daemon that starts
-            // cleanly, answers 250 to everything, and fails every delivery.
-            if pigeon_types::Address::parse(&destination).is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("PIGEON_FORWARD_TO is not a valid address: {destination:?}"),
-                ));
-            }
-
-            let resolver = SystemResolver::from_system()
-                .map_err(|e| io::Error::other(format!("cannot build resolver: {e}")))?;
-            tracing::info!(%destination, "forwarding enabled");
-            Some(Forwarding {
-                resolver: Arc::new(resolver),
-                ehlo_name: hostname.clone(),
-                destination,
-                limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
-                port: SUBMISSION_PORT,
-                budget: TOTAL_FORWARD_BUDGET,
-            })
-        }
-        _ => {
-            tracing::info!("PIGEON_FORWARD_TO is unset: messages will be spooled only");
-            None
-        }
+    // Where mail goes is decided by routing and recorded in the queue, so what
+    // is built here is only *how* it is sent: the resolver, the EHLO name and
+    // the concurrency bound. A resolver that cannot be built is local
+    // misconfiguration and stops startup. A resolver that later fails to
+    // answer is not, and must not.
+    let forwarding = Forwarding {
+        resolver: Arc::new(
+            SystemResolver::from_system()
+                .map_err(|e| io::Error::other(format!("cannot build resolver: {e}")))?,
+        ),
+        ehlo_name: hostname.clone(),
+        limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
+        port: SUBMISSION_PORT,
+        budget: TOTAL_FORWARD_BUDGET,
     };
 
     // Anything already in the spool was accepted by a previous run and never
@@ -1738,29 +1547,23 @@ async fn run() -> io::Result<()> {
     // The ring is loaded once and shared by both users below. Loading it twice
     // would put two copies of the secret in memory and, worse, allow them to
     // disagree after a rotation.
-    let auth = match &booted {
-        Some((b, (_, snapshot, _))) => Some(build_auth(b, snapshot.clone(), &hostname)?),
-        None => None,
-    };
+    let auth = build_auth(&started, snapshot, &hostname)?;
+
+    // Cloned before the sink takes ownership: the reload worker publishes into
+    // the same state the sink reads from, which is the point.
+    let auth_runtime = Arc::clone(&auth.runtime);
 
     // R-4: a sender whose rewritten return path would not fit in a 64-octet
     // local part cannot be forwarded, and the last moment at which refusing is
     // still the *upstream* MTA's problem is `RCPT`. After `250` there is a
     // message that can neither be forwarded nor bounced, and generating a DSN
-    // here would be generating mail — which needs the Milestone 3 queue.
-    //
-    // Absent configuration, no check: a Pigeon with no SRS ring refuses nobody
-    // for this reason.
-    // Cloned before the sink takes ownership: the reload worker publishes into
-    // the same state the sink reads from, which is the point.
-    let auth_runtime = auth.as_ref().map(|a| Arc::clone(&a.runtime));
-
-    let return_path = auth.as_ref().map(|a| {
+    // for it would be Pigeon owning a failure it could have declined.
+    let return_path = {
         // The published runtime rather than a captured ring: a rotation must
         // change what this refuses as well as what the pipeline signs, and both
         // read the same state.
-        let runtime = Arc::clone(&a.runtime);
-        Arc::new(move |sender: &str| {
+        let runtime = Arc::clone(&auth.runtime);
+        Some(Arc::new(move |sender: &str| {
             let srs = Arc::clone(&runtime.pin().srs);
             let (local, domain) = sender.rsplit_once('@').unwrap_or((sender, ""));
             match srs.forward(local, domain, pigeon_auth::Day::now()) {
@@ -1771,8 +1574,9 @@ async fn run() -> io::Result<()> {
                 // fault.
                 _ => Ok(()),
             }
-        }) as Arc<pigeon_smtp::server::SharedReturnPathCheck>
-    });
+        })
+            as Arc<pigeon_smtp::server::SharedReturnPathCheck>)
+    };
 
     // A claim must outlast the delivery it covers, or a row is reclaimed
     // underneath a live attempt and the remote's real answer is discarded as
@@ -1787,32 +1591,25 @@ async fn run() -> io::Result<()> {
     // The queue's own connection. Opened here rather than shared with the
     // reload worker's: that one is read-only by design, so that a detector
     // cannot write, and acceptance needs to.
-    let queue = match &booted {
-        Some((b, (db_path, _, _))) => {
-            let conn = pigeon_db::open(db_path).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("cannot open {} for queueing: {e}", db_path.display()),
-                )
-            })?;
-            let _ = b;
-            Some(Queue {
-                conn: Arc::new(tokio::sync::Mutex::new(conn)),
-                path: Arc::new(db_path.clone()),
-            })
+    let queue = {
+        let conn = pigeon_db::open(&db_path).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cannot open {} for queueing: {e}", db_path.display()),
+            )
+        })?;
+        Queue {
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            path: Arc::new(db_path.clone()),
         }
-        None => None,
     };
 
     let sink = SpoolSink {
-        queue,
+        queue: queue.clone(),
         spool: pigeon_spool::Spool::new(sink_dir.clone()),
-        dir: Arc::new(sink_dir),
-        auth,
-        accept: Arc::new(accept),
+        auth: auth.clone(),
         counter: Arc::new(AtomicU64::new(0)),
         boot: std::process::id(),
-        forwarding,
     };
 
     let config = ServerConfig {
@@ -1824,59 +1621,43 @@ async fn run() -> io::Result<()> {
         ..Default::default()
     };
 
-    // The delivery loop, if there is a queue to deliver from. Started after
-    // every fallible step, for the reason the reload worker is: an early `?`
-    // between the start and the listener bind would drop the handle and leave
-    // the task running.
-    let stop_delivery = match (&sink.queue, &sink.forwarding, &sink.auth) {
-        (Some(queue), Some(forwarding), Some(auth)) => {
-            let worker = worker_identity(&hostname_for_worker);
-            tracing::info!(%worker, concurrency = MAX_CONCURRENT_DELIVERIES, "delivery worker starting");
-            let d = delivery::Deliverer::start(delivery::DeliveryConfig {
-                queue: queue.clone(),
-                // The ring as published, so a rotation reaches the notifier
-                // the same way it reaches signing.
-                srs: Arc::clone(&auth.runtime.pin().srs),
-                hostname: hostname_for_worker.clone(),
-                spool: sink.spool.clone(),
-                forwarding: forwarding.clone(),
-                concurrency: MAX_CONCURRENT_DELIVERIES,
-                lease_seconds: CLAIM_LEASE.as_secs() as i64,
-                horizon_seconds: GIVE_UP_AFTER.as_secs() as i64,
-                worker,
-            });
-            Some(d)
-        }
-        _ => None,
-    };
+    // The delivery loop. Started after every fallible step, for the reason the
+    // reload worker is: an early `?` between the start and the listener bind
+    // would drop the handle and leave the task running.
+    let worker = worker_identity(&hostname_for_worker);
+    tracing::info!(%worker, concurrency = MAX_CONCURRENT_DELIVERIES, "delivery worker starting");
+    let stop_delivery = delivery::Deliverer::start(delivery::DeliveryConfig {
+        queue: queue.clone(),
+        // The ring as published, so a rotation reaches the notifier the same
+        // way it reaches signing.
+        srs: Arc::clone(&auth.runtime.pin().srs),
+        hostname: hostname_for_worker.clone(),
+        spool: sink.spool.clone(),
+        forwarding: forwarding.clone(),
+        concurrency: MAX_CONCURRENT_DELIVERIES,
+        lease_seconds: CLAIM_LEASE.as_secs() as i64,
+        horizon_seconds: GIVE_UP_AFTER.as_secs() as i64,
+        worker,
+    });
 
     // Supervised from here rather than left to a dropped handle. A panicking
     // task cannot report its own death, and an unpolled `JoinHandle` holds the
     // result silently — a daemon that spawned the worker and forgot it would
     // keep serving the last published table forever with routing frozen and
     // nothing saying why.
-    // Started here, after every fallible step: the spool probe, the listener
-    // bind, the resolver. Nothing below this line returns early before the
-    // shutdown path.
     //
-    // The routing table is republished when the database changes even though
-    // nothing routes from it yet, so the detector — the part with the property
-    // worth proving — is exercised by every run rather than only once it has a
-    // consumer.
     // The reload worker publishes into the combined runtime, so a reload that
     // adds or rotates a key installs the table and the key together or neither.
     // Publishing the table alone would leave a `rewrite_from` domain with no
     // key, or one still signing with the key that was just retired.
-    let stop_reload = booted
-        .zip(auth_runtime)
-        .map(|((_, (db_path, _, _)), runtime)| {
-            let r = reload::Reloader::start(db_path, runtime);
-            // `supervise` consumes the handle and becomes the only join, so the
-            // stopper is taken first. Two ways to stop one worker would be two
-            // orderings to keep straight.
-            let stopper = r.stopper();
-            (stopper, r.supervise())
-        });
+    let stop_reload = {
+        let r = reload::Reloader::start(db_path, auth_runtime);
+        // `supervise` consumes the handle and becomes the only join, so the
+        // stopper is taken first. Two ways to stop one worker would be two
+        // orderings to keep straight.
+        let stopper = r.stopper();
+        (stopper, r.supervise())
+    };
 
     let outcome = tokio::select! {
         r = pigeon_smtp::serve(listener, config, sink) => r,
@@ -1887,9 +1668,8 @@ async fn run() -> io::Result<()> {
     };
 
     // Signalled *and* joined, through the supervisor.
-    if let Some((stopper, supervisor)) = stop_reload {
-        stopper.stop_and_join(supervisor).await;
-    }
+    let (stopper, supervisor) = stop_reload;
+    stopper.stop_and_join(supervisor).await;
 
     // The delivery loop stops taking new work; attempts already in flight are
     // left to finish or to be reclaimed by lease expiry after a restart. Not
@@ -1897,12 +1677,10 @@ async fn run() -> io::Result<()> {
     // waiting for one would make shutdown hostage to the slowest remote server
     // currently being tried. The claim token is what makes an unjoined
     // attempt harmless.
-    if let Some(d) = stop_delivery {
-        d.stop();
-        // Supervised so a panic in the loop is reported rather than swallowed,
-        // and not awaited so shutdown does not wait on a delivery in flight.
-        drop(d.supervise());
-    }
+    stop_delivery.stop();
+    // Supervised so a panic in the loop is reported rather than swallowed, and
+    // not awaited so shutdown does not wait on a delivery in flight.
+    drop(stop_delivery.supervise());
 
     outcome
 }
@@ -1950,73 +1728,99 @@ mod tests {
         }
     }
 
-    /// A sink that spools and stops. `FakeResolver` names the type parameter
-    /// without ever being asked anything.
-    fn sink(dir: &Path, accept: &[&str]) -> SpoolSink<pigeon_dns::FakeResolver> {
-        SpoolSink {
-            queue: None,
-            spool: pigeon_spool::Spool::new(dir.to_path_buf()),
-            auth: None,
-            dir: Arc::new(dir.to_path_buf()),
-            accept: Arc::new(accept.iter().map(|s| s.to_string()).collect()),
-            counter: Arc::new(AtomicU64::new(0)),
-            boot: 0x1234_5678,
-            forwarding: None,
+    /// One managed domain, with a catch-all so every local part routes.
+    ///
+    /// Aliases are the router's own subject; what these tests need is a table
+    /// that accepts and resolves, so the fixture is deliberately plain.
+    fn test_domain(name: &str, destination: &str) -> pigeon_route::snapshot::DomainInput {
+        let (local, host) = destination.rsplit_once('@').expect("a destination address");
+        pigeon_route::snapshot::DomainInput {
+            name: name.into(),
+            gate: pigeon_types::DomainGate {
+                status: pigeon_types::DomainStatus::Active,
+                inbound_enabled: true,
+                outbound_enabled: false,
+            },
+            plus_addressing: true,
+            forwarding: pigeon_route::snapshot::Forwarding {
+                policy: pigeon_types::ForwardPolicy::Preserve,
+                dkim: None,
+            },
+            default_destination: Some(pigeon_route::snapshot::Destination {
+                local: local.into(),
+                domain: host.into(),
+            }),
+            aliases: Vec::new(),
+            catchall: Some(pigeon_route::snapshot::CatchAllInput { destination: None }),
         }
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_spooled_message_is_the_bytes_that_will_be_sent() {
-        // The envelope no longer sits beside the message: the sender and the
-        // recipients are `message`, `original_recipient` and `delivery` rows,
-        // which is what makes them queryable and retryable. What is on disk is
-        // exactly what goes on the wire.
-        let tmp = TempDir::new("write");
-        let s = sink(tmp.path(), &[]);
-
-        let id = s.next_id();
-        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
-        s.install(&spool_id, "Received: here\r\n", b"body\r\n")
-            .await
-            .expect("install");
-
-        let eml = tokio::fs::read(tmp.path().join(format!("{id}.eml")))
-            .await
-            .unwrap();
-        assert_eq!(eml, b"Received: here\r\nbody\r\n");
-
-        // And nothing beside it.
-        let mut entries: Vec<String> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        entries.sort();
-        assert_eq!(entries, vec![format!("{id}.eml")], "a sidecar was written");
+    /// A sink with a real database and a real routing table behind it.
+    ///
+    /// Both are required now: there is no configuration under which the daemon
+    /// accepts mail without a queue to put it in or a table to route it with.
+    fn queued_sink(dir: &Path) -> (SpoolSink, PathBuf) {
+        queued_sink_for(
+            dir,
+            vec![test_domain("example.com", "mailbox@provider.example")],
+        )
     }
 
-    #[tokio::test]
-    async fn discarding_a_message_twice_is_not_an_error() {
-        // The operator may have cleaned up by hand, and a second failure here
-        // would only produce noise about work already done.
-        let tmp = TempDir::new("discard");
-        discard_spooled(tmp.path(), "absent")
-            .await
-            .expect("discard");
-    }
-
-    /// A sink with a real database behind it, for the acceptance path.
-    fn queued_sink(dir: &Path) -> (SpoolSink<pigeon_dns::FakeResolver>, PathBuf) {
+    fn queued_sink_for(
+        dir: &Path,
+        domains: Vec<pigeon_route::snapshot::DomainInput>,
+    ) -> (SpoolSink, PathBuf) {
         let db = dir.join("pigeon.db");
         let mut conn = pigeon_db::open(&db).unwrap();
         pigeon_db::migrate(&mut conn, &db).unwrap();
 
-        let mut s = sink(dir, &[]);
-        s.queue = Some(Queue {
-            conn: Arc::new(tokio::sync::Mutex::new(conn)),
-            path: Arc::new(db.clone()),
-        });
-        (s, db)
+        let sink = SpoolSink {
+            queue: Queue {
+                conn: Arc::new(tokio::sync::Mutex::new(conn)),
+                path: Arc::new(db.clone()),
+            },
+            spool: pigeon_spool::Spool::new(dir.to_path_buf()),
+            auth: auth_for(domains, false),
+            counter: Arc::new(AtomicU64::new(0)),
+            boot: 0x1234_5678,
+        };
+        (sink, db)
+    }
+
+    /// Route one address the way `RCPT TO` does, and hand back the transaction.
+    fn transaction_for(sink: &SpoolSink, recipients: &[&str]) -> Transaction {
+        let mut txn = sink.begin();
+        for r in recipients {
+            assert_eq!(
+                sink.accepts_recipient(&mut txn, r, &[]),
+                Recipient::Accept,
+                "the fixture should accept {r}"
+            );
+        }
+        txn
+    }
+
+    /// One accepted message, through the whole acceptance path.
+    async fn accept_message(
+        sink: &SpoolSink,
+        from: &str,
+        recipients: &[&str],
+    ) -> Result<String, DataError> {
+        let txn = transaction_for(sink, recipients);
+        sink.deliver_inner(
+            txn,
+            Message {
+                envelope: Envelope {
+                    sender: from.into(),
+                    recipients: recipients.iter().map(|r| r.to_string()).collect(),
+                },
+                peer: "192.0.2.10".parse().unwrap(),
+                helo: "sender.example".into(),
+                received: "Received: from sender.example\r\n".into(),
+                body: b"From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody\r\n".to_vec(),
+            },
+        )
+        .await
     }
 
     // ------------------------------------------------------ the delivery loop
@@ -2085,7 +1889,6 @@ mod tests {
                     vec![MxRecord::new(10, peer_addr.ip().to_string())],
                 )),
                 ehlo_name: "pigeon.test".into(),
-                destination: String::new(),
                 limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
                 port: peer_addr.port(),
                 budget: Duration::from_secs(5),
@@ -2631,104 +2434,104 @@ mod tests {
         );
     }
 
+    /// One group, as `DATA` would hand it to `admit`.
+    fn prepared_group(id: &str, group: routing::Group) -> Prepared {
+        Prepared {
+            id: id.to_string(),
+            spool_id: pigeon_spool::SpoolId::new(id).unwrap(),
+            group,
+            size: 10,
+            outcome: None,
+        }
+    }
+
+    fn one_destination(domain: &str, recipient: &str, destination: &str) -> routing::Group {
+        routing::Group {
+            domain: domain.into(),
+            recipients: vec![recipient.into()],
+            destinations: vec![routing::Destination {
+                address: destination.into(),
+                from_recipients: vec![0],
+            }],
+        }
+    }
+
     #[tokio::test]
     async fn acceptance_records_the_runtime_it_was_pinned_to() {
         // What "recorded, never re-resolved" means at the boundary: the message
         // carries the revision *and* the fingerprint of the configuration that
-        // decided its rows, both taken from the one pinned runtime. A restore
-        // that rewinds the counter afterwards cannot make this pair look like
-        // any other configuration's.
+        // decided its rows, both taken from the one runtime pinned at `MAIL
+        // FROM`. A restore that rewinds the counter afterwards cannot make this
+        // pair look like any other configuration's.
         let tmp = TempDir::new("admit-identity");
         let (s, db) = queued_sink(tmp.path());
-        let id = s.next_id();
-        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
-        let runtime = runtime_for(7, RING_A, None);
+        let pinned = s.auth.runtime.pin();
 
-        let envelope = Envelope {
-            sender: "SRS0=tag=AAA=remote.test=alice@pigeon.test".into(),
-            recipients: vec!["hello@example.com".into()],
-        };
-
-        s.admit(
-            s.queue.as_ref().unwrap(),
-            &spool_id,
-            Admission {
-                envelope: &envelope,
-                original_sender: "alice@remote.test",
-                size: 10,
-                destination: "mailbox@provider.example",
-                routing: Some(&runtime),
-            },
-        )
-        .await
-        .expect("admit");
+        accept_message(&s, "alice@remote.test", &["hello@example.com"])
+            .await
+            .expect("the message should be accepted");
 
         let conn = pigeon_db::open(&db).unwrap();
         let (revision, fingerprint): (i64, Vec<u8>) = conn
             .query_row(
-                "SELECT routing_revision, routing_fingerprint FROM message WHERE spool_id = ?1",
-                [spool_id.as_str()],
+                "SELECT routing_revision, routing_fingerprint FROM message",
+                [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
 
         assert_eq!(
-            revision, 7,
+            revision, pinned.revision,
             "the accepted message lost its routing revision"
         );
         assert_eq!(
             fingerprint,
-            runtime.fingerprint.to_vec(),
+            pinned.fingerprint.to_vec(),
             "the accepted message was not recorded under the pinned configuration"
         );
     }
 
     #[tokio::test]
-    async fn admission_writes_the_graph_the_dsn_will_need() {
+    async fn acceptance_writes_the_graph_the_dsn_will_need() {
         // The envelope moved from a sidecar into rows, so what used to be a
         // string in a file is now a graph: the return path, the address the
         // sender actually used, every recipient they named, and which of them
         // reaches each destination.
         let tmp = TempDir::new("admit");
         let (s, db) = queued_sink(tmp.path());
-        let id = s.next_id();
-        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
 
-        let envelope = Envelope {
-            // Already rewritten by the time admission runs.
-            sender: "SRS0=tag=AAA=remote.test=alice@pigeon.test".into(),
-            recipients: vec!["hello@example.com".into(), "sales@example.com".into()],
-        };
-
-        s.admit(
-            s.queue.as_ref().unwrap(),
-            &spool_id,
-            Admission {
-                envelope: &envelope,
-                original_sender: "alice@remote.test",
-                size: 1234,
-                destination: "mailbox@provider.example",
-                routing: None,
-            },
+        accept_message(
+            &s,
+            "alice@remote.test",
+            &["hello@example.com", "sales@example.com"],
         )
         .await
-        .expect("admit");
+        .expect("the message should be accepted");
 
         let conn = pigeon_db::open(&db).unwrap();
-        let (return_path, original, size): (String, String, i64) = conn
+        let (return_path, original): (String, String) = conn
             .query_row(
-                "SELECT return_path, original_sender, size_bytes FROM message WHERE spool_id = ?1",
-                [spool_id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                "SELECT return_path, original_sender FROM message",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(return_path, "SRS0=tag=AAA=remote.test=alice@pigeon.test");
+        // Rewritten by the time admission runs, and the address a person would
+        // recognise is kept beside it.
+        assert!(
+            return_path.starts_with("SRS0="),
+            "the return path was not rewritten: {return_path}"
+        );
         assert_eq!(original, "alice@remote.test");
-        assert_eq!(size, 1234);
 
-        // Both recipients, and both mapped to the destination — the mapping is
-        // what lets a report name the address the sender wrote rather than the
-        // mailbox they have never heard of.
+        // Both recipients reach one mailbox, so there is one delivery — and
+        // both are mapped to it, which is what lets a report name the address
+        // the sender wrote rather than the mailbox they have never heard of.
+        let deliveries: i64 = conn
+            .query_row("SELECT count(*) FROM delivery", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(deliveries, 1, "one mailbox became two deliveries");
+
         let mut stmt = conn
             .prepare(
                 "SELECT o.address FROM original_recipient o
@@ -2746,41 +2549,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_managed_domain_is_accepted_as_its_own_message() {
+        // R-2 through the real path: one submission, two managed domains, two
+        // messages with their own bytes and their own delivery sets — and no
+        // deduplication across them, because the sender addressed two
+        // recipients and the two relay forms are signed under different
+        // identities.
+        let tmp = TempDir::new("split");
+        let (s, db) = queued_sink_for(
+            tmp.path(),
+            vec![
+                test_domain("one.example", "shared@provider.example"),
+                test_domain("two.example", "shared@provider.example"),
+            ],
+        );
+
+        accept_message(&s, "alice@remote.test", &["a@one.example", "b@two.example"])
+            .await
+            .expect("the message should be accepted");
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 2, "the submission did not split by domain");
+
+        let deliveries: i64 = conn
+            .query_row("SELECT count(*) FROM delivery", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            deliveries, 2,
+            "one mailbox reached from two domains was deduplicated across messages"
+        );
+
+        // Each message carries only its own recipient.
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, o.address FROM message m
+                   JOIN original_recipient o ON o.message_id = m.id
+                  ORDER BY m.id, o.address",
+            )
+            .unwrap();
+        let pairs: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (1, "a@one.example".to_string()),
+                (2, "b@two.example".to_string())
+            ]
+        );
+
+        // Two spool files, one per group: separate bytes, separately signed.
+        let spooled = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".eml"))
+            .count();
+        assert_eq!(spooled, 2, "the two groups shared one set of bytes");
+    }
+
+    #[tokio::test]
     async fn a_bounce_is_admitted_with_an_empty_return_path() {
         // The null sender is a fact the queue has to carry: §9 owes no report
         // for a message that is itself a bounce, and that rule reads
         // `return_path`.
         let tmp = TempDir::new("bounce");
         let (s, db) = queued_sink(tmp.path());
-        let id = s.next_id();
-        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
 
-        let envelope = Envelope {
-            sender: String::new(),
-            recipients: vec!["a@example.net".into()],
-        };
-
-        s.admit(
-            s.queue.as_ref().unwrap(),
-            &spool_id,
-            Admission {
-                envelope: &envelope,
-                original_sender: "",
-                size: 10,
-                destination: "mailbox@provider.example",
-                routing: None,
-            },
-        )
-        .await
-        .expect("admit");
+        accept_message(&s, "", &["hello@example.com"])
+            .await
+            .expect("a bounce should be accepted");
 
         let conn = pigeon_db::open(&db).unwrap();
         let return_path: String = conn
-            .query_row(
-                "SELECT return_path FROM message WHERE spool_id = ?1",
-                [spool_id.as_str()],
-                |r| r.get(0),
-            )
+            .query_row("SELECT return_path FROM message", [], |r| r.get(0))
             .unwrap();
         assert!(return_path.is_empty(), "a bounce gained a return path");
     }
@@ -2788,43 +2634,31 @@ mod tests {
     #[tokio::test]
     async fn an_admission_that_cannot_commit_says_whether_the_file_may_go() {
         // The rule the acceptance path turns on. A collision is established
-        // non-commit, so the spool file is an orphan and may be removed.
+        // non-commit, so the spool files are orphans and may be removed.
         let tmp = TempDir::new("collide");
         let (s, _db) = queued_sink(tmp.path());
         let id = s.next_id();
-        let spool_id = pigeon_spool::SpoolId::new(&id).unwrap();
         let envelope = Envelope {
             sender: "SRS0=x@pigeon.test".into(),
-            recipients: vec!["a@example.net".into()],
+            recipients: vec!["hello@example.com".into()],
         };
-        let queue = s.queue.as_ref().unwrap();
+        let runtime = s.auth.runtime.pin();
+        let prepared = vec![prepared_group(
+            &id,
+            one_destination("example.com", "hello@example.com", "m@provider.example"),
+        )];
 
-        s.admit(
-            queue,
-            &spool_id,
-            Admission {
-                envelope: &envelope,
-                original_sender: "a@remote.test",
-                size: 10,
-                destination: "m@provider.example",
-                routing: None,
-            },
-        )
-        .await
-        .expect("first admission");
+        let admission = || Admission {
+            prepared: &prepared,
+            envelope: &envelope,
+            original_sender: "a@remote.test",
+            routing: &runtime,
+        };
+
+        s.admit(admission()).await.expect("first admission");
 
         let (why, removable) = s
-            .admit(
-                queue,
-                &spool_id,
-                Admission {
-                    envelope: &envelope,
-                    original_sender: "a@remote.test",
-                    size: 10,
-                    destination: "m@provider.example",
-                    routing: None,
-                },
-            )
+            .admit(admission())
             .await
             .expect_err("a second admission of the same spool id should fail");
         assert!(
@@ -2836,45 +2670,85 @@ mod tests {
     #[test]
     fn identifiers_do_not_repeat_within_a_run() {
         let tmp = TempDir::new("ids");
-        let s = sink(tmp.path(), &[]);
-        let ids: HashSet<String> = (0..1000).map(|_| s.next_id()).collect();
+        let (s, _db) = queued_sink(tmp.path());
+        let ids: std::collections::HashSet<String> = (0..1000).map(|_| s.next_id()).collect();
         assert_eq!(ids.len(), 1000, "identifier collision within one run");
     }
 
     #[test]
-    fn the_accept_list_folds_the_domain_and_not_the_local_part() {
-        let tmp = TempDir::new("accept");
-        let s = sink(tmp.path(), &["Bob@Example.com"]);
+    fn rcpt_is_answered_from_the_routing_table() {
+        // The mapping the sink owns: what routing decides becomes what the
+        // sender is told, and the difference between the two refusals matters.
+        // A permanent refusal for a gated domain would tell a sender to give up
+        // on a mailbox that is about to work.
+        let tmp = TempDir::new("rcpt");
+        let (s, _db) = queued_sink_for(
+            tmp.path(),
+            vec![
+                test_domain("example.com", "mailbox@provider.example"),
+                {
+                    let mut gated = test_domain("gated.example", "mailbox@provider.example");
+                    gated.gate.inbound_enabled = false;
+                    gated
+                },
+                {
+                    // A domain with no catch-all and no alias: carried, but
+                    // nothing routes.
+                    let mut empty = test_domain("empty.example", "mailbox@provider.example");
+                    empty.catchall = None;
+                    empty
+                },
+            ],
+        );
 
-        assert!(
-            s.accepts_recipient_inner("Bob@example.com"),
-            "domain not folded"
+        let mut txn = s.begin();
+        assert_eq!(
+            s.accepts_recipient(&mut txn, "hello@example.com", &[]),
+            Recipient::Accept
         );
-        assert!(
-            s.accepts_recipient_inner("Bob@EXAMPLE.COM"),
-            "domain not folded"
+        assert_eq!(
+            s.accepts_recipient(&mut txn, "hello@unmanaged.example", &[]),
+            Recipient::Reject,
+            "an unmanaged domain was not refused permanently"
         );
-        // A different mailbox, and one the operator never listed. RFC 5321
-        // §2.4 reserves the local part to the destination host.
-        assert!(
-            !s.accepts_recipient_inner("bob@example.com"),
-            "folded the local part"
+        assert_eq!(
+            s.accepts_recipient(&mut txn, "hello@empty.example", &[]),
+            Recipient::Reject,
+            "an address nothing routes was not refused permanently"
+        );
+        assert_eq!(
+            s.accepts_recipient(&mut txn, "hello@gated.example", &[]),
+            Recipient::Defer,
+            "a gated domain was refused permanently"
         );
     }
 
-    #[test]
-    fn an_empty_accept_list_accepts_anything() {
-        let tmp = TempDir::new("accept-any");
-        let s = sink(tmp.path(), &[]);
-        assert!(s.accepts_recipient_inner("whoever@example.com"));
-    }
+    #[tokio::test]
+    async fn a_gated_domain_is_refused_before_the_message_is_taken() {
+        // Gating decides at `RCPT`, which is the last moment refusing is the
+        // upstream MTA's problem. A domain switched off must never reach the
+        // point where Pigeon owes a bounce for it.
+        let tmp = TempDir::new("gate-before-250");
+        let (s, db) = queued_sink_for(
+            tmp.path(),
+            vec![{
+                let mut gated = test_domain("gated.example", "mailbox@provider.example");
+                gated.gate.inbound_enabled = false;
+                gated
+            }],
+        );
 
-    #[test]
-    fn malformed_recipients_are_not_accepted_by_a_configured_list() {
-        let tmp = TempDir::new("accept-bad");
-        let s = sink(tmp.path(), &["a@example.com"]);
-        assert!(!s.accepts_recipient_inner("not-an-address"));
-        assert!(!s.accepts_recipient_inner("x@."));
+        let mut txn = s.begin();
+        assert_eq!(
+            s.accepts_recipient(&mut txn, "hello@gated.example", &[]),
+            Recipient::Defer
+        );
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 0, "a refused recipient reached the queue");
     }
 
     #[tokio::test]
@@ -2905,61 +2779,107 @@ mod tests {
     // listener → session → spool → resolver → delivery client → receiving
     // server in one run, which is the path a real message actually takes.
 
-    /// Drive the real server with the real sink against a scripted peer.
+    /// Drive the real server, the real sink and the real delivery worker
+    /// against a scripted peer.
     ///
     /// The resolver is fake and the port is injected, so no DNS is consulted
-    /// and nothing leaves the loopback interface — but every other component
-    /// is the production one.
+    /// and nothing leaves the loopback interface — but every other component is
+    /// the production one, including the queue the message is accepted into and
+    /// the worker that sends it. There is no configuration in which acceptance
+    /// or forwarding happens any other way.
     async fn spawn_daemon(
         dir: &Path,
-        accept: &[&str],
         peer_addr: SocketAddr,
-    ) -> (SocketAddr, Arc<PathBuf>) {
-        spawn_daemon_with_budget(dir, accept, peer_addr, TOTAL_FORWARD_BUDGET).await
+    ) -> (SocketAddr, Arc<PathBuf>, delivery::Deliverer) {
+        spawn_wired(
+            dir,
+            peer_addr,
+            e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true),
+            TOTAL_FORWARD_BUDGET,
+        )
+        .await
     }
 
-    async fn spawn_daemon_with_budget(
+    async fn spawn_authenticated(
         dir: &Path,
-        accept: &[&str],
         peer_addr: SocketAddr,
+        auth: Auth,
+    ) -> (SocketAddr, Arc<PathBuf>, delivery::Deliverer) {
+        spawn_wired(dir, peer_addr, auth, TOTAL_FORWARD_BUDGET).await
+    }
+
+    async fn spawn_wired(
+        dir: &Path,
+        peer_addr: SocketAddr,
+        auth: Auth,
         budget: Duration,
-    ) -> (SocketAddr, Arc<PathBuf>) {
+    ) -> (SocketAddr, Arc<PathBuf>, delivery::Deliverer) {
         use pigeon_dns::{FakeResolver, MxRecord};
 
-        let spool = Arc::new(dir.to_path_buf());
-        let resolver = FakeResolver::new().with(
-            "example.net",
-            vec![MxRecord::new(10, peer_addr.ip().to_string())],
-        );
+        let spool_dir = Arc::new(dir.to_path_buf());
+        let db = dir.join("pigeon.db");
+        let mut conn = pigeon_db::open(&db).expect("open");
+        pigeon_db::migrate(&mut conn, &db).expect("migrate");
+        let queue = Queue {
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            path: Arc::new(db),
+        };
+        let spool = pigeon_spool::Spool::new(spool_dir.as_path());
 
         let sink = SpoolSink {
-            queue: None,
-            auth: None,
-            spool: pigeon_spool::Spool::new(spool.as_path()),
-            dir: Arc::clone(&spool),
-            accept: Arc::new(accept.iter().map(|s| s.to_string()).collect()),
+            queue: queue.clone(),
+            auth: auth.clone(),
+            spool: spool.clone(),
             counter: Arc::new(AtomicU64::new(0)),
             boot: 0x0bad_cafe,
-            forwarding: Some(Forwarding {
-                resolver: Arc::new(resolver),
+        };
+
+        let deliverer = delivery::Deliverer::start(delivery::DeliveryConfig {
+            queue,
+            srs: Arc::clone(&auth.runtime.pin().srs),
+            hostname: "pigeon.test".into(),
+            spool,
+            forwarding: Forwarding {
+                resolver: Arc::new(FakeResolver::new().with(
+                    "example.net",
+                    vec![MxRecord::new(10, peer_addr.ip().to_string())],
+                )),
                 ehlo_name: "pigeon.test".into(),
-                destination: "dest@example.net".into(),
                 limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
                 port: peer_addr.port(),
                 budget,
-            }),
-        };
+            },
+            concurrency: MAX_CONCURRENT_DELIVERIES,
+            lease_seconds: CLAIM_LEASE.as_secs() as i64,
+            horizon_seconds: GIVE_UP_AFTER.as_secs() as i64,
+            worker: "test-worker".into(),
+        });
+
+        // The same return-path check production installs (R-4): a sender whose
+        // rewritten address will not fit is refused at `RCPT`, which is the
+        // last moment that refusal is the upstream MTA's problem.
+        let checked = Arc::clone(&auth.runtime);
+        let return_path = Some(Arc::new(move |sender: &str| {
+            let srs = Arc::clone(&checked.pin().srs);
+            let (local, domain) = sender.rsplit_once('@').unwrap_or((sender, ""));
+            match srs.forward(local, domain, pigeon_auth::Day::now()) {
+                Err(pigeon_auth::SrsError::TooLong { octets }) => Err(octets),
+                _ => Ok(()),
+            }
+        })
+            as Arc<pigeon_smtp::server::SharedReturnPathCheck>);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let config = ServerConfig {
             hostname: "pigeon.test".into(),
+            return_path,
             ..ServerConfig::default()
         };
         tokio::spawn(async move {
             let _ = pigeon_smtp::serve(listener, config, sink).await;
         });
-        (addr, spool)
+        (addr, spool_dir, deliverer)
     }
 
     /// Send one message through a real SMTP conversation.
@@ -3030,35 +2950,48 @@ mod tests {
     fn e2e_auth(domain: &str, policy: pigeon_types::ForwardPolicy, with_key: bool) -> Auth {
         use pigeon_route::snapshot::{DkimIdentity, DomainInput, Forwarding as RouteForwarding};
 
-        let snapshot = pigeon_route::Snapshot::build(vec![DomainInput {
-            name: domain.into(),
-            gate: pigeon_types::DomainGate {
-                status: pigeon_types::DomainStatus::Active,
-                inbound_enabled: true,
-                outbound_enabled: false,
-            },
-            plus_addressing: true,
-            forwarding: RouteForwarding {
-                policy,
-                dkim: Some(DkimIdentity {
-                    selector: "sel".into(),
-                    private_key_path: "unused-in-test".into(),
-                    algorithm: "rsa2048".into(),
+        auth_for(
+            vec![DomainInput {
+                name: domain.into(),
+                gate: pigeon_types::DomainGate {
+                    status: pigeon_types::DomainStatus::Active,
+                    inbound_enabled: true,
+                    outbound_enabled: false,
+                },
+                plus_addressing: true,
+                forwarding: RouteForwarding {
+                    policy,
+                    dkim: Some(DkimIdentity {
+                        selector: "sel".into(),
+                        private_key_path: "unused-in-test".into(),
+                        algorithm: "rsa2048".into(),
+                    }),
+                },
+                default_destination: Some(pigeon_route::snapshot::Destination {
+                    local: "me".into(),
+                    domain: "example.net".into(),
                 }),
-            },
-            default_destination: Some(pigeon_route::snapshot::Destination {
-                local: "me".into(),
-                domain: "example.net".into(),
-            }),
-            aliases: vec![pigeon_route::snapshot::AliasInput {
-                pattern: "hello".into(),
-                reject: false,
-                destinations: vec![],
+                aliases: vec![pigeon_route::snapshot::AliasInput {
+                    pattern: "hello".into(),
+                    reject: false,
+                    destinations: vec![],
+                }],
+                catchall: None,
             }],
-            catchall: None,
-        }])
-        .expect("the fixture configuration should build")
-        .snapshot;
+            with_key,
+        )
+    }
+
+    /// The authentication machinery a wired daemon builds at startup, over a
+    /// snapshot constructed directly — the same type `load` produces.
+    ///
+    /// `with_key` false is how the "signing fails at runtime" case is reached:
+    /// startup validation makes it unreachable in production, so a test has to
+    /// assemble it deliberately.
+    fn auth_for(domains: Vec<pigeon_route::snapshot::DomainInput>, with_key: bool) -> Auth {
+        let snapshot = pigeon_route::Snapshot::build(domains)
+            .expect("the fixture configuration should build")
+            .snapshot;
 
         // The fixture ring, written to a real file so the reconciliation path
         // has something to hash and a rotation test has something to replace.
@@ -3216,66 +3149,8 @@ mod tests {
         dir: &Path,
         peer_addr: SocketAddr,
         auth: Auth,
-    ) -> (SocketAddr, Arc<PathBuf>) {
-        spawn_with_accept(
-            dir,
-            peer_addr,
-            auth,
-            &["hello@example.com", "hello@other.example"],
-        )
-        .await
-    }
-
-    async fn spawn_authenticated(
-        dir: &Path,
-        peer_addr: SocketAddr,
-        auth: Auth,
-    ) -> (SocketAddr, Arc<PathBuf>) {
-        spawn_with_accept(dir, peer_addr, auth, &["hello@example.com"]).await
-    }
-
-    async fn spawn_with_accept(
-        dir: &Path,
-        peer_addr: SocketAddr,
-        auth: Auth,
-        accept: &[&str],
-    ) -> (SocketAddr, Arc<PathBuf>) {
-        use pigeon_dns::{FakeResolver, MxRecord};
-
-        let spool = Arc::new(dir.to_path_buf());
-        let resolver = FakeResolver::new().with(
-            "example.net",
-            vec![MxRecord::new(10, peer_addr.ip().to_string())],
-        );
-
-        let sink = SpoolSink {
-            queue: None,
-            auth: Some(auth),
-            spool: pigeon_spool::Spool::new(spool.as_path()),
-            dir: Arc::clone(&spool),
-            accept: Arc::new(accept.iter().map(|a| a.to_string()).collect()),
-            counter: Arc::new(AtomicU64::new(0)),
-            boot: 0x0bad_cafe,
-            forwarding: Some(Forwarding {
-                resolver: Arc::new(resolver),
-                ehlo_name: "pigeon.test".into(),
-                destination: "dest@example.net".into(),
-                limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
-                port: peer_addr.port(),
-                budget: TOTAL_FORWARD_BUDGET,
-            }),
-        };
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let config = ServerConfig {
-            hostname: "pigeon.test".into(),
-            ..ServerConfig::default()
-        };
-        tokio::spawn(async move {
-            let _ = pigeon_smtp::serve(listener, config, sink).await;
-        });
-        (addr, spool)
+    ) -> (SocketAddr, Arc<PathBuf>, delivery::Deliverer) {
+        spawn_wired(dir, peer_addr, auth, TOTAL_FORWARD_BUDGET).await
     }
 
     /// The single line the peer recorded that carries the message body.
@@ -3292,7 +3167,7 @@ mod tests {
         // The whole path: listener, pipeline, spool, scripted peer.
         let tmp = TempDir::new("e2e-preserve");
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
-        let (addr, spool) = spawn_authenticated(
+        let (addr, spool, _deliverer) = spawn_authenticated(
             tmp.path(),
             peer_addr,
             e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true),
@@ -3425,7 +3300,7 @@ mod tests {
         // would say so.
         let tmp = TempDir::new("e2e-arc-valid");
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
-        let (addr, spool) = spawn_authenticated(
+        let (addr, spool, _deliverer) = spawn_authenticated(
             tmp.path(),
             peer_addr,
             e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true),
@@ -3460,7 +3335,7 @@ mod tests {
         // looks correct and fails at the receiver.
         let tmp = TempDir::new("e2e-dkim-valid");
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
-        let (addr, spool) = spawn_authenticated(
+        let (addr, spool, _deliverer) = spawn_authenticated(
             tmp.path(),
             peer_addr,
             e2e_auth(
@@ -3505,7 +3380,7 @@ mod tests {
         // place to compare against what it recorded.
         let tmp = TempDir::new("e2e-spooled");
         let (peer_addr, transcript) = refusing_peer().spawn().await;
-        let (addr, spool) = spawn_authenticated(
+        let (addr, spool, _deliverer) = spawn_authenticated(
             tmp.path(),
             peer_addr,
             e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true),
@@ -3608,7 +3483,7 @@ mod tests {
         // that one is never written and never sent.
         let tmp = TempDir::new("e2e-unsealed");
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
-        let (addr, spool) = spawn_authenticated(
+        let (addr, spool, _deliverer) = spawn_authenticated(
             tmp.path(),
             peer_addr,
             // Preserve with no key: nothing can seal, and nothing needs to sign.
@@ -3730,7 +3605,7 @@ mod tests {
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
         let auth = e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true);
         let srs = Arc::clone(&auth.runtime.pin().srs);
-        let (addr, spool) = spawn_authenticated(tmp.path(), peer_addr, auth).await;
+        let (addr, spool, _deliverer) = spawn_authenticated(tmp.path(), peer_addr, auth).await;
 
         submit(
             addr,
@@ -3764,6 +3639,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_consumes_the_decisions_rcpt_made_and_makes_none_of_its_own() {
+        // The boundary: `DATA` reads what `RCPT TO` decided. An envelope
+        // carrying an address the sink never accepted is a wiring bug, and the
+        // answer to a bug at the acceptance boundary is a transient failure —
+        // never a fresh lookup, which would queue mail for a recipient that was
+        // never acknowledged and could resolve differently from the decision
+        // the sender was answered on.
+        let tmp = TempDir::new("data-consumes");
+        let (s, db) = queued_sink(tmp.path());
+
+        // One recipient routed, two in the envelope.
+        let txn = transaction_for(&s, &["hello@example.com"]);
+
+        let outcome = s
+            .deliver_inner(
+                txn,
+                Message {
+                    envelope: Envelope {
+                        sender: "alice@remote.test".into(),
+                        recipients: vec![
+                            "hello@example.com".into(),
+                            "never-routed@example.com".into(),
+                        ],
+                    },
+                    peer: "192.0.2.10".parse().unwrap(),
+                    helo: "sender.example".into(),
+                    received: "Received: from sender.example\r\n".into(),
+                    body: b"Subject: hi\r\n\r\nbody\r\n".to_vec(),
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, Err(DataError::Temporary)),
+            "an unrouted recipient was accepted: {outcome:?}"
+        );
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 0, "a routing decision was invented at DATA");
+    }
+
+    #[tokio::test]
+    async fn a_reload_between_rcpt_and_data_does_not_change_where_mail_goes() {
+        // R-1 seen through the pin. The recipient is accepted against one
+        // table; the destination then changes before the body arrives. The
+        // message must go where the decision that accepted it said, because
+        // re-resolving would deliver to a mailbox the sender was never told
+        // about and make "where did this go?" unanswerable afterwards.
+        let tmp = TempDir::new("pin-destination");
+        let (s, db) = queued_sink(tmp.path());
+
+        // Routed here, against the table in force now.
+        let txn = transaction_for(&s, &["hello@example.com"]);
+
+        // The reload lands between `RCPT TO` and `DATA`.
+        pigeon_route::Publish::publish(
+            s.auth.runtime.as_ref(),
+            pigeon_route::Snapshot::build(vec![test_domain(
+                "example.com",
+                "somewhere-else@provider.example",
+            )])
+            .unwrap()
+            .snapshot,
+        )
+        .expect("the fixture should publish");
+
+        s.deliver_inner(
+            txn,
+            Message {
+                envelope: Envelope {
+                    sender: "alice@remote.test".into(),
+                    recipients: vec!["hello@example.com".into()],
+                },
+                peer: "192.0.2.10".parse().unwrap(),
+                helo: "sender.example".into(),
+                received: "Received: from sender.example\r\n".into(),
+                body: b"Subject: hi\r\n\r\nbody\r\n".to_vec(),
+            },
+        )
+        .await
+        .expect("the message should be accepted");
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let destination: String = conn
+            .query_row("SELECT destination FROM delivery", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            destination, "mailbox@provider.example",
+            "the message was re-resolved against a table that never accepted it"
+        );
+
+        // And the new table is in force for the *next* transaction, so the test
+        // cannot pass by the publication having done nothing.
+        let next = transaction_for(&s, &["hello@example.com"]);
+        let groups = next
+            .plan
+            .groups(&["hello@example.com".to_string()])
+            .expect("routed");
+        assert_eq!(
+            groups[0].destinations[0].address,
+            "somewhere-else@provider.example"
+        );
+    }
+
+    #[test]
+    fn nothing_is_accepted_or_forwarded_from_the_environment() {
+        // The Milestone 0 runtime is retired, and this is what keeps it that
+        // way. `SpoolSink` no longer *has* an optional queue, routing table or
+        // destination, so a daemon that accepts mail without them cannot be
+        // constructed — but a new environment variable could reintroduce a
+        // second answer to "who is accepted?" or "where does this go?" without
+        // touching those types.
+        //
+        // So the source is checked for what it reads: one variable, naming the
+        // configuration file, and nothing else.
+        let source = include_str!("main.rs");
+        // Assembled rather than written out, so this check does not match
+        // itself and pass by describing what it is looking for.
+        let needle = format!("std::env::{}(", "var");
+        let mut read: Vec<&str> = source
+            .match_indices(needle.as_str())
+            .map(|(at, _)| {
+                let rest = &source[at + needle.len()..];
+                rest.split('"').nth(1).unwrap_or("<not a literal>")
+            })
+            .collect();
+        read.sort();
+        read.dedup();
+        assert_eq!(
+            read,
+            vec!["PIGEON_CONFIG"],
+            "the daemon reads configuration from the environment beyond the config file"
+        );
+    }
+
+    #[tokio::test]
     async fn a_reload_between_rcpt_and_data_does_not_change_the_policy() {
         // The pin, made falsifiable. The recipient is accepted under Preserve;
         // the configuration then changes to rewrite_from before the body
@@ -3775,7 +3789,7 @@ mod tests {
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
         let auth = e2e_auth("example.com", pigeon_types::ForwardPolicy::Preserve, true);
         let runtime = Arc::clone(&auth.runtime);
-        let (addr, spool) = spawn_authenticated(tmp.path(), peer_addr, auth).await;
+        let (addr, spool, _deliverer) = spawn_authenticated(tmp.path(), peer_addr, auth).await;
 
         let mut c = pigeon_testkit::RawClient::connect(addr)
             .await
@@ -3828,13 +3842,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_managed_domain_is_deferred_rather_than_refused() {
-        // Recipient order would otherwise choose the forwarding policy and the
-        // signing identity, which is a decision belonging to the sender.
-        //
-        // Deferred, not rejected: the address is deliverable on its own, so a
-        // permanent answer would tell the sender to give up on a working
-        // mailbox.
+    async fn two_managed_domains_are_accepted_and_split() {
+        // R-2, through a real SMTP conversation. The previous behaviour
+        // deferred the second domain and asked the sender to send it again,
+        // because one set of bytes cannot carry two signing identities. The
+        // split removes the restriction rather than the reason: both
+        // recipients are accepted, and each domain's mail becomes its own
+        // message with its own bytes.
         let tmp = TempDir::new("e2e-two-domains");
         let (peer_addr, _transcript) = pigeon_testkit::Peer::accepting().spawn().await;
 
@@ -3842,7 +3856,7 @@ mod tests {
         // A second managed domain in the same table.
         auth = second_domain(auth, "other.example");
 
-        let (addr, _spool) = spawn_two_domain_daemon(tmp.path(), peer_addr, auth).await;
+        let (addr, _spool, _deliverer) = spawn_two_domain_daemon(tmp.path(), peer_addr, auth).await;
 
         let mut c = pigeon_testkit::RawClient::connect(addr)
             .await
@@ -3869,27 +3883,26 @@ mod tests {
             .expect("rcpt 2");
         let (code, text) = c.read_reply().await.expect("rcpt 2 reply");
         assert_eq!(
-            code / 100,
-            4,
-            "a second managed domain was not deferred: {code} {text}"
+            code, 250,
+            "a second managed domain was not accepted: {code} {text}"
         );
 
-        // And the same address on its own is fine, which is what makes the
-        // refusal about the combination rather than the recipient.
-        c.send(b"RSET\r\n").await.expect("rset");
-        c.read_reply().await.expect("rset reply");
-        c.send(b"MAIL FROM:<sender@remote.test>\r\n")
+        c.send(b"DATA\r\n").await.expect("data");
+        assert_eq!(c.read_reply().await.expect("data reply").0, 354);
+        c.send(b"From: <sender@remote.test>\r\nSubject: hi\r\n\r\nbody line\r\n.\r\n")
             .await
-            .expect("mail 2");
-        c.read_reply().await.expect("mail 2 reply");
-        c.send(b"RCPT TO:<hello@other.example>\r\n")
-            .await
-            .expect("rcpt 3");
+            .expect("body");
         assert_eq!(
-            c.read_reply().await.expect("rcpt 3 reply").0,
+            c.read_reply().await.expect("accept reply").0,
             250,
-            "the deferred address is not deliverable on its own either"
+            "the split submission was not acknowledged"
         );
+
+        let conn = pigeon_db::open(&tmp.path().join("pigeon.db")).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 2, "one submission did not become two messages");
     }
 
     #[tokio::test]
@@ -3899,7 +3912,7 @@ mod tests {
         // unaligned pass changes nothing for DMARC.
         let tmp = TempDir::new("e2e-rewrite");
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
-        let (addr, spool) = spawn_authenticated(
+        let (addr, spool, _deliverer) = spawn_authenticated(
             tmp.path(),
             peer_addr,
             e2e_auth(
@@ -3956,7 +3969,7 @@ mod tests {
         // and a rule with no failing case is an assumption.
         let tmp = TempDir::new("e2e-unsigned");
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
-        let (addr, spool) = spawn_authenticated(
+        let (addr, spool, _deliverer) = spawn_authenticated(
             tmp.path(),
             peer_addr,
             e2e_auth(
@@ -3984,11 +3997,16 @@ mod tests {
             replies[5]
         );
 
-        // Nothing was written.
+        // No message was written. The database files share the directory, so
+        // what is asserted is the absence of message bodies rather than of
+        // everything.
         let mut entries = tokio::fs::read_dir(spool.as_path()).await.expect("spool");
         let mut spooled = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
-            spooled.push(entry.file_name());
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".eml") || name.ends_with(".tmp") {
+                spooled.push(name);
+            }
         }
         assert!(
             spooled.is_empty(),
@@ -4009,7 +4027,7 @@ mod tests {
     async fn a_message_travels_from_the_listener_to_a_receiving_server() {
         let tmp = TempDir::new("e2e");
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
-        let (addr, spool) = spawn_daemon(tmp.path(), &["hello@example.com"], peer_addr).await;
+        let (addr, spool, _deliverer) = spawn_daemon(tmp.path(), peer_addr).await;
 
         let replies = submit(
             addr,
@@ -4030,35 +4048,97 @@ mod tests {
 
         // The receiving end saw a real SMTP transaction, not just a connection.
         assert!(transcript.saw("EHLO"), "{:?}", transcript.lines());
+        // The return path is Pigeon's, not the sender's: SRS rewrites it once,
+        // at acceptance, so the bounce comes back here and can be reversed.
         assert!(
-            transcript.saw("MAIL FROM:<sender@remote.test>"),
-            "envelope sender not passed through: {:?}",
+            transcript
+                .lines()
+                .iter()
+                .any(|l| l.starts_with("MAIL FROM:<SRS0=")),
+            "the envelope sender was not rewritten: {:?}",
             transcript.lines()
         );
+        // Readdressed to where *routing* sent it, which is the whole point:
+        // the destination came from the table, not from configuration naming
+        // one mailbox.
         assert!(
-            transcript.saw("RCPT TO:<dest@example.net>"),
-            "not readdressed to the configured destination: {:?}",
+            transcript.saw("RCPT TO:<me@example.net>"),
+            "not readdressed to the routed destination: {:?}",
             transcript.lines()
         );
 
-        // The body that arrived, with the trace header Pigeon prepended.
+        // The body that arrived, carrying the trace header Pigeon prepended
+        // and the ARC set that seals it. The seal is written above the trace
+        // header — newest first, which is the order every hop adds to.
         let body = transcript
             .lines()
             .into_iter()
             .find(|l| l.contains("body line"))
             .expect("body never reached the peer");
         assert!(
-            body.starts_with("Received: from sender.test"),
-            "no trace header, or not first: {body:?}"
+            body.starts_with("ARC-Seal:"),
+            "the message was not sealed: {body:?}"
         );
-        assert!(body.contains("Subject: hi"));
+        let trace = body
+            .find("Received: from sender.test")
+            .expect("no trace header");
+        let subject = body
+            .find("Subject: hi")
+            .expect("the message lost its subject");
+        assert!(
+            trace < subject,
+            "the trace header is not above the message it describes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_cannot_be_rewritten_is_refused_at_rcpt() {
+        // R-4. A return path that will not fit in a 64-octet local part is a
+        // failure Pigeon can predict, so it is answered during the
+        // conversation — where the refusal is still the upstream MTA's
+        // problem. After the `250` the only remaining answer is a bounce
+        // Pigeon has to generate and deliver itself.
+        let tmp = TempDir::new("e2e-srs-length");
+        let (peer_addr, _transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+        let (addr, _spool, _deliverer) = spawn_daemon(tmp.path(), peer_addr).await;
+
+        let long = format!("{}@a-fairly-long-domain.example", "x".repeat(60));
+
+        let mut c = pigeon_testkit::RawClient::connect(addr)
+            .await
+            .expect("connect");
+        c.read_reply().await.expect("banner");
+        c.send(b"EHLO sender.test\r\n").await.unwrap();
+        c.read_reply().await.unwrap();
+        c.send(format!("MAIL FROM:<{long}>\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            c.read_reply().await.expect("mail reply").0,
+            250,
+            "the sender is only a problem for a recipient that would be forwarded"
+        );
+        c.send(b"RCPT TO:<hello@example.com>\r\n").await.unwrap();
+        let (code, text) = c.read_reply().await.expect("rcpt reply");
+        assert_eq!(
+            code / 100,
+            5,
+            "an unrewritable sender was not refused at RCPT: {code} {text}"
+        );
+
+        // And nothing was taken on: no rows, so no obligation to report.
+        let conn = pigeon_db::open(&tmp.path().join("pigeon.db")).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 0, "a refused sender still reached the queue");
     }
 
     #[tokio::test]
     async fn a_refused_recipient_never_reaches_the_spool() {
         let tmp = TempDir::new("e2e-refused");
         let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
-        let (addr, spool) = spawn_daemon(tmp.path(), &["hello@example.com"], peer_addr).await;
+        let (addr, spool, _deliverer) = spawn_daemon(tmp.path(), peer_addr).await;
 
         let mut c = pigeon_testkit::RawClient::connect(addr)
             .await
@@ -4098,7 +4178,7 @@ mod tests {
             .spawn()
             .await;
 
-        let (addr, spool) = spawn_daemon(tmp.path(), &["hello@example.com"], peer_addr).await;
+        let (addr, spool, _deliverer) = spawn_daemon(tmp.path(), peer_addr).await;
         let replies = submit(
             addr,
             "sender@remote.test",
@@ -4142,7 +4222,6 @@ mod tests {
                 ],
             )),
             ehlo_name: "pigeon.test".into(),
-            destination: "dest@example.net".into(),
             limit: Arc::new(Semaphore::new(1)),
             port: peer_addr.port(),
             budget: Duration::from_millis(400),
@@ -4183,7 +4262,6 @@ mod tests {
         let f = |resolver| Forwarding {
             resolver: Arc::new(resolver),
             ehlo_name: "pigeon.test".into(),
-            destination: "dest@example.net".into(),
             limit: Arc::new(Semaphore::new(1)),
             port: 1,
             budget: Duration::from_millis(400),

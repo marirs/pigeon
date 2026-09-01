@@ -44,15 +44,22 @@ pub trait MessageSink: Clone + Send + Sync + 'static {
     /// later is not, and this is the point at which the transaction exists.
     fn begin(&self) -> Self::Transaction;
 
-    /// Whether this address should be accepted at `RCPT TO`.
+    /// Whether this address should be accepted at `RCPT TO`, and what
+    /// accepting it means.
     ///
     /// Called before the sender transmits the body, which is the only point at
     /// which a message can be refused without Pigeon becoming responsible for
     /// bouncing it. `accepted` is what the envelope holds already, so a sink
     /// can refuse a combination it cannot handle as one message.
+    ///
+    /// The transaction is **mutable** because deciding a recipient is also
+    /// resolving it: a sink that answers `Accept` here and works out where the
+    /// address goes later would be routing twice, and the second answer can
+    /// differ from the first. What is decided here is recorded here, and
+    /// `deliver` consumes it.
     fn accepts_recipient(
         &self,
-        transaction: &Self::Transaction,
+        transaction: &mut Self::Transaction,
         address: &str,
         accepted: &[String],
     ) -> Recipient;
@@ -507,7 +514,7 @@ async fn step<S: MessageSink>(
         && matches!(session.state(), State::Mail | State::Rcpt)
         && pigeon_types::Address::parse(path).is_ok()
     {
-        let decision = match transaction.as_ref() {
+        let decision = match transaction.as_mut() {
             Some(txn) => sink.accepts_recipient(txn, path, &session.envelope().recipients),
             // No transaction means no `MAIL FROM`, which the sequence check
             // above has already excluded.

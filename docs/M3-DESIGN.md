@@ -323,6 +323,26 @@ messages — the sender addressed two recipients, the two relay forms are signed
 under different identities, and suppressing one would mean silently dropping
 mail the sender asked to send.
 
+### 5.1 As built: one decision, at `RCPT`
+
+Routing happens once per transaction, at `RCPT TO`, against the runtime pinned
+at `MAIL FROM`. The decision — the managed domain the mail is accepted *for* and
+the destinations it resolves to — is recorded in the transaction
+(`pigeond/src/routing.rs`). `DATA` reads those decisions and makes none of its
+own, even against the same runtime: a second lookup is a second answer waiting
+to differ from the one the sender was given a `250` for.
+
+The envelope the session finally holds is authoritative for *which* recipients
+count: an address this sink accepted can still be refused by the recipient cap
+immediately afterwards, and a destination only that address reached must not
+become a delivery. An acknowledged recipient with no recorded decision is a
+wiring bug, and is answered `451` rather than routed.
+
+Grouping happens at `DATA` from those stored decisions: one group per managed
+domain (R-2), destinations deduplicated within a group by mailbox — folding the
+domain, never the local part — with every original recipient kept on the merged
+row.
+
 ---
 
 ## 6. Claiming, leasing, and the duplicate window
