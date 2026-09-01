@@ -38,7 +38,7 @@ impl TestSink {
 impl MessageSink for TestSink {
     type Transaction = ();
 
-    fn begin(&self, _peer: std::net::SocketAddr, _sender: &str) {}
+    fn begin(&self, _peer: std::net::SocketAddr, _sender: &str, _principal: Option<&str>) {}
 
     async fn accepts_recipient(
         &self,

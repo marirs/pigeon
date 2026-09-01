@@ -200,6 +200,12 @@ pub struct Session {
     /// Whether authentication is offered at all. Set by the listener: the
     /// submission port advertises it and port 25 does not.
     auth_available: bool,
+    /// Whether a transaction may begin without it.
+    ///
+    /// The submission port requires it; port 25 must not, since mail from
+    /// strangers is the entire job there. This is the single flag that
+    /// separates a submission service from an open relay.
+    auth_required: bool,
     /// Refused recipients, counted for the life of the connection.
     ///
     /// Separate from `errors`, which resets on success. A directory harvest is
@@ -260,6 +266,7 @@ impl Session {
             auth: Auth::None,
             auth_failures: 0,
             auth_available: false,
+            auth_required: false,
             refusals: 0,
             return_path: None,
         }
@@ -273,6 +280,17 @@ impl Session {
     /// encrypted.
     pub fn with_auth(mut self) -> Self {
         self.auth_available = true;
+        self
+    }
+
+    /// Refuse `MAIL FROM` until the client has authenticated.
+    ///
+    /// The submission port sets this. Without it, a listener that advertised
+    /// `AUTH` and accepted mail anyway would be an open relay with a login
+    /// screen — the credential would be decoration.
+    pub fn with_required_auth(mut self) -> Self {
+        self.auth_available = true;
+        self.auth_required = true;
         self
     }
 
@@ -503,6 +521,13 @@ impl Session {
     }
 
     fn mail(&mut self, path: &str, params: &str) -> Action {
+        // Before anything about the address: an unauthenticated transaction on
+        // the submission port is the open-relay case, and it is refused here
+        // rather than at `RCPT` so nothing is recorded about it at all.
+        if self.auth_required && !matches!(self.auth, Auth::As(_)) {
+            return self.protocol_error(reply::authentication_required());
+        }
+
         if self.state != State::Ready {
             return self.protocol_error(reply::bad_sequence());
         }

@@ -47,7 +47,10 @@ pub trait MessageSink: Clone + Send + Sync + 'static {
     /// decision can depend on both — greylisting is keyed on the pair together
     /// with the recipient — and re-deriving them at `RCPT` would mean two
     /// sources for one fact.
-    fn begin(&self, peer: SocketAddr, sender: &str) -> Self::Transaction;
+    /// `principal` is who authenticated, when anyone did. The submission
+    /// listener uses it to decide what the sender is allowed to be; the MX
+    /// listener ignores it, because nobody authenticates there.
+    fn begin(&self, peer: SocketAddr, sender: &str, principal: Option<&str>) -> Self::Transaction;
 
     /// Check one set of credentials.
     ///
@@ -290,6 +293,15 @@ pub struct ServerConfig {
     /// reading plaintext, which is a downgrade that looks like a working
     /// encrypted session from the outside. That state is now unrepresentable.
     pub tls: Option<crate::tls::Serving>,
+    /// Require authentication before a transaction may begin.
+    ///
+    /// The submission listener sets it. It is the single flag that separates a
+    /// submission service from an open relay, which is why it lives in
+    /// configuration rather than being inferred from the port: a listener that
+    /// advertised `AUTH` and accepted mail anyway would make the credential
+    /// decoration.
+    pub require_auth: bool,
+
     /// Refuse recipients whose sender cannot be given a return path (R-4).
     ///
     /// Shared rather than cloned per connection: it holds the SRS key ring,
@@ -314,6 +326,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("max_connections", &self.max_connections)
             .field("max_per_address", &self.max_per_address)
             .field("max_session", &self.max_session)
+            .field("require_auth", &self.require_auth)
             .field("tls", &self.tls.is_some())
             .field("return_path", &self.return_path.is_some())
             .finish()
@@ -333,6 +346,7 @@ impl Default for ServerConfig {
             max_connections: 256,
             max_per_address: 20,
             max_session: Duration::from_secs(3600),
+            require_auth: false,
             tls: None,
             return_path: None,
         }
@@ -621,6 +635,9 @@ async fn handle<S: MessageSink>(
         config.tls.is_some(),
         config.max_message_size,
     );
+    if config.require_auth {
+        session = session.with_required_auth();
+    }
     if let Some(check) = config.return_path.clone() {
         session = session.with_return_path_check(Box::new(move |sender| check(sender)));
     }
@@ -953,7 +970,7 @@ async fn step<S: MessageSink>(
 
     match session.state() {
         State::Mail if starts_transaction => {
-            *transaction = Some(sink.begin(peer, &session.envelope().sender))
+            *transaction = Some(sink.begin(peer, &session.envelope().sender, session.principal()))
         }
         State::Mail | State::Rcpt | State::Data => {}
         // Anything else means there is no transaction in progress: `RSET`,

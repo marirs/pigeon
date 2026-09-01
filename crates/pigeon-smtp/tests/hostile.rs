@@ -42,7 +42,7 @@ impl LocalOnly {
 impl MessageSink for LocalOnly {
     type Transaction = ();
 
-    fn begin(&self, _peer: std::net::SocketAddr, _sender: &str) {}
+    fn begin(&self, _peer: std::net::SocketAddr, _sender: &str, _principal: Option<&str>) {}
 
     async fn accepts_recipient(
         &self,

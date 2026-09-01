@@ -99,6 +99,9 @@ pub enum DbError {
     #[error("no such domain: {0}")]
     NoSuchDomain(String),
 
+    #[error("no application named {0}")]
+    NoSuchPrincipal(String),
+
     #[error("domain {0} already exists")]
     DomainExists(String),
 

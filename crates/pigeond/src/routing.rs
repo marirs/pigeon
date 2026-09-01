@@ -187,6 +187,12 @@ impl Group {
     ///
     /// Every original recipient is kept on the merged row, so a failure is
     /// reported against each address the sender actually wrote.
+    /// The same, for the submission path, which builds a group directly from
+    /// the recipients an authenticated client named.
+    pub fn add_destination_public(&mut self, address: &str, from: usize) {
+        self.add_destination(address, from)
+    }
+
     fn add_destination(&mut self, address: &str, from: usize) {
         let parsed = Address::parse(address).ok();
 

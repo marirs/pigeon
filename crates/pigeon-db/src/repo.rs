@@ -642,3 +642,200 @@ pub fn dkim_keys_for(conn: &Connection, domain: &str) -> Result<Vec<DkimKey>, Db
         .filter(|k| k.domain == domain.to_ascii_lowercase())
         .collect())
 }
+
+// ------------------------------------------------------------- principals (M7)
+
+/// An application allowed to submit mail.
+#[derive(Debug, Clone)]
+pub struct Principal {
+    pub id: i64,
+    /// What a person calls it: `phone`, `backup script`.
+    pub name: String,
+    /// What it authenticates as.
+    pub username: String,
+    pub enabled: bool,
+    pub last_used_at: Option<i64>,
+}
+
+/// Record a generated credential.
+///
+/// The password is not passed here and never enters the database: what is
+/// stored is an Argon2id hash, and an operator who loses the password issues a
+/// new credential rather than recovering the old one.
+pub fn add_principal(
+    conn: &Connection,
+    name: &str,
+    username: &str,
+    password_hash: &str,
+) -> Result<i64, DbError> {
+    conn.execute(
+        "INSERT INTO principal (name, username, password_hash, enabled, created_at)
+         VALUES (?1, ?2, ?3, 1, ?4)",
+        params![name, username, password_hash, now()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_principals(conn: &Connection) -> Result<Vec<Principal>, DbError> {
+    let mut stmt = conn
+        .prepare("SELECT id, name, username, enabled, last_used_at FROM principal ORDER BY name")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Principal {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            username: r.get(2)?,
+            enabled: r.get::<_, i64>(3)? != 0,
+            last_used_at: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The stored hash for a username, if the principal exists and is enabled.
+///
+/// Returns the hash rather than doing the comparison: verifying is
+/// `pigeon-auth`'s job, and the caller has to verify *something* even when this
+/// returns `None` — otherwise the response time says which usernames are real.
+pub fn password_hash_for(
+    conn: &Connection,
+    username: &str,
+) -> Result<Option<(i64, String)>, DbError> {
+    let row = conn
+        .query_row(
+            "SELECT id, password_hash FROM principal WHERE username = ?1 AND enabled = 1",
+            [username],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Note that a credential was used, for the operator's benefit.
+///
+/// Best effort and not in any transaction: a credential that worked is a fact
+/// about the past, and failing to record it must never fail the authentication
+/// that just succeeded.
+pub fn touch_principal(conn: &Connection, id: i64) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE principal SET last_used_at = ?1 WHERE id = ?2",
+        params![now(), id],
+    )?;
+    Ok(())
+}
+
+pub fn set_principal_enabled(
+    conn: &Connection,
+    name: &str,
+    enabled: bool,
+) -> Result<bool, DbError> {
+    let changed = conn.execute(
+        "UPDATE principal SET enabled = ?1 WHERE name = ?2",
+        params![i64::from(enabled), name],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn remove_principal(conn: &Connection, name: &str) -> Result<bool, DbError> {
+    let changed = conn.execute("DELETE FROM principal WHERE name = ?1", [name])?;
+    Ok(changed > 0)
+}
+
+/// Allow a principal to send as an address, or as a whole domain.
+///
+/// `local = None` is the domain-wide grant. A grant naming a local part must
+/// name a real sender identity, which the schema enforces — otherwise a grant
+/// could authorise an address that is not on the domain's allowlist at all.
+pub fn grant(
+    conn: &Connection,
+    principal: &str,
+    domain: &str,
+    local: Option<&str>,
+) -> Result<(), DbError> {
+    let principal_id: i64 = conn
+        .query_row(
+            "SELECT id FROM principal WHERE name = ?1",
+            [principal],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| DbError::NoSuchPrincipal(principal.to_string()))?;
+    let domain_id = domain_id(conn, domain)?;
+
+    // The identity has to exist before it can be granted: the composite foreign
+    // key would refuse anyway, and this says why in the operator's terms.
+    if let Some(local) = local {
+        conn.execute(
+            "INSERT OR IGNORE INTO sender_identity (domain_id, local, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![domain_id, local, now()],
+        )?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO principal_grant (principal_id, domain_id, local, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![principal_id, domain_id, local, now()],
+    )?;
+    Ok(())
+}
+
+pub fn revoke(
+    conn: &Connection,
+    principal: &str,
+    domain: &str,
+    local: Option<&str>,
+) -> Result<bool, DbError> {
+    let changed = conn.execute(
+        "DELETE FROM principal_grant
+          WHERE principal_id = (SELECT id FROM principal WHERE name = ?1)
+            AND domain_id = (SELECT id FROM domain WHERE name = ?2)
+            AND ((?3 IS NULL AND local IS NULL) OR local = ?3)",
+        params![principal, domain.to_ascii_lowercase(), local],
+    )?;
+    Ok(changed > 0)
+}
+
+/// What a principal may send as.
+pub fn grants_for(conn: &Connection, principal: &str) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT d.name, g.local
+           FROM principal_grant g
+           JOIN principal p ON p.id = g.principal_id
+           JOIN domain d ON d.id = g.domain_id
+          WHERE p.name = ?1
+          ORDER BY d.name, g.local",
+    )?;
+    let rows = stmt.query_map([principal], |r| {
+        let domain: String = r.get(0)?;
+        let local: Option<String> = r.get(1)?;
+        Ok(match local {
+            Some(l) => format!("{l}@{domain}"),
+            None => format!("*@{domain}"),
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Whether this principal may use this envelope sender.
+///
+/// The check the submission path turns on. Case: the domain folds and the local
+/// part does not, matching every other address comparison in this project —
+/// `Bob@` and `bob@` are different mailboxes, and a grant for one is not a
+/// grant for the other.
+pub fn may_send_as(conn: &Connection, principal_id: i64, address: &str) -> Result<bool, DbError> {
+    let Some((local, domain)) = address.rsplit_once('@') else {
+        return Ok(false);
+    };
+
+    let allowed: i64 = conn.query_row(
+        "SELECT count(*)
+           FROM principal_grant g
+           JOIN domain d ON d.id = g.domain_id
+          WHERE g.principal_id = ?1
+            AND d.name = ?2
+            AND (g.local IS NULL OR g.local = ?3)",
+        params![principal_id, domain.to_ascii_lowercase(), local],
+        |r| r.get(0),
+    )?;
+    Ok(allowed > 0)
+}

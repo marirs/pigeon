@@ -194,6 +194,14 @@ pub fn too_many_commands() -> Reply {
     Reply::line(421, "Too many commands on this connection")
 }
 
+/// A transaction may not begin without authentication.
+///
+/// `530 5.7.0` is what clients expect here, and what tells them to
+/// authenticate rather than to give up.
+pub fn authentication_required() -> Reply {
+    Reply::line(530, "Authentication required")
+}
+
 pub fn authenticated() -> Reply {
     Reply::line(235, "Authentication successful")
 }

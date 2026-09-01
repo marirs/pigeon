@@ -203,6 +203,11 @@ enum Command {
         #[command(subcommand)]
         verb: Option<QueueVerb>,
     },
+    /// Applications allowed to send mail through this host.
+    Auth {
+        #[command(subcommand)]
+        verb: Option<AuthVerb>,
+    },
     /// Operator notifications.
     Alerts {
         #[command(subcommand)]
@@ -212,6 +217,36 @@ enum Command {
     Srs {
         #[command(subcommand)]
         verb: Option<SrsVerb>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthVerb {
+    /// Create a credential for an application.
+    ///
+    /// The password is shown once and never again: what is stored is an
+    /// Argon2id hash, so an operator who loses it issues a new credential
+    /// rather than recovering the old one.
+    Add { name: String },
+    /// Every application, and what it may send as.
+    List,
+    /// Allow an application to send as an address, or as a whole domain.
+    Allow {
+        name: String,
+        /// `alice@example.com`, or `*@example.com` for the whole domain.
+        address: String,
+    },
+    /// Take that permission away.
+    Revoke { name: String, address: String },
+    /// Stop a credential working, without deleting it.
+    Disable { name: String },
+    /// Let it work again.
+    Enable { name: String },
+    /// Delete an application and its permissions.
+    Remove {
+        name: String,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -713,6 +748,13 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
                     cli.json,
                 )
             }
+        },
+        Command::Auth { verb } => match verb {
+            None => {
+                print_help("auth");
+                Ok(exit::OK)
+            }
+            Some(v) => auth(cli, v),
         },
         Command::Alerts { verb } => match verb {
             None => {
@@ -1655,6 +1697,30 @@ Getting started:
 
 fn print_help(noun: &str) {
     match noun {
+        "auth" => println!(
+            r#"Applications allowed to send mail through this host.
+
+USAGE
+  pigeon auth <verb> [name] [address]
+
+VERBS
+  add        create a credential for an application
+  list       every application, and what it may send as
+  allow      let an application send as an address, or *@domain
+  revoke     take that permission away
+  disable    stop a credential working, keeping its permissions
+  enable     let it work again
+  remove     delete an application and its permissions
+
+A new credential can send nothing until an address is allowed. The password is
+shown once: what is stored is a hash.
+
+EXAMPLES
+  pigeon auth add phone
+  pigeon auth allow phone you@example.com
+  pigeon auth allow backup '*@example.com'
+  pigeon auth list"#
+        ),
         "queue" => println!(
             r#"What is waiting to be delivered.
 
@@ -1944,6 +2010,170 @@ fn alerts_test(cli: &Cli) -> anyhow::Result<u8> {
             Ok(exit::FAILED)
         }
     }
+}
+
+/// `pigeon auth`.
+fn auth(cli: &Cli, verb: &AuthVerb) -> anyhow::Result<u8> {
+    match verb {
+        AuthVerb::Add { name } => {
+            let conn = open_write(cli)?;
+            let credential = pigeon_auth::credential::generate(name)?;
+            repo::add_principal(&conn, name, &credential.username, &credential.hash)?;
+
+            if cli.json {
+                json::ok(serde_json::json!({
+                    "name": name,
+                    "username": credential.username,
+                    // Shown once. Nothing stores it, and nothing can recover it.
+                    "password": credential.password,
+                }));
+            } else {
+                println!("Created {name}.\n");
+                println!("  Username  {}", credential.username);
+                println!("  Password  {}\n", credential.password);
+                println!(
+                    "This is the only time the password is shown: what is stored is a hash,\n\
+                     so a lost password means a new credential rather than a recovered one.\n"
+                );
+                println!(
+                    "It cannot send anything yet. Allow an address:\n  \
+                     pigeon auth allow {name} you@example.com"
+                );
+            }
+            Ok(exit::OK)
+        }
+
+        AuthVerb::List => {
+            let conn = open_read(cli)?;
+            let principals = repo::list_principals(&conn)?;
+
+            if cli.json {
+                let rows: Vec<serde_json::Value> = principals
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "name": p.name,
+                            "username": p.username,
+                            "enabled": p.enabled,
+                            "last_used_at": p.last_used_at,
+                            "may_send_as": repo::grants_for(&conn, &p.name).unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                json::ok(serde_json::json!({ "applications": rows }));
+                return Ok(exit::OK);
+            }
+
+            if principals.is_empty() {
+                println!("No applications yet.\n  pigeon auth add phone");
+                return Ok(exit::OK);
+            }
+
+            for p in &principals {
+                let grants = repo::grants_for(&conn, &p.name).unwrap_or_default();
+                println!(
+                    "{}{}\n  {}\n  sends as {}",
+                    p.name,
+                    if p.enabled { "" } else { "  (disabled)" },
+                    p.username,
+                    if grants.is_empty() {
+                        "nothing yet".to_string()
+                    } else {
+                        grants.join(", ")
+                    }
+                );
+            }
+            Ok(exit::OK)
+        }
+
+        AuthVerb::Allow { name, address } => {
+            let conn = open_write(cli)?;
+            let (local, domain) = split_identity(address)?;
+            repo::grant(&conn, name, &domain, local.as_deref())?;
+
+            if cli.json {
+                json::ok(serde_json::json!({ "application": name, "may_send_as": address }));
+            } else {
+                println!("{name} may now send as {address}.");
+            }
+            Ok(exit::OK)
+        }
+
+        AuthVerb::Revoke { name, address } => {
+            let conn = open_write(cli)?;
+            let (local, domain) = split_identity(address)?;
+            let removed = repo::revoke(&conn, name, &domain, local.as_deref())?;
+
+            if cli.json {
+                json::ok(serde_json::json!({ "application": name, "revoked": removed }));
+            } else if removed {
+                println!("{name} can no longer send as {address}.");
+            } else {
+                println!("{name} was not allowed to send as {address}.");
+            }
+            Ok(exit::OK)
+        }
+
+        AuthVerb::Disable { name } | AuthVerb::Enable { name } => {
+            let enable = matches!(verb, AuthVerb::Enable { .. });
+            let conn = open_write(cli)?;
+            if !repo::set_principal_enabled(&conn, name, enable)? {
+                return Err(pigeon_db::DbError::NoSuchPrincipal(name.clone()).into());
+            }
+            if cli.json {
+                json::ok(serde_json::json!({ "application": name, "enabled": enable }));
+            } else if enable {
+                println!("{name} can send again.");
+            } else {
+                // Disabled rather than deleted: the credential stops working
+                // immediately and the grants survive, so turning it back on
+                // does not mean granting everything again.
+                println!("{name} is disabled. Its permissions are kept.");
+            }
+            Ok(exit::OK)
+        }
+
+        AuthVerb::Remove { name, yes } => {
+            if !yes && !cli.json {
+                println!(
+                    "This deletes {name} and every permission it has.\n  \
+                     pigeon auth remove {name} --yes"
+                );
+                return Ok(exit::OK);
+            }
+            let conn = open_write(cli)?;
+            if !repo::remove_principal(&conn, name)? {
+                return Err(pigeon_db::DbError::NoSuchPrincipal(name.clone()).into());
+            }
+            if cli.json {
+                json::ok(serde_json::json!({ "removed": name }));
+            } else {
+                println!("Removed {name}.");
+            }
+            Ok(exit::OK)
+        }
+    }
+}
+
+/// `alice@example.com` or `*@example.com`.
+///
+/// The wildcard is the whole domain, which is a real distinction rather than a
+/// convenience: a domain-wide grant is stored as a NULL local part, and the
+/// schema uses that to exempt it from the identity foreign key.
+fn split_identity(address: &str) -> anyhow::Result<(Option<String>, String)> {
+    let Some((local, domain)) = address.rsplit_once('@') else {
+        anyhow::bail!(
+            "{address:?} is not an address.\n\n  \
+             Use alice@example.com, or *@example.com for the whole domain."
+        );
+    };
+    if local == "*" {
+        return Ok((None, domain.to_ascii_lowercase()));
+    }
+    if local.is_empty() {
+        anyhow::bail!("{address:?} has no local part");
+    }
+    Ok((Some(local.to_string()), domain.to_ascii_lowercase()))
 }
 
 /// Which deliveries a queue command is about.

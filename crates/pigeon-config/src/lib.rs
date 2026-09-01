@@ -245,6 +245,18 @@ pub struct Submission {
     #[serde(default = "yes")]
     pub require_starttls: bool,
 
+    /// Messages one application may submit per hour. Zero disables the limit.
+    ///
+    /// Per principal rather than per connection: the credential is the thing
+    /// that gets compromised, and a limit on connections is one a compromised
+    /// credential simply opens more of.
+    #[serde(default = "default_submission_rate")]
+    pub messages_per_hour: u32,
+
+    /// How much of that hourly allowance may arrive at once.
+    #[serde(default = "default_submission_burst")]
+    pub burst: u32,
+
     pub tls_certificate: Option<PathBuf>,
     pub tls_private_key: Option<PathBuf>,
 }
@@ -254,10 +266,22 @@ impl Default for Submission {
         Self {
             listen: None,
             require_starttls: true,
+            messages_per_hour: default_submission_rate(),
+            burst: default_submission_burst(),
             tls_certificate: None,
             tls_private_key: None,
         }
     }
+}
+
+/// Generous for a person's mail client, and low enough that a compromised
+/// credential is noticed before it has sent a campaign.
+fn default_submission_rate() -> u32 {
+    500
+}
+
+fn default_submission_burst() -> u32 {
+    50
 }
 
 fn yes() -> bool {

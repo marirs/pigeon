@@ -306,24 +306,23 @@ Backup deserves specific attention. DKIM private keys are the only state that ca
 
 ## Milestone 7 — Outbound sending
 
-- [ ] submission listener on TCP/587
-- [ ] STARTTLS required
-- [ ] authentication
-- [ ] application credentials
-- [ ] password hashing and constant-time comparison
-- [ ] sender identity policy
-- [ ] per-domain sender allowlist
+- [x] submission listener on TCP/587
+- [x] STARTTLS required
+- [x] authentication
+- [x] application credentials
+- [x] password hashing and constant-time comparison
+- [x] sender identity policy
+- [x] per-domain sender allowlist
 - [ ] envelope and header alignment checks
-- [ ] DKIM signing
+- [x] DKIM signing
 - [ ] outbound SPF guidance
-- [ ] direct-to-MX delivery
+- [x] direct-to-MX delivery
 - [ ] upstream smarthost delivery
 - [ ] per-domain outbound mode
 - [ ] outbound queue and bounce processing
-- [ ] per-principal and per-domain rate limits
-- [ ] anti-open-relay integration suite — the unauthenticated half landed in
-      Milestone 0; what remains is every combination involving an authenticated
-      principal, which needs the submission listener to exist first
+- [x] per-principal and per-domain rate limits
+- [x] anti-open-relay integration suite — the unauthenticated half landed in
+      Milestone 0; the authenticated half is `pigeon-smtp/tests/relay.rs`
 - [ ] optional CLI send for diagnostics
 
 Sequenced after forwarding because it is the larger and more security-critical body of work, and because forwarding is what breaks first in production.

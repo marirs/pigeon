@@ -41,6 +41,7 @@ mod reload;
 mod routing;
 mod scanner;
 mod startup;
+mod submission;
 
 use std::collections::HashMap;
 use std::io;
@@ -841,7 +842,13 @@ struct Transaction {
 impl MessageSink for SpoolSink {
     type Transaction = Transaction;
 
-    fn begin(&self, peer: std::net::SocketAddr, sender: &str) -> Self::Transaction {
+    fn begin(
+        &self,
+        peer: std::net::SocketAddr,
+        sender: &str,
+        // Nobody authenticates on port 25: mail from strangers is the job.
+        _principal: Option<&str>,
+    ) -> Self::Transaction {
         Transaction {
             runtime: self.auth.runtime.pin(),
             plan: routing::Plan::default(),
@@ -1774,6 +1781,57 @@ async fn run() -> io::Result<()> {
         ..Default::default()
     };
 
+    // The submission listener, when one is configured. Its own listener and
+    // its own sink: the two ports ask opposite questions — the MX asks whether
+    // it carries the recipient, submission asks whether the principal may use
+    // the sender — and one sink answering both would be one place to get the
+    // difference wrong.
+    let submission = match started.config.config().smtp.submission.listen {
+        Some(addr) => {
+            let s = &started.config.config().smtp.submission;
+            let (Some(cert), Some(key)) = (&s.tls_certificate, &s.tls_private_key) else {
+                // Validation refuses this, so reaching it means the check was
+                // bypassed. Refused again here rather than served without TLS:
+                // credentials in the clear are credentials given away.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "submission is configured with no TLS certificate",
+                ));
+            };
+
+            let tls = pigeon_smtp::tls::load(cert, key)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+            let listener = TcpListener::bind(addr).await.map_err(|e| {
+                io::Error::new(e.kind(), format!("cannot bind {addr} for submission: {e}"))
+            })?;
+
+            let sink = submission::SubmissionSink {
+                spool: pigeon_spool::Spool::new(sink_dir.clone()),
+                queue: queue.clone(),
+                auth: auth.clone(),
+                counter: Arc::new(AtomicU64::new(0)),
+                boot: std::process::id(),
+                limits: Arc::new(submission::Limits::new(s.messages_per_hour, s.burst)),
+            };
+
+            let config = ServerConfig {
+                hostname: hostname_for_worker.clone(),
+                tls: Some(pigeon_smtp::tls::Serving::new(tls)),
+                // The flag that separates a submission service from an open
+                // relay: no transaction may begin without authentication.
+                require_auth: true,
+                ..Default::default()
+            };
+
+            tracing::info!(%addr, "submission listening");
+            Some(tokio::spawn(async move {
+                let _ = pigeon_smtp::serve(listener, config, sink).await;
+            }))
+        }
+        None => None,
+    };
+
     // The delivery loop. Started after every fallible step, for the reason the
     // reload worker is: an early `?` between the start and the listener bind
     // would drop the handle and leave the task running.
@@ -1961,6 +2019,13 @@ async fn run() -> io::Result<()> {
     stop_health.stop();
     drop(stop_health.supervise());
 
+    // The submission listener stops with the runtime: it holds nothing durable
+    // of its own, and a message it was mid-way through accepting has no `250`
+    // and will be retried by the client.
+    if let Some(handle) = submission {
+        handle.abort();
+    }
+
     if let Some(m) = stop_metrics {
         m.stop();
         drop(m.supervise());
@@ -2127,7 +2192,11 @@ mod tests {
 
     /// Route one address the way `RCPT TO` does, and hand back the transaction.
     async fn transaction_for(sink: &SpoolSink, recipients: &[&str]) -> Transaction {
-        let mut txn = sink.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
+        let mut txn = sink.begin(
+            "192.0.2.10:2525".parse().unwrap(),
+            "alice@remote.test",
+            None,
+        );
         for r in recipients {
             assert_eq!(
                 sink.accepts_recipient(&mut txn, r, &[]).await,
@@ -3036,7 +3105,11 @@ mod tests {
             resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
         });
 
-        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
+        let mut txn = s.begin(
+            "192.0.2.10:2525".parse().unwrap(),
+            "alice@remote.test",
+            None,
+        );
         assert_eq!(
             s.accepts_recipient(&mut txn, "hello@example.com", &[])
                 .await,
@@ -3058,7 +3131,11 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
+        let mut txn = s.begin(
+            "192.0.2.10:2525".parse().unwrap(),
+            "alice@remote.test",
+            None,
+        );
         assert_eq!(
             s.accepts_recipient(&mut txn, "hello@example.com", &[])
                 .await,
@@ -3081,7 +3158,11 @@ mod tests {
             resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
         });
 
-        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
+        let mut txn = s.begin(
+            "192.0.2.10:2525".parse().unwrap(),
+            "alice@remote.test",
+            None,
+        );
         assert_eq!(
             s.accepts_recipient(&mut txn, "hello@example.com", &[])
                 .await,
@@ -3452,7 +3533,11 @@ mod tests {
             ],
         );
 
-        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
+        let mut txn = s.begin(
+            "192.0.2.10:2525".parse().unwrap(),
+            "alice@remote.test",
+            None,
+        );
         assert_eq!(
             s.accepts_recipient(&mut txn, "hello@example.com", &[])
                 .await,
@@ -3493,7 +3578,11 @@ mod tests {
             }],
         );
 
-        let mut txn = s.begin("192.0.2.10:2525".parse().unwrap(), "alice@remote.test");
+        let mut txn = s.begin(
+            "192.0.2.10:2525".parse().unwrap(),
+            "alice@remote.test",
+            None,
+        );
         assert_eq!(
             s.accepts_recipient(&mut txn, "hello@gated.example", &[])
                 .await,
