@@ -486,6 +486,36 @@ fn giving_up_reads_differently_from_being_refused() {
 }
 
 #[test]
+fn a_routing_loop_says_so_rather_than_blaming_the_mailbox() {
+    // A delivery that loops back to this host is a configuration fault here,
+    // not a refusal there. Reported as "no such user" it would send the sender
+    // hunting for a mailbox that is fine, and the operator — who is the only
+    // person who can fix it — would never see the word "loop".
+    //
+    // 554 is the code the delivery path records for exactly this and nothing
+    // else: a remote's own permanent refusal is recorded as 550 whatever it
+    // actually said.
+    let mut looped = sample_report();
+    looped.entries[0].code = Some(554);
+    looped.entries[0].response =
+        Some("routing loop: every mail exchanger for it resolves to this host".into());
+
+    let text = String::from_utf8(pigeon_spool::report::render(
+        &looped,
+        "pigeon.test",
+        "alice@remote.test",
+        None,
+        "Mon, 1 Sep 2026 00:00:00 +0000",
+        "b",
+    ))
+    .unwrap();
+
+    assert!(text.contains("Status: 5.4.6"), "{text}");
+    assert!(!text.contains("Status: 5.1.1"), "{text}");
+    assert!(text.contains("routing loop"), "{text}");
+}
+
+#[test]
 fn a_local_failure_is_not_reported_as_the_recipients_fault() {
     // No SMTP code means nothing remote said anything. A 5.x.x status here
     // would tell the sender their recipient rejected the message.

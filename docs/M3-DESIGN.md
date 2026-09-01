@@ -981,6 +981,46 @@ in production — which is the case this path exists for.
 
 ---
 
+## 11.7 Loop detection at delivery
+
+The inbound hop limit catches a message that has been round a loop a hundred
+times. This catches it before the first pass.
+
+Before connecting, each resolved mail exchanger is compared against what this
+daemon is:
+
+- **Addresses, not names.** The comparison is on the socket addresses a
+  connection would actually be made to — never reverse DNS or the peer's
+  banner, both of which the remote writes and neither of which says where the
+  packets went. Resolution happens once, and the address checked is the address
+  connected to. IPv4-mapped IPv6 is normalised, or a resolver returning
+  `::ffff:198.51.100.7` would walk straight past a check on `198.51.100.7`.
+- **The port is part of it**, because the question is "would this connection be
+  answered by us?" — and `127.0.0.1:2526` is not this daemon when it serves
+  `127.0.0.1:2525`.
+- **Self identities** are the listener's own address, every loopback address
+  when the listener is a wildcard, and `smtp.inbound.self_addresses`. Behind
+  NAT or on a multi-homed host, the address the world's DNS points at cannot be
+  inferred from a wildcard bind, which is what that setting is for.
+
+The verdicts:
+
+| What the resolver said | Verdict |
+|---|---|
+| Some address elsewhere | connect to it — a mixed MX list is an ordinary secondary-MX arrangement, and the mail belongs at the other host |
+| Every address is this host | skip that exchanger and try the next |
+| Cannot resolve, or timed out | transient, and **not** evidence of a loop |
+| Every usable exchanger is this host | permanent: `554`, rendered as **5.4.6** in the DSN, and a report is owed |
+
+Uncertainty never becomes a loop verdict: "we could not reach anyone" and
+"everyone is us" are different answers, and only the second is a configuration
+that no retry resolves. The report says *routing loop* rather than *no such
+user*, because the mailbox is fine and the fault is on this side — the person
+who can fix it is the operator, and they will not see the word "loop" in a
+bounce that blames the recipient.
+
+---
+
 ## 12. Tests
 
 Every property with the mutation that must break it, in the discipline the

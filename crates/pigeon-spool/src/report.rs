@@ -133,6 +133,12 @@ fn human_paragraph(entry: &Entry) -> String {
 fn status_code(entry: &Entry) -> &'static str {
     match (entry.state.as_str(), entry.code) {
         ("expired", _) => "4.4.7",
+        // A routing loop, which the delivery path records with this code and
+        // nothing else does: a remote's own permanent refusal is recorded as
+        // 550 whatever code it actually gave. "No such user" would be wrong
+        // here — the mailbox is fine, and the fault is a configuration that
+        // sends the domain's mail back to the host forwarding it.
+        (_, Some(554)) => "5.4.6",
         (_, Some(550)) => "5.1.1",
         (_, Some(code)) if (500..600).contains(&code) => "5.0.0",
         // No SMTP code and not expired: a local fault, and the status says so

@@ -122,6 +122,23 @@ pub struct Inbound {
     pub tls_certificate: Option<PathBuf>,
     #[serde(default)]
     pub tls_private_key: Option<PathBuf>,
+
+    /// Addresses that are this host, for delivery-side loop detection.
+    ///
+    /// Pigeon refuses to deliver to itself: an MX that resolves back here means
+    /// the message would be accepted again, forwarded again, and go round until
+    /// the trace-header hop limit stops it — one delivery per pass.
+    ///
+    /// It knows the listener's own address, and every loopback address when the
+    /// listener is a wildcard. It cannot know the rest: behind NAT, or on a
+    /// host with several interfaces, the address the world's DNS points at is
+    /// not one this process can see. Those go here.
+    ///
+    /// Empty is safe rather than strict — the hop limit is still the final
+    /// defence — but a forwarding loop through a NAT'd host will be caught a
+    /// hundred deliveries later instead of on the first.
+    #[serde(default)]
+    pub self_addresses: Vec<std::net::IpAddr>,
 }
 
 impl Default for Inbound {
@@ -130,6 +147,7 @@ impl Default for Inbound {
             listen: "0.0.0.0:25".parse().expect("literal"),
             tls_certificate: None,
             tls_private_key: None,
+            self_addresses: Vec::new(),
         }
     }
 }

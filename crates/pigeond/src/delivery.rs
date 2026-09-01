@@ -376,6 +376,17 @@ async fn transmit<R: MxLookup>(
             response: remote,
         },
 
+        // A routing loop is a permanent failure of a different kind, and the
+        // report has to say so: 554 is what the DSN renderer turns into 5.4.6,
+        // and telling the sender "no such user" instead would send them looking
+        // for a mailbox that is fine. Pigeon records 554 only here — a remote's
+        // own permanent refusal is recorded below as 550 — so the code is an
+        // unambiguous marker rather than a guess about who said what.
+        Err(e @ crate::ForwardError::Loop(_)) => Outcome::Failed {
+            code: 554,
+            response: e.to_string(),
+        },
+
         // Permanent means the *remote* refused it, or the domain said in DNS
         // that it accepts no mail. Only these become a failure the sender is
         // told about.

@@ -125,6 +125,9 @@ struct Forwarding<R: MxLookup> {
     /// How outbound `STARTTLS` is negotiated. Shared, and built once: see
     /// `pigeon_smtp::tls::outbound` for why the peer is not authenticated.
     tls: Arc<rustls::ClientConfig>,
+    /// Which addresses are this host, so delivery can refuse to loop back to
+    /// it.
+    identity: SelfIdentity,
     /// Name given in EHLO. Its forward and reverse DNS must agree with the
     /// sending address or receivers will treat everything as suspect.
     ehlo_name: String,
@@ -148,6 +151,7 @@ impl<R: MxLookup> Clone for Forwarding<R> {
         Self {
             resolver: Arc::clone(&self.resolver),
             tls: Arc::clone(&self.tls),
+            identity: self.identity.clone(),
             ehlo_name: self.ehlo_name.clone(),
             limit: Arc::clone(&self.limit),
             port: self.port,
@@ -170,11 +174,20 @@ enum ForwardError {
     Permanent(String),
     /// Worth trying again later.
     Transient(String),
+    /// Every usable mail exchanger is this host.
+    ///
+    /// Permanent, and kept separate from [`Self::Permanent`] because the sender
+    /// is told a different thing: a remote refusal is about their recipient,
+    /// while this is about a configuration on *this* side that sends a domain's
+    /// mail back to the machine that forwards it. RFC 3463 has a status for
+    /// exactly that, and a report saying "no such user" would send the sender
+    /// looking for a mailbox that is fine.
+    Loop(String),
 }
 
 impl ForwardError {
     fn is_permanent(&self) -> bool {
-        matches!(self, Self::Permanent(_))
+        matches!(self, Self::Permanent(_) | Self::Loop(_))
     }
 }
 
@@ -183,6 +196,7 @@ impl std::fmt::Display for ForwardError {
         match self {
             Self::Permanent(m) => write!(f, "permanent: {m}"),
             Self::Transient(m) => write!(f, "transient: {m}"),
+            Self::Loop(m) => write!(f, "routing loop: {m}"),
         }
     }
 }
@@ -664,6 +678,67 @@ struct Auth {
 struct Queue {
     conn: Arc<tokio::sync::Mutex<rusqlite::Connection>>,
     path: Arc<PathBuf>,
+}
+
+/// Which socket addresses are this daemon.
+///
+/// Used to refuse delivering to ourselves. An MX that resolves back here means
+/// the message would be accepted again, forwarded again, and go round until the
+/// inbound hop limit stops it — one delivery attempt per pass, each one real
+/// mail leaving and re-entering.
+///
+/// # Addresses, and the port with them
+///
+/// Compared against the addresses a connection would actually be made to —
+/// never against reverse DNS or the peer's banner, both of which are the
+/// remote's to write and neither of which says where the packets went.
+///
+/// The port is part of the identity because the question is "would this
+/// connection be answered by us?", and the answer for `127.0.0.1:2526` when
+/// this daemon serves `127.0.0.1:2525` is no. Delivery always goes to the MX
+/// port, so in production this is the listener's port and the check is exactly
+/// "is that MX us".
+#[derive(Debug, Clone, Default)]
+struct SelfIdentity {
+    addresses: std::collections::HashSet<std::net::IpAddr>,
+    port: u16,
+}
+
+impl SelfIdentity {
+    /// What the daemon can work out about itself, plus what it was told.
+    ///
+    /// A wildcard listener means every local address reaches this process, and
+    /// the loopback addresses are the ones it can name without asking the
+    /// operating system for its interfaces. The address the world's DNS points
+    /// at — behind NAT, or on a multi-homed host — cannot be inferred from a
+    /// wildcard bind at all, which is why `self_addresses` exists.
+    fn new(listen: std::net::SocketAddr, configured: &[std::net::IpAddr]) -> Self {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let mut addresses: std::collections::HashSet<IpAddr> =
+            configured.iter().map(|a| a.to_canonical()).collect();
+
+        if listen.ip().is_unspecified() {
+            addresses.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            addresses.insert(IpAddr::V6(Ipv6Addr::LOCALHOST).to_canonical());
+        } else {
+            addresses.insert(listen.ip().to_canonical());
+        }
+
+        Self {
+            addresses,
+            port: listen.port(),
+        }
+    }
+
+    /// Whether a connection to this address would come back to us.
+    ///
+    /// `to_canonical` first: `::ffff:127.0.0.1` and `127.0.0.1` are the same
+    /// host reached two ways, and a comparison that missed that would be
+    /// defeated by a resolver returning the mapped form.
+    fn is_self(&self, addr: std::net::SocketAddr) -> bool {
+        addr.port() == self.port && self.addresses.contains(&addr.ip().to_canonical())
+    }
 }
 
 /// Everything acceptance needs, and nothing delivery does.
@@ -1263,6 +1338,12 @@ async fn forward<R: MxLookup>(
     // destination is refusing.
     let mut last = ForwardError::Transient("no hosts tried".into());
 
+    // Whether every candidate so far was *demonstrably* this host. A single
+    // host that could not be resolved, or that has one address elsewhere,
+    // clears it: "we could not reach anyone" and "everyone is us" are different
+    // answers, and only the second is a loop.
+    let mut all_self = true;
+
     for host in &hosts {
         let Some(remaining) = deadline
             .checked_duration_since(Instant::now())
@@ -1274,9 +1355,63 @@ async fn forward<R: MxLookup>(
             ));
         };
 
+        // Resolved here rather than inside `connect`, for two reasons. The
+        // addresses are what the loop check compares — not the name, not the
+        // peer's reverse DNS, not its banner, none of which say where the
+        // packets went. And resolving once means the address checked is the
+        // address connected to: resolving again inside `connect` could land on
+        // a different one.
+        let resolved = tokio::time::timeout(
+            CONNECT_TIMEOUT.min(remaining),
+            tokio::net::lookup_host((host.as_str(), f.port)),
+        )
+        .await;
+
+        let addresses: Vec<std::net::SocketAddr> = match resolved {
+            Ok(Ok(addrs)) => addrs.collect(),
+            Ok(Err(e)) => {
+                // Uncertainty is transient and is *not* evidence of a loop: a
+                // resolver that cannot answer has said nothing about whether
+                // this host is us.
+                all_self = false;
+                last = ForwardError::Transient(format!("{host}: {e}"));
+                tracing::warn!(%host, error = %e, "cannot resolve, trying next host");
+                continue;
+            }
+            Err(_) => {
+                all_self = false;
+                last = ForwardError::Transient(format!("{host}: resolution timed out"));
+                tracing::warn!(%host, "resolution timed out, trying next host");
+                continue;
+            }
+        };
+
+        // Self addresses are skipped rather than fatal: a domain whose MX list
+        // includes this host *and* a real one is a normal secondary-MX setup,
+        // and the mail belongs at the other host.
+        let elsewhere: Vec<std::net::SocketAddr> = addresses
+            .iter()
+            .copied()
+            .filter(|a| !f.identity.is_self(*a))
+            .collect();
+
+        if elsewhere.is_empty() && !addresses.is_empty() {
+            tracing::warn!(%host, "skipping a mail exchanger that resolves back to this host");
+            last = ForwardError::Permanent(format!(
+                "{host} resolves only to this host: mail for {destination} would loop"
+            ));
+            continue;
+        }
+        if addresses.is_empty() {
+            all_self = false;
+            last = ForwardError::Transient(format!("{host}: resolved to no addresses"));
+            continue;
+        }
+        all_self = false;
+
         let connect = tokio::time::timeout(
             CONNECT_TIMEOUT.min(remaining),
-            TcpStream::connect((host.as_str(), f.port)),
+            TcpStream::connect(&elsewhere[..]),
         );
 
         let stream = match connect.await {
@@ -1340,6 +1475,20 @@ async fn forward<R: MxLookup>(
                 tracing::warn!(%host, "forward budget exhausted mid-delivery");
             }
         }
+    }
+
+    // Every usable target was this host. Permanent, and reported as a routing
+    // loop (RFC 3463 §3.5, 5.4.6): the configuration says this domain's mail
+    // comes here and also that it goes there, and no retry resolves that — each
+    // pass would be a real delivery back into Pigeon's own listener, stopped
+    // only by the inbound hop limit a hundred passes later.
+    //
+    // The sender is owed a report, which the permanent classification is what
+    // arranges.
+    if all_self && !hosts.is_empty() {
+        return Err(ForwardError::Loop(format!(
+            "every mail exchanger for {destination} resolves to this host"
+        )));
     }
 
     Err(last)
@@ -1571,6 +1720,13 @@ async fn run() -> io::Result<()> {
                 .map_err(|e| io::Error::other(format!("cannot build resolver: {e}")))?,
         ),
         tls: pigeon_smtp::tls::outbound(),
+        // What this host is, for refusing to deliver to itself. The listener's
+        // own address, plus whatever the operator had to tell us because a
+        // wildcard bind cannot reveal a NAT'd or multi-homed address.
+        identity: SelfIdentity::new(
+            started.config.config().smtp.inbound.listen,
+            &started.config.config().smtp.inbound.self_addresses,
+        ),
         ehlo_name: hostname.clone(),
         limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
         port: SUBMISSION_PORT,
@@ -2018,6 +2174,7 @@ mod tests {
             spool,
             forwarding: Forwarding {
                 tls: pigeon_smtp::tls::outbound(),
+                identity: SelfIdentity::default(),
                 resolver: Arc::new(FakeResolver::new().with(
                     "example.net",
                     vec![MxRecord::new(10, peer_addr.ip().to_string())],
@@ -3149,6 +3306,7 @@ mod tests {
             spool,
             forwarding: Forwarding {
                 tls: pigeon_smtp::tls::outbound(),
+                identity: SelfIdentity::default(),
                 resolver: Arc::new(FakeResolver::new().with(
                     "example.net",
                     vec![MxRecord::new(10, peer_addr.ip().to_string())],
@@ -4508,6 +4666,166 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------- delivery-side loop check
+
+    /// A forwarder that treats `127.0.0.1:port` as this host.
+    fn looping_forwarder(
+        port: u16,
+        exchangers: Vec<pigeon_dns::MxRecord>,
+    ) -> Forwarding<pigeon_dns::FakeResolver> {
+        Forwarding {
+            tls: pigeon_smtp::tls::outbound(),
+            identity: SelfIdentity::new(format!("127.0.0.1:{port}").parse().unwrap(), &[]),
+            resolver: Arc::new(pigeon_dns::FakeResolver::new().with("example.net", exchangers)),
+            ehlo_name: "pigeon.test".into(),
+            limit: Arc::new(Semaphore::new(1)),
+            port,
+            budget: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn an_address_is_this_host_by_address_and_port() {
+        // The comparison is on where the packets would go, and both halves
+        // matter: `127.0.0.1:2526` is not this daemon when it serves
+        // `127.0.0.1:2525`, and treating it as such would refuse to deliver to
+        // a neighbouring service.
+        let id = SelfIdentity::new("127.0.0.1:2525".parse().unwrap(), &[]);
+        assert!(id.is_self("127.0.0.1:2525".parse().unwrap()));
+        assert!(!id.is_self("127.0.0.1:2526".parse().unwrap()));
+        assert!(!id.is_self("198.51.100.7:2525".parse().unwrap()));
+
+        // IPv4-mapped IPv6 is the same host reached two ways. A resolver that
+        // returned the mapped form would otherwise walk straight past the
+        // check.
+        assert!(
+            id.is_self("[::ffff:127.0.0.1]:2525".parse().unwrap()),
+            "an IPv4-mapped address was not recognised"
+        );
+
+        // And the same in the other direction: configured as mapped, seen as
+        // plain.
+        let mapped = SelfIdentity::new(
+            "0.0.0.0:2525".parse().unwrap(),
+            &["::ffff:198.51.100.7".parse().unwrap()],
+        );
+        assert!(mapped.is_self("198.51.100.7:2525".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_wildcard_listener_knows_only_loopback_and_what_it_was_told() {
+        // Behind NAT, or on a multi-homed host, the address the world's DNS
+        // points at cannot be inferred from a wildcard bind — which is the
+        // whole reason `self_addresses` exists.
+        let wildcard = SelfIdentity::new("0.0.0.0:25".parse().unwrap(), &[]);
+        assert!(wildcard.is_self("127.0.0.1:25".parse().unwrap()));
+        assert!(wildcard.is_self("[::1]:25".parse().unwrap()));
+        assert!(
+            !wildcard.is_self("198.51.100.7:25".parse().unwrap()),
+            "a wildcard bind claimed an address it cannot know it has"
+        );
+
+        let told = SelfIdentity::new(
+            "0.0.0.0:25".parse().unwrap(),
+            &["198.51.100.7".parse().unwrap()],
+        );
+        assert!(told.is_self("198.51.100.7:25".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_self_exchanger_is_skipped_and_a_real_one_is_used() {
+        // A domain whose MX list includes this host *and* a real one is an
+        // ordinary secondary-MX arrangement. The mail belongs at the other
+        // host, and refusing the whole delivery would bounce mail that has a
+        // perfectly good place to go.
+        //
+        // The self entry is listed first, so the check has to skip it and carry
+        // on rather than deciding on the primary alone.
+        //
+        // What this pins is the fallthrough: that one self exchanger does not
+        // condemn the whole delivery. It cannot also pin the skip itself —
+        // nothing is listening at the self address, so a delivery that tried it
+        // anyway would fail and move on to the same place. The skip is pinned
+        // by `every_exchanger_being_this_host_is_a_permanent_loop`, where
+        // trying it is the difference between a loop and a connection.
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+
+        let mut f = looping_forwarder(
+            peer_addr.port(),
+            vec![
+                // Us: nothing is listening there, so a delivery that tried it
+                // would fail rather than quietly succeed.
+                pigeon_dns::MxRecord::new(10, "127.0.0.2".to_string()),
+                // The real one.
+                pigeon_dns::MxRecord::new(20, "127.0.0.1".to_string()),
+            ],
+        );
+        f.identity = SelfIdentity::new(
+            format!("127.0.0.2:{}", peer_addr.port()).parse().unwrap(),
+            &[],
+        );
+
+        forward(&f, 0, "dest@example.net", "s@remote.test", b"body\r\n")
+            .await
+            .expect("the secondary exchanger should have taken the message");
+        assert!(
+            transcript.saw("MAIL FROM"),
+            "the message never reached the exchanger that is not us"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_exchanger_being_this_host_is_a_permanent_loop() {
+        // The case the check exists for. Without it each pass is a real
+        // delivery back into Pigeon's own listener, and the message goes round
+        // until the inbound hop limit stops it a hundred deliveries later.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let f = looping_forwarder(
+            port,
+            vec![
+                pigeon_dns::MxRecord::new(10, "127.0.0.1".to_string()),
+                // A name for the same host: the comparison is on the resolved
+                // address, so an alias does not get past it.
+                pigeon_dns::MxRecord::new(20, "localhost".to_string()),
+            ],
+        );
+
+        let err = forward(&f, 0, "dest@example.net", "s@remote.test", b"body\r\n")
+            .await
+            .expect_err("delivering to ourselves should not succeed");
+
+        assert!(
+            matches!(err, ForwardError::Loop(_)),
+            "a loop was not reported as one: {err}"
+        );
+        assert!(err.is_permanent(), "a routing loop is not worth retrying");
+    }
+
+    #[tokio::test]
+    async fn an_exchanger_that_cannot_be_resolved_is_transient_not_a_loop() {
+        // Resolver uncertainty says nothing about whether a host is us.
+        // Calling it a loop would bounce deliverable mail on the strength of a
+        // DNS failure.
+        let f = looping_forwarder(
+            25,
+            vec![pigeon_dns::MxRecord::new(
+                10,
+                "no-such-host.invalid".to_string(),
+            )],
+        );
+
+        let err = forward(&f, 0, "dest@example.net", "s@remote.test", b"body\r\n")
+            .await
+            .expect_err("an unresolvable exchanger cannot deliver");
+
+        assert!(
+            !err.is_permanent(),
+            "an unresolved name was treated as evidence of a loop: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn the_forward_budget_bounds_the_whole_delivery_not_one_connection() {
         // A peer that answers its door and then says nothing. `deliver` has
@@ -4522,6 +4840,7 @@ mod tests {
 
         let f = Forwarding {
             tls: pigeon_smtp::tls::outbound(),
+            identity: SelfIdentity::default(),
             resolver: Arc::new(pigeon_dns::FakeResolver::new().with(
                 "example.net",
                 vec![
@@ -4572,6 +4891,7 @@ mod tests {
 
         let f = |resolver| Forwarding {
             tls: pigeon_smtp::tls::outbound(),
+            identity: SelfIdentity::default(),
             resolver: Arc::new(resolver),
             ehlo_name: "pigeon.test".into(),
             limit: Arc::new(Semaphore::new(1)),

@@ -187,7 +187,7 @@ mail that providers reject.**
 - [x] delivery metadata retention
 - [x] duplicate suppression (declined by policy: §6.2 — safe only within one
       accepted transaction, which is what the acceptance path already does)
-- [ ] loop detection at delivery, as a backstop for chains leaving and
+- [x] loop detection at delivery, as a backstop for chains leaving and
       re-entering through systems Pigeon cannot see
 - [x] STARTTLS
 - [x] SMTP timeouts, connection and size limits
