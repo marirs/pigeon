@@ -27,6 +27,7 @@
 //! it is, for an operator to find. Configuration comes from the environment
 //! because the TOML loader and SQLite schema arrive in Milestone 1.
 
+mod delivery;
 mod reload;
 mod startup;
 
@@ -73,6 +74,14 @@ const TOTAL_FORWARD_BUDGET: Duration = Duration::from_secs(1800);
 /// Checked at startup rather than trusted: the two live in different crates.
 const CLAIM_LEASE: Duration =
     Duration::from_secs(pigeon_spool::queue::DEFAULT_LEASE_SECONDS as u64);
+
+/// How long a message may keep failing before Pigeon gives up (R-3).
+///
+/// Five days, the SMTP convention, and fixed: configurability is deferred, and
+/// if it is ever exposed it has to be validated against the 21-day SRS window
+/// — a return path that expires before the bounce is sent is a failure nobody
+/// hears about.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(5 * 24 * 60 * 60);
 
 /// Where forwarded mail is sent, and who we claim to be when sending it.
 ///
@@ -773,7 +782,11 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
                 //
                 // Nothing retries yet: a failure here leaves the message in
                 // the spool and says so. The queue arrives in Milestone 3.
-                if let Some(f) = self.forwarding.clone() {
+                // Milestone 0's path: with no database there is no queue to
+                // deliver from, so the message is forwarded straight away and
+                // nothing retries it. With a queue, delivery is the worker's
+                // job — acceptance ends at the commit.
+                if let Some(f) = self.forwarding.clone().filter(|_| self.queue.is_none()) {
                     let rotation = self.counter.load(Ordering::Relaxed);
                     let id2 = id.clone();
                     let dir = Arc::clone(&self.dir);
@@ -820,7 +833,9 @@ impl<R: MxLookup + 'static> SpoolSink<R> {
 
                         // The spooled file is already header-then-body, so it
                         // goes out as one part.
-                        match forward(&f, rotation, &envelope, &spooled).await {
+                        let destination = f.destination.clone();
+                        match forward(&f, rotation, &destination, &envelope.sender, &spooled).await
+                        {
                             Ok(remote) => {
                                 tracing::info!(id = %id2, %remote, "forwarded");
                                 // Pigeon is a relay, not an archive. The spool
@@ -1006,7 +1021,10 @@ async fn discard_spooled(dir: &Path, id: &str) -> io::Result<()> {
 async fn forward<R: MxLookup>(
     f: &Forwarding<R>,
     rotation: u64,
-    envelope: &Envelope,
+    destination: &str,
+    // The envelope sender to transmit: the SRS return path stored at
+    // acceptance, or empty for a bounce.
+    return_path: &str,
     message: &[u8],
 ) -> Result<String, ForwardError> {
     // The whole forward, not one connection. Every wait below is measured
@@ -1014,15 +1032,13 @@ async fn forward<R: MxLookup>(
     // hosts the destination publishes.
     let deadline = Instant::now() + f.budget;
 
-    let domain = f
-        .destination
+    let domain = destination
         .rsplit_once('@')
         .map(|(_, d)| d)
         .ok_or_else(|| {
-            // Startup validates the destination, so reaching this means the
-            // guard was bypassed. Permanent either way: retrying will not add
-            // an '@'.
-            ForwardError::Permanent(format!("destination {} has no domain", f.destination))
+            // Startup validates the destination, so reaching this means the guard
+            // was bypassed. Permanent either way: retrying will not add an '@'.
+            ForwardError::Permanent(format!("destination {destination} has no domain"))
         })?;
 
     let hosts = match f.resolver.lookup_mx(domain).await {
@@ -1043,11 +1059,14 @@ async fn forward<R: MxLookup>(
         Err(e) => return Err(ForwardError::Transient(e.to_string())),
     };
 
-    // The envelope Pigeon sends is its own: one recipient, the configured
-    // destination. Rewriting the sender for SPF comes with SRS in Milestone 2.
+    // The envelope Pigeon sends is its own: one recipient, and the return path
+    // the message was accepted with. Built from the two arguments rather than
+    // from a caller's envelope, because a caller that supplied both a
+    // recipient list and a destination would have two answers to one question
+    // — and the recipient list was silently ignored.
     let outgoing = Envelope {
-        sender: envelope.sender.clone(),
-        recipients: vec![f.destination.clone()],
+        sender: return_path.to_string(),
+        recipients: vec![destination.to_string()],
     };
 
     // Transient by default: having tried nothing is not evidence that the
@@ -1182,6 +1201,38 @@ async fn prepare_spool(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Identifies this process's claims.
+///
+/// Hostname plus a random boot value (R-7). Not a PID, which is reused within
+/// minutes on a busy host, and not a timestamp alone, which collides across
+/// machines that boot together and after a clock step. The hostname is for the
+/// operator reading a stuck row; the random half is what makes it unique.
+fn worker_identity(hostname: &str) -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        // A worker that cannot generate a unique identity would share one, and
+        // two workers sharing an identity is precisely what the claim token
+        // exists to survive — but it also makes a log unreadable. Fall back to
+        // the clock rather than to a constant.
+        return format!("{hostname}-{}", unix_now());
+    }
+    format!(
+        "{hostname}-{}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+
+/// Seconds since the Unix epoch.
+///
+/// Wall clock, because the queue's schedule has to survive a restart and a
+/// monotonic clock does not.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -1301,6 +1352,8 @@ async fn run() -> io::Result<()> {
         Some((b, _)) => b.config.config().hostname.clone(),
         None => env_or("PIGEON_HOSTNAME", "localhost"),
     };
+    // The listener config takes `hostname` by value below.
+    let hostname_for_worker = hostname.clone();
     let spool = match &booted {
         Some((b, _)) => b.config.config().spool.clone(),
         None => PathBuf::from(env_or("PIGEON_SPOOL", "./spool")),
@@ -1519,6 +1572,28 @@ async fn run() -> io::Result<()> {
         ..Default::default()
     };
 
+    // The delivery loop, if there is a queue to deliver from. Started after
+    // every fallible step, for the reason the reload worker is: an early `?`
+    // between the start and the listener bind would drop the handle and leave
+    // the task running.
+    let stop_delivery = match (&sink.queue, &sink.forwarding) {
+        (Some(queue), Some(forwarding)) => {
+            let worker = worker_identity(&hostname_for_worker);
+            tracing::info!(%worker, concurrency = MAX_CONCURRENT_DELIVERIES, "delivery worker starting");
+            let d = delivery::Deliverer::start(delivery::DeliveryConfig {
+                queue: queue.clone(),
+                spool: sink.spool.clone(),
+                forwarding: forwarding.clone(),
+                concurrency: MAX_CONCURRENT_DELIVERIES,
+                lease_seconds: CLAIM_LEASE.as_secs() as i64,
+                horizon_seconds: GIVE_UP_AFTER.as_secs() as i64,
+                worker,
+            });
+            Some(d)
+        }
+        _ => None,
+    };
+
     // Supervised from here rather than left to a dropped handle. A panicking
     // task cannot report its own death, and an unpolled `JoinHandle` holds the
     // result silently — a daemon that spawned the worker and forgot it would
@@ -1558,6 +1633,19 @@ async fn run() -> io::Result<()> {
     // Signalled *and* joined, through the supervisor.
     if let Some((stopper, supervisor)) = stop_reload {
         stopper.stop_and_join(supervisor).await;
+    }
+
+    // The delivery loop stops taking new work; attempts already in flight are
+    // left to finish or to be reclaimed by lease expiry after a restart. Not
+    // joined, deliberately: a delivery can take the whole forward budget, and
+    // waiting for one would make shutdown hostage to the slowest remote server
+    // currently being tried. The claim token is what makes an unjoined
+    // attempt harmless.
+    if let Some(d) = stop_delivery {
+        d.stop();
+        // Supervised so a panic in the loop is reported rather than swallowed,
+        // and not awaited so shutdown does not wait on a delivery in flight.
+        drop(d.supervise());
     }
 
     outcome
@@ -1673,6 +1761,297 @@ mod tests {
             path: Arc::new(db.clone()),
         });
         (s, db)
+    }
+
+    // ------------------------------------------------------ the delivery loop
+
+    /// A queue with `n` due deliveries and their spool files, plus a deliverer
+    /// pointed at `peer_addr`.
+    async fn delivery_fixture(
+        dir: &Path,
+        peer_addr: SocketAddr,
+        destinations: &[&str],
+        concurrency: usize,
+        write_bodies: bool,
+    ) -> (Queue, delivery::Deliverer) {
+        use pigeon_dns::{FakeResolver, MxRecord};
+
+        let db = dir.join("pigeon.db");
+        let mut conn = pigeon_db::open(&db).unwrap();
+        pigeon_db::migrate(&mut conn, &db).unwrap();
+        let queue = Queue {
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            path: Arc::new(db.clone()),
+        };
+        let spool = pigeon_spool::Spool::new(dir.to_path_buf());
+
+        for (i, destination) in destinations.iter().enumerate() {
+            let spool_id = pigeon_spool::SpoolId::new(&format!("msg-{i}")).unwrap();
+            if write_bodies {
+                spool
+                    .install(&spool_id, &[b"From: <a@remote.test>\r\n\r\nbody\r\n"])
+                    .await
+                    .unwrap();
+            }
+            let acceptance = pigeon_spool::accept::Acceptance {
+                spool_id,
+                return_path: "SRS0=tag=AAA=remote.test=alice@pigeon.test".into(),
+                original_sender: "alice@remote.test".into(),
+                size_bytes: 30,
+                routing_revision: 1,
+                routing_fingerprint: vec![0; 32],
+                original_recipients: vec!["hello@example.com".into()],
+                destinations: vec![pigeon_spool::accept::Destination {
+                    address: (*destination).to_string(),
+                    from_recipients: vec![0],
+                }],
+            };
+            let mut conn = queue.conn.lock().await;
+            // Accepted *now*: a message dated at the epoch is five days past
+            // the give-up horizon before the worker ever sees it.
+            pigeon_spool::accept(&mut conn, &queue.path, &[acceptance], unix_now()).unwrap();
+        }
+
+        let deliverer = delivery::Deliverer::start(delivery::DeliveryConfig {
+            queue: queue.clone(),
+            spool,
+            forwarding: Forwarding {
+                resolver: Arc::new(FakeResolver::new().with(
+                    "example.net",
+                    vec![MxRecord::new(10, peer_addr.ip().to_string())],
+                )),
+                ehlo_name: "pigeon.test".into(),
+                destination: String::new(),
+                limit: Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES)),
+                port: peer_addr.port(),
+                budget: Duration::from_secs(5),
+            },
+            concurrency,
+            lease_seconds: 2400,
+            horizon_seconds: 5 * 24 * 60 * 60,
+            worker: "test-worker".into(),
+        });
+
+        (queue, deliverer)
+    }
+
+    async fn states(queue: &Queue) -> Vec<String> {
+        let conn = queue.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT state FROM delivery ORDER BY destination")
+            .unwrap();
+        let mut v: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn no_more_is_claimed_than_can_be_attempted() {
+        // The permit is acquired *before* the claim, so a row is only claimed
+        // when it is about to be attempted. Claiming first and waiting for a
+        // permit afterwards would let a row spend its lease sitting in memory,
+        // and the lease-outlasts-the-deadline guarantee would prove nothing.
+        //
+        // Observable with one permit and two due deliveries: exactly one row
+        // may be `delivering` at a time.
+        let tmp = TempDir::new("permit-order");
+        // A peer that accepts the connection and then says nothing, so the
+        // first attempt stays in flight for the length of the test.
+        let (peer_addr, _t) = pigeon_testkit::Peer::new()
+            .send("220 test.invalid ESMTP")
+            .stall(Duration::from_secs(30))
+            .close()
+            .spawn()
+            .await;
+
+        let (queue, deliverer) = delivery_fixture(
+            tmp.path(),
+            peer_addr,
+            &["a@example.net", "b@example.net"],
+            1,
+            true,
+        )
+        .await;
+
+        // Long enough for the loop to claim, connect and block.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let states = states(&queue).await;
+        let delivering = states.iter().filter(|s| *s == "delivering").count();
+        assert_eq!(
+            delivering, 1,
+            "with one permit, {delivering} rows were claimed at once: {states:?}"
+        );
+
+        deliverer.stop();
+    }
+
+    #[tokio::test]
+    async fn a_missing_body_is_a_local_failure_not_a_remote_rejection() {
+        // Telling the sender their recipient refused the message would be
+        // false and unactionable: the fault is here. Deferred, so it can still
+        // be delivered if an operator restores the file — and if it never is,
+        // the age horizon gives up and says so honestly.
+        let tmp = TempDir::new("missing-body");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+
+        let (queue, deliverer) = delivery_fixture(
+            tmp.path(),
+            peer_addr,
+            &["a@example.net"],
+            1,
+            // No spool file: the row refers to a body that is not there.
+            false,
+        )
+        .await;
+
+        for _ in 0..40 {
+            if states(&queue).await.iter().any(|s| s == "deferred") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let conn = queue.conn.lock().await;
+        let (state, code, response): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT state, last_code, last_response FROM delivery",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(state, "deferred", "a missing body ended the delivery");
+        assert_eq!(code, None, "a local failure was given an SMTP code");
+        assert!(
+            response.unwrap_or_default().contains("local integrity"),
+            "the failure was not recorded as a local one"
+        );
+        assert!(
+            !transcript.saw("MAIL FROM"),
+            "a message with no body was transmitted anyway"
+        );
+
+        deliverer.stop();
+    }
+
+    #[tokio::test]
+    async fn a_delivered_message_becomes_terminal_and_is_not_retried() {
+        let tmp = TempDir::new("delivered");
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+
+        let (queue, deliverer) =
+            delivery_fixture(tmp.path(), peer_addr, &["a@example.net"], 1, true).await;
+
+        for _ in 0..60 {
+            if states(&queue).await.iter().any(|s| s == "delivered") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(states(&queue).await, vec!["delivered"]);
+        assert!(
+            transcript.saw("MAIL FROM:<SRS0="),
+            "the stored return path was not used: {:?}",
+            transcript.lines()
+        );
+        assert!(
+            transcript.saw("RCPT TO:<a@example.net>"),
+            "the claim's destination was not used: {:?}",
+            transcript.lines()
+        );
+
+        deliverer.stop();
+    }
+
+    /// A peer that answers the end of DATA with `code`.
+    fn peer_answering(code: &str) -> pigeon_testkit::Peer {
+        pigeon_testkit::Peer::new()
+            .send("220 test.invalid ESMTP")
+            .read_line()
+            .send("250 test.invalid")
+            .read_line() // MAIL FROM
+            .send("250 Ok")
+            .read_line() // RCPT TO
+            .send("250 Ok")
+            .read_line() // DATA
+            .send("354 Go ahead")
+            .read_body()
+            .send(code)
+            .read_line() // QUIT
+            .send("221 Bye")
+            .close()
+    }
+
+    async fn wait_for_state(queue: &Queue, wanted: &str) -> Vec<String> {
+        for _ in 0..80 {
+            let s = states(queue).await;
+            if s.iter().any(|state| state == wanted) {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        states(queue).await
+    }
+
+    #[tokio::test]
+    async fn a_temporary_refusal_is_retried_not_bounced() {
+        // 4xx means "not now". Recording it as a failure would bounce mail the
+        // destination never refused, and Pigeon keeps no copy after that.
+        let tmp = TempDir::new("temp-refusal");
+        let (peer_addr, _t) = peer_answering("451 4.3.0 try later").spawn().await;
+        let (queue, deliverer) =
+            delivery_fixture(tmp.path(), peer_addr, &["a@example.net"], 1, true).await;
+
+        assert_eq!(wait_for_state(&queue, "deferred").await, vec!["deferred"]);
+
+        let conn = queue.conn.lock().await;
+        let (notification, next): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT notification, next_attempt_at FROM delivery",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(notification, "none", "a deferral owes the sender a report");
+        assert!(next.is_some(), "a deferred delivery has no next attempt");
+
+        deliverer.stop();
+    }
+
+    #[tokio::test]
+    async fn a_permanent_refusal_fails_and_owes_a_report() {
+        // 5xx is the destination's final answer, and the sender has to be told.
+        let tmp = TempDir::new("perm-refusal");
+        let (peer_addr, _t) = peer_answering("550 5.1.1 No such user").spawn().await;
+        let (queue, deliverer) =
+            delivery_fixture(tmp.path(), peer_addr, &["a@example.net"], 1, true).await;
+
+        assert_eq!(wait_for_state(&queue, "failed").await, vec!["failed"]);
+
+        let conn = queue.conn.lock().await;
+        let (notification, response): (String, String) = conn
+            .query_row(
+                "SELECT notification, last_response FROM delivery",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(notification, "owed", "a permanent failure owes no report");
+        assert!(
+            response.contains("550") || response.contains("No such user"),
+            "the remote's answer was not recorded: {response}"
+        );
+
+        deliverer.stop();
     }
 
     #[tokio::test]
@@ -3127,7 +3506,7 @@ mod tests {
         };
 
         let started = Instant::now();
-        let err = forward(&f, 0, &envelope, b"body\r\n")
+        let err = forward(&f, 0, "dest@example.net", &envelope.sender, b"body\r\n")
             .await
             .expect_err("a stalled peer somehow delivered");
 
@@ -3165,9 +3544,15 @@ mod tests {
         // RFC 7505: the domain has published that it accepts no mail.
         let null_mx = f(pigeon_dns::FakeResolver::new()
             .with("example.net", vec![pigeon_dns::MxRecord::new(0, ".")]));
-        let err = forward(&null_mx, 0, &envelope, b"body\r\n")
-            .await
-            .expect_err("null MX delivered");
+        let err = forward(
+            &null_mx,
+            0,
+            "dest@example.net",
+            &envelope.sender,
+            b"body\r\n",
+        )
+        .await
+        .expect_err("null MX delivered");
         assert!(err.is_permanent(), "null MX treated as retryable: {err}");
 
         // A resolver that is merely failing says nothing about the domain.
@@ -3175,9 +3560,15 @@ mod tests {
             "example.net",
             pigeon_dns::LookupError::Resolver("SERVFAIL".into()),
         ));
-        let err = forward(&broken, 0, &envelope, b"body\r\n")
-            .await
-            .expect_err("a broken resolver delivered");
+        let err = forward(
+            &broken,
+            0,
+            "dest@example.net",
+            &envelope.sender,
+            b"body\r\n",
+        )
+        .await
+        .expect_err("a broken resolver delivered");
         assert!(
             !err.is_permanent(),
             "a resolver fault would have bounced deliverable mail: {err}"
@@ -3188,7 +3579,7 @@ mod tests {
             "example.net",
             pigeon_dns::LookupError::NoSuchDomain("example.net".into()),
         ));
-        let err = forward(&gone, 0, &envelope, b"body\r\n")
+        let err = forward(&gone, 0, "dest@example.net", &envelope.sender, b"body\r\n")
             .await
             .expect_err("NXDOMAIN delivered");
         assert!(err.is_permanent(), "NXDOMAIN treated as retryable: {err}");

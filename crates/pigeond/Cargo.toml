@@ -21,6 +21,8 @@ pigeon-spool = { workspace = true }
 pigeon-alert = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
+# Backoff jitter and the worker boot identifier.
+getrandom = "0.3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
