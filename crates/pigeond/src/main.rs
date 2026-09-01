@@ -37,6 +37,7 @@ mod delivery;
 mod notify;
 mod reload;
 mod routing;
+mod scanner;
 mod startup;
 
 use std::collections::HashMap;
@@ -770,6 +771,8 @@ struct Abuse {
     trusted: std::collections::HashSet<std::net::IpAddr>,
     /// Zero disables greylisting.
     greylist_seconds: i64,
+    /// The external content scanner, if one is configured.
+    scanner: Option<scanner::Scanner>,
     /// The resolver the blocklists are asked through. The same one delivery
     /// uses: one DNS stack, one set of answers.
     resolver: Arc<SystemResolver>,
@@ -1031,6 +1034,28 @@ impl SpoolSink {
                     // message still forwards — with SPF failing at the receiver,
                     // which is the pre-SRS status quo rather than lost mail.
                     tracing::error!(%id, error = %e, "forwarding without an SRS return path");
+                }
+            }
+        }
+
+        // Content filtering, before anything is written. The last moment a
+        // message can be refused while it is still the sender's problem — and
+        // scanning the received bytes rather than each group's relay form,
+        // because the groups differ only in Pigeon's own headers and signature,
+        // and a scanner asked the same question twice would answer it twice.
+        if let Some(s) = &self.abuse.scanner {
+            match s.scan(&body).await {
+                scanner::Verdict::Accept => {}
+                scanner::Verdict::Reject { reason } => {
+                    tracing::info!(%id, %reason, "refusing a message the scanner rejected");
+                    return Err(DataError::Rejected);
+                }
+                scanner::Verdict::Unavailable { reason } => {
+                    // Not "clean". A scanner that cannot answer has said
+                    // nothing, and reading that as acceptance turns a broken
+                    // scanner into no scanner at all, silently.
+                    tracing::error!(%id, %reason, "the content scanner could not be consulted");
+                    return Err(DataError::Temporary);
                 }
             }
         }
@@ -1943,10 +1968,18 @@ async fn run() -> io::Result<()> {
         if a.greylist_seconds > 0 {
             tracing::info!(seconds = a.greylist_seconds, "greylisting new senders");
         }
+        if let Some(path) = &a.scanner {
+            tracing::info!(scanner = %path.display(), "content scanning enabled");
+        }
         Arc::new(Abuse {
             blocklists: a.blocklists.clone(),
             trusted: a.trusted.iter().map(|ip| ip.to_canonical()).collect(),
             greylist_seconds: a.greylist_seconds,
+            scanner: a.scanner.as_ref().map(|path| scanner::Scanner {
+                command: path.clone(),
+                args: a.scanner_args.clone(),
+                timeout: Duration::from_secs(a.scanner_timeout_seconds),
+            }),
             // The resolver delivery already built: one DNS stack, one set of
             // answers, and one place a resolver failure is classified.
             resolver: Arc::clone(&forwarding.resolver),
@@ -2155,6 +2188,7 @@ mod tests {
             blocklists: Vec::new(),
             trusted: std::collections::HashSet::new(),
             greylist_seconds: 0,
+            scanner: None,
             // Offline: these tests are about what the daemon does with an
             // answer, not about what this machine's resolver says.
             resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
@@ -3126,6 +3160,7 @@ mod tests {
             blocklists: Vec::new(),
             trusted: std::collections::HashSet::new(),
             greylist_seconds: 300,
+            scanner: None,
             resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
         });
 
@@ -3170,6 +3205,7 @@ mod tests {
             blocklists: Vec::new(),
             trusted: ["192.0.2.10".parse().unwrap()].into_iter().collect(),
             greylist_seconds: 300,
+            scanner: None,
             resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
         });
 
@@ -3213,6 +3249,7 @@ mod tests {
             blocklists: vec!["blocklist.invalid".into()],
             trusted: std::collections::HashSet::new(),
             greylist_seconds: 0,
+            scanner: None,
             resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
         });
 
@@ -3224,6 +3261,91 @@ mod tests {
             pigeon_smtp::Connection::Accept,
             "an unreachable blocklist refused a connection"
         );
+    }
+
+    /// Abuse controls with only a scanner configured.
+    fn with_scanner(script: &str) -> Arc<Abuse> {
+        Arc::new(Abuse {
+            blocklists: Vec::new(),
+            trusted: std::collections::HashSet::new(),
+            greylist_seconds: 0,
+            scanner: Some(scanner::Scanner {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                timeout: Duration::from_secs(5),
+            }),
+            resolver: Arc::new(pigeon_dns::SystemResolver::offline()),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_rejected_message_is_refused_permanently_and_never_queued() {
+        // Refused at the end of DATA, before anything is written: the sender
+        // still has the message, and the report goes to whoever wrote it rather
+        // than being Pigeon's to generate.
+        let tmp = TempDir::new("scanner-reject");
+        let (mut s, db) = queued_sink(tmp.path());
+        s.abuse = with_scanner("cat > /dev/null; exit 1");
+
+        let outcome = accept_message(&s, "alice@remote.test", &["hello@example.com"]).await;
+        assert!(
+            matches!(outcome, Err(DataError::Rejected)),
+            "a rejected message was not refused permanently: {outcome:?}"
+        );
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 0, "a rejected message reached the queue");
+
+        // And nothing was spooled: the refusal happens before any bytes are
+        // written, so there is no orphan for the sweep to collect.
+        let spooled = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".eml"))
+            .count();
+        assert_eq!(spooled, 0, "a rejected message was written to the spool");
+    }
+
+    #[tokio::test]
+    async fn a_broken_scanner_defers_rather_than_accepting() {
+        // The asymmetry that decides this: a scanner failing open costs every
+        // message that arrives while it is broken, because it is the only thing
+        // looking at content at all.
+        let tmp = TempDir::new("scanner-broken");
+        let (mut s, db) = queued_sink(tmp.path());
+        s.abuse = with_scanner("exit 42");
+
+        let outcome = accept_message(&s, "alice@remote.test", &["hello@example.com"]).await;
+        assert!(
+            matches!(outcome, Err(DataError::Temporary)),
+            "a broken scanner did not defer: {outcome:?}"
+        );
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 0);
+    }
+
+    #[tokio::test]
+    async fn a_clean_message_passes_the_scanner_and_is_queued() {
+        let tmp = TempDir::new("scanner-clean");
+        let (mut s, db) = queued_sink(tmp.path());
+        s.abuse = with_scanner("cat > /dev/null; exit 0");
+
+        accept_message(&s, "alice@remote.test", &["hello@example.com"])
+            .await
+            .expect("a clean message should be accepted");
+
+        let conn = pigeon_db::open(&db).unwrap();
+        let messages: i64 = conn
+            .query_row("SELECT count(*) FROM message", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 1);
     }
 
     #[tokio::test]

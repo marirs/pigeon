@@ -26,7 +26,9 @@ sha2 = { workspace = true }
 # Backoff jitter and the worker boot identifier.
 getrandom = "0.3"
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `process` for the external content scanner: the message goes to a child
+# process's standard input and its exit status is the verdict.
+tokio = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

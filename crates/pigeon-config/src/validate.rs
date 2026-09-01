@@ -103,6 +103,18 @@ pub enum ValidationError {
         source: std::io::Error,
     },
 
+    /// A configured helper that cannot be used as one.
+    ///
+    /// Separate from `Missing` because the reason is not always a file that is
+    /// not there: a scanner can exist and not be executable, which reads very
+    /// differently to an operator.
+    #[error("the {what} at {path} cannot be used: {reason}")]
+    Unusable {
+        what: &'static str,
+        path: PathBuf,
+        reason: String,
+    },
+
     #[error("{what} {path} is outside the configured root {root}")]
     EscapesRoot {
         what: String,
@@ -194,6 +206,7 @@ pub fn validate(config: Config) -> Result<Checked, ValidationError> {
     require_mode("SRS secret", &config.srs_secret_file, 0o600)?;
 
     check_inbound(&config)?;
+    check_scanner(&config)?;
     check_submission(&config)?;
     check_alerts(&config)?;
 
@@ -270,6 +283,46 @@ fn check_submission(config: &Config) -> Result<(), ValidationError> {
 
     require_readable("TLS certificate", cert)?;
     require_mode("TLS private key", key, 0o600)?;
+    Ok(())
+}
+
+/// The scanner has to exist and be executable, and its timeout has to be a
+/// timeout.
+///
+/// Checked at startup because the alternative is a daemon that starts cleanly
+/// and then refuses every message transiently — a total mail stoppage whose
+/// cause is one missing file.
+fn check_scanner(config: &Config) -> Result<(), ValidationError> {
+    let Some(path) = &config.abuse.scanner else {
+        return Ok(());
+    };
+
+    let meta = std::fs::metadata(path).map_err(|e| ValidationError::Unusable {
+        what: "content scanner",
+        path: path.clone(),
+        reason: e.to_string(),
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(ValidationError::Unusable {
+                what: "content scanner",
+                path: path.clone(),
+                reason: "not executable".into(),
+            });
+        }
+    }
+    let _ = meta;
+
+    if config.abuse.scanner_timeout_seconds == 0 {
+        return Err(ValidationError::Unusable {
+            what: "content scanner",
+            path: path.clone(),
+            reason: "scanner_timeout_seconds is 0, so every message would time out".into(),
+        });
+    }
     Ok(())
 }
 

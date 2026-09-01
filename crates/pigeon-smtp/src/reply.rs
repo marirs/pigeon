@@ -207,6 +207,15 @@ pub fn message_malformed() -> Reply {
     Reply::line(554, "Message contains an octet that cannot be relayed")
 }
 
+/// Refused on content.
+///
+/// Says nothing about *why*: reply text is attacker-visible, and a rejection
+/// that explained which rule fired would be a tuning oracle for whoever is
+/// trying to get past it.
+pub fn message_rejected() -> Reply {
+    Reply::line(550, "Message rejected")
+}
+
 /// Too many trace headers: the message appears to be looping.
 ///
 /// Permanent, because a message going round in circles will do so again on

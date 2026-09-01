@@ -130,6 +130,33 @@ pub struct Abuse {
     /// the delay is measured between and why it is not a per-message delay.
     #[serde(default)]
     pub greylist_seconds: i64,
+
+    /// An external content scanner, run per message at the end of `DATA`.
+    ///
+    /// Absent means no content filtering, which is the default: Pigeon does not
+    /// filter mail itself and is not going to. What this does is hand the
+    /// finished message to whatever the operator already runs — `rspamc`,
+    /// `clamdscan`, a wrapper script — and act on its exit status.
+    ///
+    /// `0` accepts, `1` refuses permanently, anything else refuses transiently.
+    /// A scanner that crashes or hangs has said nothing, and reading that as
+    /// "clean" turns a broken scanner into no scanner at exactly the moment
+    /// somebody is trying to get past it.
+    #[serde(default)]
+    pub scanner: Option<PathBuf>,
+
+    /// Arguments passed before the message, which arrives on standard input.
+    #[serde(default)]
+    pub scanner_args: Vec<String>,
+
+    /// How long one message may take. Kept below the SMTP data timeout, or a
+    /// hanging scanner ends the session rather than answering it.
+    #[serde(default = "thirty")]
+    pub scanner_timeout_seconds: u64,
+}
+
+fn thirty() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

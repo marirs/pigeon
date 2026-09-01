@@ -337,6 +337,7 @@ impl Session {
             Ok(id) => reply::queued(&id),
             Err(DataError::TooLarge) => reply::message_too_large(),
             Err(DataError::Malformed) => reply::message_malformed(),
+            Err(DataError::Rejected) => reply::message_rejected(),
             Err(DataError::TooManyHops) => reply::too_many_hops(),
             Err(DataError::Temporary) => reply::temporary_failure(),
         })
@@ -537,6 +538,10 @@ pub enum DataError {
     /// The body cannot be relayed as it stands: it carries an octet that makes
     /// one set of bytes two different messages. See [`crate::codec::DataStatus`].
     Malformed,
+    /// Refused on content. Permanent, because the same bytes will be refused
+    /// again — and said during the conversation, so the sender still has the
+    /// message and reports the failure to whoever wrote it.
+    Rejected,
 }
 
 #[cfg(test)]

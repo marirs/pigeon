@@ -231,7 +231,7 @@ that.
 
 - [x] DNSBL checks at connect time
 - [x] greylisting
-- [ ] content filtering via an external scanner
+- [x] content filtering via an external scanner
 - [x] connections per IP
 - [x] commands per connection
 - [x] recipients per message
