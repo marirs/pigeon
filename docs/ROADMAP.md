@@ -245,25 +245,32 @@ Rejection happens during the SMTP conversation. Accepting and then discarding is
 
 ## Milestone 5 — DNS validation
 
-- [ ] resolver with timeout and failure handling
-- [ ] MX validation
-- [ ] A / AAAA resolution
-- [ ] PTR validation
-- [ ] hostname consistency
-- [ ] SPF validation
+- [x] resolver with timeout and failure handling
+- [x] MX validation
+- [x] A / AAAA resolution
+- [x] PTR validation
+- [x] hostname consistency
+- [x] SPF validation
 - [ ] optional ed25519 second selector
-- [ ] DKIM selector validation against the published record
-- [ ] DMARC validation
-- [ ] TLS validation
-- [ ] finding severities: FATAL / ERROR / WARNING / INFO
-- [ ] `pigeon domain check`
-- [ ] `pigeon domains check`
-- [ ] startup gating per §5.1 of ARCHITECTURE
-- [ ] certificate issuance and renewal
-- [ ] operator alerts on domain gate and recovery
-- [ ] alert transition tracking, confirmation window and cooldown
-- [ ] resolver circuit breaker
-- [ ] `pigeon alerts test`
+- [x] DKIM selector validation against the published record
+- [x] DMARC validation
+- [x] TLS validation
+- [x] finding severities: FATAL / ERROR / WARNING / INFO
+- [x] `pigeon domain check`
+- [x] `pigeon domains check`
+- [x] startup gating per §5.1 of ARCHITECTURE
+- [x] certificate renewal: the served certificate is reloaded when the file
+      changes and an alert fires two weeks before expiry
+- [ ] certificate *issuance* — deliberately delegated to an external ACME
+      client (certbot, lego, or the reverse proxy that already has one).
+      Issuance needs an HTTP-01 responder on port 80 or a DNS-01 credential
+      with write access to the zone; a mail server that held either would be
+      holding the keys to its own DNS to save an operator one cron entry.
+      Renewal is where the outage actually is, and that is handled.
+- [x] operator alerts on domain gate and recovery
+- [x] alert transition tracking, confirmation window and cooldown
+- [x] resolver circuit breaker
+- [x] `pigeon alerts test`
 
 RSA-2048 is the default DKIM key type. Ed25519 remains unevenly supported by receivers and is offered only as an additional selector alongside RSA, never alone.
 

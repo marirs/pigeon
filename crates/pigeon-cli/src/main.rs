@@ -184,11 +184,26 @@ enum Command {
         #[command(subcommand)]
         verb: Option<RouteVerb>,
     },
+    /// Operator notifications.
+    Alerts {
+        #[command(subcommand)]
+        verb: Option<AlertsVerb>,
+    },
     /// The SRS key ring that signs return paths.
     Srs {
         #[command(subcommand)]
         verb: Option<SrsVerb>,
     },
+}
+
+#[derive(Subcommand)]
+enum AlertsVerb {
+    /// Send one alert to the configured operator address.
+    ///
+    /// The channel that reports failures can fail silently — email about email
+    /// infrastructure shares a failure domain with the thing it monitors — so
+    /// the only way to know it works is to use it.
+    Test,
 }
 
 #[derive(Subcommand)]
@@ -571,6 +586,13 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
                 Ok(exit::OK)
             }
             Some(v) => import_cmd(cli, v),
+        },
+        Command::Alerts { verb } => match verb {
+            None => {
+                print_help("alerts");
+                Ok(exit::OK)
+            }
+            Some(AlertsVerb::Test) => alerts_test(cli),
         },
         Command::Srs { verb } => {
             let path = srs_ring_path(cli)?;
@@ -1448,6 +1470,22 @@ Getting started:
 
 fn print_help(noun: &str) {
     match noun {
+        "alerts" => println!(
+            r#"Operator notifications.
+
+USAGE
+  pigeon alerts <verb>
+
+VERBS
+  test       send one alert to the configured operator address
+
+The channel that reports failures can fail silently: email about email
+infrastructure shares a failure domain with the thing it monitors, so the
+only way to know it works is to use it.
+
+EXAMPLES
+  pigeon --config /etc/pigeon/pigeon.toml alerts test"#
+        ),
         "domain" => println!(
             r#"Add and configure a domain.
 
@@ -1458,6 +1496,7 @@ VERBS
   add        add a domain
   remove     delete a domain and everything under it
   show       status, destination and alias count
+  check      compare published DNS with what this host needs
   forward    set where this domain's mail goes by default
   enable     allow this domain to receive mail
   disable    stop this domain receiving mail
@@ -1600,6 +1639,104 @@ fn config_for_checks(cli: &Cli) -> anyhow::Result<pigeon_config::Config> {
         "checking DNS needs to know this host's name, which is in the configuration file.\n\n  \
          pigeon --config /etc/pigeon/pigeon.toml domain check <domain>"
     )
+}
+
+/// `pigeon alerts test`: send one message down the alert path.
+///
+/// It uses the real delivery client and the real out-of-band route, because a
+/// test that took a different path would be testing a path nobody uses. What it
+/// cannot prove is that the message was *read* — only that this host could hand
+/// it to the operator's mail server.
+fn alerts_test(cli: &Cli) -> anyhow::Result<u8> {
+    let config = config_for_checks(cli)?;
+    let alerts = &config.alerts;
+
+    if !alerts.enabled {
+        anyhow::bail!(
+            "alerts are disabled.\n\n  Set alerts.enabled, alerts.identity and alerts.to in {}",
+            cli.config
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the configuration file".into())
+        );
+    }
+    let (Some(identity), Some(to)) = (&alerts.identity, &alerts.to) else {
+        anyhow::bail!("alerts.identity and alerts.to must both be set");
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let outcome = runtime.block_on(async {
+        // The same relay the daemon's own alerts go through, out of band and
+        // never via the routing engine. A test that took a different path would
+        // be testing a path nobody uses.
+        let resolver = pigeon_dns::SystemResolver::from_system()
+            .map_err(|e| format!("cannot build a resolver: {e}"))?;
+
+        let forwarding = pigeon_smtp::relay::Forwarding {
+            resolver: std::sync::Arc::new(resolver),
+            tls: pigeon_smtp::tls::outbound(),
+            // No self-identity: this is a one-off diagnostic and the CLI does
+            // not bind the listener, so it cannot say which addresses are the
+            // daemon's. The daemon's own alerts get the real one.
+            identity: pigeon_smtp::relay::SelfIdentity::default(),
+            ehlo_name: config.hostname.clone(),
+            limit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            port: 25,
+            budget: std::time::Duration::from_secs(120),
+        };
+
+        let body = format!(
+            "From: <{identity}>\r\n\
+             To: <{to}>\r\n\
+             Subject: [pigeon] alert test\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Auto-Submitted: auto-generated\r\n\
+             \r\n\
+             This is `pigeon alerts test` from {}.\r\n\
+             \r\n\
+             If it arrived, alerts about gated domains will reach you the same way.\r\n\
+             If it did not, the channel is not usable and `pigeon domains check`\r\n\
+             remains the source of truth.\r\n",
+            config.hostname
+        );
+
+        // An empty return path: a bounce for an alert must not produce another
+        // alert about the bounce.
+        pigeon_smtp::relay::forward(&forwarding, 0, to, "", body.as_bytes())
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    match outcome {
+        Ok(remote) => {
+            if cli.json {
+                json::ok(serde_json::json!({
+                    "sent": true,
+                    "to": to,
+                    "remote": remote,
+                }));
+            } else {
+                println!("Sent one alert to {to}.\n  {remote}");
+                println!(
+                    "\nIf it does not arrive, the channel is not usable and \
+                     `pigeon domains check` remains the source of truth."
+                );
+            }
+            Ok(exit::OK)
+        }
+        Err(e) => {
+            if cli.json {
+                json::fail("alert_failed", &e);
+            } else {
+                eprintln!("The alert could not be delivered.\n  {e}");
+            }
+            Ok(exit::FAILED)
+        }
+    }
 }
 
 fn keys_root(cli: &Cli) -> anyhow::Result<PathBuf> {

@@ -270,7 +270,7 @@ pub struct ServerConfig {
     /// could say "advertise it" while the server answered `220 Ready` and kept
     /// reading plaintext, which is a downgrade that looks like a working
     /// encrypted session from the outside. That state is now unrepresentable.
-    pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub tls: Option<crate::tls::Serving>,
     /// Refuse recipients whose sender cannot be given a return path (R-4).
     ///
     /// Shared rather than cloned per connection: it holds the SRS key ring,
@@ -707,7 +707,7 @@ async fn handle<S: MessageSink>(
                         Step::Continue => {}
                         Step::Close => return Ok(()),
                         Step::StartTls(reply) => {
-                            let Some(tls) = config.tls.clone() else {
+                            let Some(tls) = config.tls.as_ref().map(|t| t.current()) else {
                                 // The session only answers `StartTls` when it
                                 // was told TLS is available, which is exactly
                                 // `config.tls.is_some()`.

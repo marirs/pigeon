@@ -368,6 +368,26 @@ pub struct DomainSummary {
     pub default_destination: Option<String>,
 }
 
+/// Move a domain into or out of `error`, the state DNS gating uses.
+///
+/// Only these two transitions, and only from each other or from `active`: the
+/// health worker's job is to take a domain out of service when its records
+/// regress and put it back when they return. It has no business promoting a
+/// domain that has never been onboarded — that is `pigeon domain add`'s path
+/// through `new` and `pending_dns`, where an operator is watching.
+///
+/// Returns whether anything changed, which is what decides if an alert is a
+/// transition or a repetition.
+pub fn set_domain_health(conn: &Connection, domain: &str, healthy: bool) -> Result<bool, DbError> {
+    let want = if healthy { "active" } else { "error" };
+    let changed = conn.execute(
+        "UPDATE domain SET status = ?1
+          WHERE name = ?2 AND status <> ?1 AND status IN ('active', 'error')",
+        rusqlite::params![want, domain.to_ascii_lowercase()],
+    )?;
+    Ok(changed > 0)
+}
+
 pub fn list_domains(conn: &Connection) -> Result<Vec<DomainSummary>, DbError> {
     let mut stmt = conn.prepare(
         "SELECT d.name, d.status, d.inbound_enabled, d.outbound_enabled,

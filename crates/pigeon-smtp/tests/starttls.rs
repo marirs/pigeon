@@ -82,7 +82,9 @@ impl Material {
     fn server_config(&self) -> ServerConfig {
         ServerConfig {
             hostname: "mx.test".into(),
-            tls: Some(pigeon_smtp::tls::load(&self.certificate, &self.private_key).unwrap()),
+            tls: Some(pigeon_smtp::tls::Serving::new(
+                pigeon_smtp::tls::load(&self.certificate, &self.private_key).unwrap(),
+            )),
             ..Default::default()
         }
     }

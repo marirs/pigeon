@@ -79,6 +79,72 @@ pub fn load(certificate: &Path, private_key: &Path) -> Result<Arc<ServerConfig>,
     Ok(Arc::new(config))
 }
 
+/// The certificate a listener is currently serving, swappable in place.
+///
+/// Certificates are renewed on a schedule nobody coordinates with the mail
+/// server — a `certbot` timer, a `lego` cron — and the file changes underneath
+/// a running process. Loading once at startup means serving an expired
+/// certificate until somebody notices and restarts the daemon, which is exactly
+/// the kind of outage that happens on a Sunday.
+///
+/// Read per connection rather than per handshake so a replacement takes effect
+/// on the next connection and never mid-handshake.
+#[derive(Clone)]
+pub struct Serving(Arc<std::sync::RwLock<Arc<ServerConfig>>>);
+
+impl Serving {
+    pub fn new(config: Arc<ServerConfig>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(config)))
+    }
+
+    pub fn current(&self) -> Arc<ServerConfig> {
+        Arc::clone(&self.0.read().expect("TLS configuration lock poisoned"))
+    }
+
+    /// Serve a different certificate from now on.
+    pub fn replace(&self, config: Arc<ServerConfig>) {
+        *self.0.write().expect("TLS configuration lock poisoned") = config;
+    }
+}
+
+impl std::fmt::Debug for Serving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Serving")
+    }
+}
+
+/// When the certificate stops being valid, as a Unix timestamp.
+///
+/// The leaf, which is the one that expires first in practice and the one a
+/// receiver checks. Read from the file rather than from the parsed
+/// `ServerConfig`, because rustls does not expose validity: it refuses expired
+/// certificates at handshake time and has no reason to tell anyone in advance,
+/// which is precisely what an operator needs.
+pub fn expires_at(certificate: &Path) -> Result<i64, TlsError> {
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(certificate)
+        .map_err(|e| TlsError::Certificate {
+            path: certificate.to_path_buf(),
+            reason: e.to_string(),
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(|e| TlsError::Certificate {
+            path: certificate.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+
+    let leaf = chain.first().ok_or_else(|| TlsError::EmptyChain {
+        path: certificate.to_path_buf(),
+    })?;
+
+    let (_, parsed) =
+        x509_parser::parse_x509_certificate(leaf).map_err(|e| TlsError::Certificate {
+            path: certificate.to_path_buf(),
+            reason: format!("cannot be parsed: {e}"),
+        })?;
+
+    Ok(parsed.validity().not_after.timestamp())
+}
+
 // ------------------------------------------------------------------ outbound
 
 /// The client configuration used for `STARTTLS` on delivery.
@@ -220,6 +286,47 @@ mod tests {
             "wrong file blamed: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_certificates_expiry_is_readable_before_it_matters() {
+        // rustls refuses an expired certificate at handshake time and has no
+        // reason to say so in advance, which is exactly what an operator needs:
+        // a renewal timer that has quietly stopped is only visible from the
+        // expiry date.
+        let dir = tmpdir("expiry");
+        let (cert, _) = material(&dir);
+
+        let at = expires_at(&cert).expect("a generated certificate has an expiry");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(at > now, "the fixture certificate is already expired");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_renewed_certificate_replaces_the_served_one() {
+        // A renewal is a file that changed underneath a running process.
+        // Loading once at startup means serving an expired certificate until
+        // somebody restarts the daemon.
+        let dir = tmpdir("swap");
+        let (cert, key) = material(&dir);
+
+        let serving = Serving::new(load(&cert, &key).unwrap());
+        let first = serving.current();
+
+        let other = tmpdir("swap-new");
+        let (cert2, key2) = material(&other);
+        serving.replace(load(&cert2, &key2).unwrap());
+
+        assert!(
+            !Arc::ptr_eq(&first, &serving.current()),
+            "the replacement did not take effect"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[test]

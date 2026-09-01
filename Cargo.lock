@@ -1334,6 +1334,7 @@ dependencies = [
  "pigeon-db",
  "pigeon-dns",
  "pigeon-route",
+ "pigeon-smtp",
  "pigeon-types",
  "rsa",
  "rusqlite",
@@ -1386,6 +1387,7 @@ dependencies = [
 name = "pigeon-smtp"
 version = "0.0.1"
 dependencies = [
+ "pigeon-dns",
  "pigeon-testkit",
  "pigeon-types",
  "rcgen",
@@ -1395,6 +1397,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]

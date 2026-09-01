@@ -37,6 +37,7 @@
 pub mod client;
 pub mod codec;
 pub mod command;
+pub mod relay;
 pub mod reply;
 pub mod server;
 pub mod session;

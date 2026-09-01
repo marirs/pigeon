@@ -23,12 +23,14 @@ pigeon-auth = { workspace = true }
 # One current-thread runtime, for `domain check`: DNS resolution is async and
 # the rest of the CLI is not. Making the whole tool async for one command would
 # be paying for it to look like a daemon.
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
 # 32 bytes from the OS for a new SRS key. Already in the graph via `rsa`;
 # named here because this crate relies on it directly.
 getrandom = "0.3"
 rsa = { workspace = true }
 pigeon-dns = { workspace = true }
+# One delivery path: `alerts test` sends the way the daemon does.
+pigeon-smtp = { workspace = true }
 
 [dev-dependencies]
 pigeon-db = { workspace = true }

@@ -11,6 +11,8 @@ publish.workspace      = true
 
 [dependencies]
 pigeon-types = { workspace = true }
+# MX selection is part of delivering, and delivering lives here.
+pigeon-dns = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -20,6 +22,11 @@ thiserror = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+
+# Certificate expiry. rustls refuses an expired certificate at handshake time
+# and has no reason to say so in advance, which is exactly what an operator
+# needs. Already in the graph through rustls-platform-verifier.
+x509-parser = "0.18"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time", "test-util"] }
