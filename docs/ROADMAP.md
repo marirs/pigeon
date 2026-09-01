@@ -174,16 +174,16 @@ mail that providers reject.**
 
 ## Milestone 3 — Durability
 
-- [ ] durable spool: write, fsync, atomic rename
-- [ ] acknowledge only after the queue row commits
-- [ ] recipient rejection at `RCPT TO`
-- [ ] lease-based queue claim
-- [ ] lease expiry and safe retry
-- [ ] exponential backoff
-- [ ] terminal states and dead-lettering
-- [ ] bounce generation via the SRS return path
-- [ ] DSN generation
-- [ ] body deletion once all recipients are terminal
+- [x] durable spool: write, fsync, atomic rename
+- [x] acknowledge only after the queue row commits
+- [x] recipient rejection at `RCPT TO`
+- [x] lease-based queue claim
+- [x] lease expiry and safe retry
+- [x] exponential backoff
+- [x] terminal states and dead-lettering
+- [x] bounce generation via the SRS return path
+- [x] DSN generation
+- [x] body deletion once all recipients are terminal
 - [x] delivery metadata retention
 - [x] duplicate suppression (declined by policy: §6.2 — safe only within one
       accepted transaction, which is what the acceptance path already does)
