@@ -989,6 +989,11 @@ times. This catches it before the first pass.
 Before connecting, each resolved mail exchanger is compared against what this
 daemon is:
 
+Filtering is **per address**, not per exchanger. One hostname can resolve to
+both this host and a real server, and judging the exchanger usable because it
+has one address elsewhere would still connect to the self address if it came
+first in the list.
+
 - **Addresses, not names.** The comparison is on the socket addresses a
   connection would actually be made to — never reverse DNS or the peer's
   banner, both of which the remote writes and neither of which says where the
@@ -1007,7 +1012,7 @@ The verdicts:
 
 | What the resolver said | Verdict |
 |---|---|
-| Some address elsewhere | connect to it — a mixed MX list is an ordinary secondary-MX arrangement, and the mail belongs at the other host |
+| Some address elsewhere | connect to **those addresses only** — the self ones are removed from the set, not merely outvoted by it, or a hostname resolving to this host *and* a real server would be connected to in order and reach this host first |
 | Every address is this host | skip that exchanger and try the next |
 | Cannot resolve, or timed out | transient, and **not** evidence of a loop |
 | Every usable exchanger is this host | permanent: `554`, rendered as **5.4.6** in the DSN, and a report is owed |

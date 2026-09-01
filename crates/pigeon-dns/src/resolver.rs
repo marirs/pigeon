@@ -56,6 +56,32 @@ pub trait MxLookup: Send + Sync {
         &self,
         domain: &str,
     ) -> impl Future<Output = Result<Vec<MxRecord>, LookupError>> + Send;
+
+    /// Resolve a mail exchanger to the addresses a connection would be made to.
+    ///
+    /// Separate from `lookup_mx` because it answers a different question, and
+    /// on this trait because the delivery path needs both from one object — the
+    /// addresses are what loop detection compares, and resolving them anywhere
+    /// else would mean the address checked and the address connected to could
+    /// differ.
+    ///
+    /// The default is the system resolver by way of `getaddrinfo`, which is
+    /// exactly what `TcpStream::connect((host, port))` did before this existed.
+    /// Deliberately *not* hickory: `/etc/hosts` is how small deployments name
+    /// hosts that no DNS server knows, and a resolver that ignored it would
+    /// stop delivering to them.
+    fn lookup_addresses(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> impl Future<Output = std::io::Result<Vec<std::net::SocketAddr>>> + Send {
+        let host = host.to_string();
+        async move {
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map(|addrs| addrs.collect())
+        }
+    }
 }
 
 /// A live resolver backed by the system configuration.
@@ -164,6 +190,9 @@ fn classify<E: std::error::Error + 'static>(e: E, domain: &str) -> LookupError {
 #[derive(Debug, Default, Clone)]
 pub struct FakeResolver {
     answers: std::collections::HashMap<String, Result<Vec<MxRecord>, LookupError>>,
+    /// Addresses for named hosts. A host with no entry falls through to the
+    /// system resolver, which resolves the address literals most tests use.
+    addresses: std::collections::HashMap<String, Vec<std::net::IpAddr>>,
 }
 
 impl FakeResolver {
@@ -181,6 +210,15 @@ impl FakeResolver {
         self.answers.insert(domain.to_ascii_lowercase(), Err(error));
         self
     }
+
+    /// Give a mail exchanger a fixed address list, in order.
+    ///
+    /// Order matters to what the caller does with it — a delivery tries them in
+    /// the order given — so it is preserved rather than sorted.
+    pub fn with_addresses(mut self, host: &str, addresses: Vec<std::net::IpAddr>) -> Self {
+        self.addresses.insert(host.to_ascii_lowercase(), addresses);
+        self
+    }
 }
 
 impl MxLookup for FakeResolver {
@@ -188,6 +226,24 @@ impl MxLookup for FakeResolver {
         match self.answers.get(&domain.to_ascii_lowercase()) {
             Some(r) => r.clone(),
             None => Err(LookupError::NoSuchDomain(domain.to_string())),
+        }
+    }
+
+    async fn lookup_addresses(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        match self.addresses.get(&host.to_ascii_lowercase()) {
+            Some(addrs) => Ok(addrs
+                .iter()
+                .map(|a| std::net::SocketAddr::new(*a, port))
+                .collect()),
+            // Unmapped names fall through, so a test that only cares about MX
+            // ordering can keep using address literals.
+            None => tokio::net::lookup_host((host, port))
+                .await
+                .map(|addrs| addrs.collect()),
         }
     }
 }

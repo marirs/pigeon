@@ -14,5 +14,11 @@ pigeon-types = { workspace = true }
 hickory-resolver = { workspace = true }
 tracing = { workspace = true }
 
+# For `lookup_host`: address resolution goes through `getaddrinfo`, which is
+# what `TcpStream::connect` did before it was hoisted out — and unlike hickory
+# it reads `/etc/hosts`, which is how small deployments name hosts no DNS
+# server knows.
+tokio = { workspace = true, features = ["net"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

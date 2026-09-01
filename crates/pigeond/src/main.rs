@@ -1363,12 +1363,12 @@ async fn forward<R: MxLookup>(
         // a different one.
         let resolved = tokio::time::timeout(
             CONNECT_TIMEOUT.min(remaining),
-            tokio::net::lookup_host((host.as_str(), f.port)),
+            f.resolver.lookup_addresses(host, f.port),
         )
         .await;
 
         let addresses: Vec<std::net::SocketAddr> = match resolved {
-            Ok(Ok(addrs)) => addrs.collect(),
+            Ok(Ok(addrs)) => addrs,
             Ok(Err(e)) => {
                 // Uncertainty is transient and is *not* evidence of a loop: a
                 // resolver that cannot answer has said nothing about whether
@@ -4772,6 +4772,87 @@ mod tests {
             transcript.saw("MAIL FROM"),
             "the message never reached the exchanger that is not us"
         );
+    }
+
+    #[tokio::test]
+    async fn a_self_address_is_removed_from_an_exchangers_address_set() {
+        // One hostname, two addresses: this host first, a real server second.
+        // The self address is *listening*, so a delivery that merely decided
+        // "this exchanger is usable because one of its addresses is not us" and
+        // then connected to the list in order would reach the wrong machine —
+        // which is Pigeon itself, and the loop this check exists to prevent.
+        //
+        // The all-self test proves an exchanger can be skipped whole. This one
+        // proves the filtering is per address.
+        let (peer_addr, transcript) = pigeon_testkit::Peer::accepting().spawn().await;
+
+        // A second listener on the same port at a different address, standing
+        // in for this daemon's own. It answers nothing: what is asserted is
+        // that nobody knocks.
+        let (self_ip, trap) = bind_beside(peer_addr.port()).await;
+        let knocked = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&knocked);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = trap.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let f = Forwarding {
+            tls: pigeon_smtp::tls::outbound(),
+            identity: SelfIdentity::new(std::net::SocketAddr::new(self_ip, peer_addr.port()), &[]),
+            resolver: Arc::new(
+                pigeon_dns::FakeResolver::new()
+                    .with(
+                        "example.net",
+                        vec![pigeon_dns::MxRecord::new(10, "mx.example.net".to_string())],
+                    )
+                    // Self first, deliberately: a filter that only looked at
+                    // the first address, or that connected in order once the
+                    // set was judged usable, would take this one.
+                    .with_addresses("mx.example.net", vec![self_ip, peer_addr.ip()]),
+            ),
+            ehlo_name: "pigeon.test".into(),
+            limit: Arc::new(Semaphore::new(1)),
+            port: peer_addr.port(),
+            budget: Duration::from_secs(5),
+        };
+
+        forward(&f, 0, "dest@example.net", "s@remote.test", b"body\r\n")
+            .await
+            .expect("the external address should have taken the message");
+
+        assert!(
+            transcript.saw("MAIL FROM"),
+            "the message never reached the address that is not us: {:?}",
+            transcript.lines()
+        );
+        assert_eq!(
+            knocked.load(Ordering::SeqCst),
+            0,
+            "a connection was made to this host's own address"
+        );
+    }
+
+    /// A listener on `port` at an address that is not `127.0.0.1`.
+    ///
+    /// The IPv6 loopback first, since it is present on every machine this runs
+    /// on and can share a port with the IPv4 one. `127.0.0.2` is the fallback:
+    /// Linux routes the whole of `127/8` locally, though macOS does not bind it
+    /// without an alias.
+    async fn bind_beside(port: u16) -> (std::net::IpAddr, TcpListener) {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        for candidate in [
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+        ] {
+            if let Ok(l) = TcpListener::bind((candidate, port)).await {
+                return (candidate, l);
+            }
+        }
+        panic!("no second loopback address could be bound beside 127.0.0.1:{port}");
     }
 
     #[tokio::test]
