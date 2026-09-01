@@ -31,7 +31,9 @@
 #![forbid(unsafe_code)]
 
 pub mod accept;
+pub mod dsn;
 pub mod queue;
+pub mod report;
 pub mod store;
 
 pub use accept::{AcceptFailure, Acceptance, Destination, Reconciled, accept};
