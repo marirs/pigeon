@@ -135,6 +135,10 @@ journalctl -u pigeond -n 50               # "accepted" and "forwarded"
 Check the received headers at the far end. `dkim=pass` and an ARC set that
 validates are what you are looking for.
 
+One message to one mailbox is a smoke test, not a result. Before treating a
+deployment as validated, run [ACCEPTANCE.md](ACCEPTANCE.md): several providers,
+placement recorded as the mailbox actually showed it, and a real SRS bounce.
+
 ---
 
 ## Sending through a smarthost

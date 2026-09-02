@@ -2,6 +2,30 @@
 
 This roadmap prioritises correctness and mail reliability over feature breadth.
 
+---
+
+## Status
+
+**Implementation complete, external acceptance pending.**
+
+Every milestone below is implemented at `318f9e3`: 722 tests, clippy and
+`cargo deny` clean, CI green. One box is unticked on purpose — certificate
+*issuance* is delegated to an external ACME client, and that is a design
+decision rather than a gap.
+
+What has **not** happened is a run against real providers. Nothing here is
+evidence that Gmail, Outlook, Yahoo, Fastmail or Proton accept what this host
+sends, authenticate its DKIM and ARC, place it in an inbox rather than a junk
+folder, or that a real bounce finds its way back through SRS to the original
+sender. Those questions cannot be answered from inside the test suite, and the
+suite passing does not bear on them.
+
+Until [ACCEPTANCE.md](ACCEPTANCE.md) has been run and its artifacts attached to
+a tag, the accurate description of any release is *implementation complete,
+externally unvalidated* — not *production ready*.
+
+---
+
 It is sequenced as a **vertical slice**: get one message from a real sender to a real mailbox early, then harden. Building complete horizontal layers first would mean not forwarding a single message until most of the work was already done, and the hardest question — does forwarded mail actually survive? — would go unanswered the longest.
 
 ---

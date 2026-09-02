@@ -21,3 +21,7 @@ node_modules/
 # It silently excluded .github/, so CI was never committed and never ran —
 # the fmt, clippy, test, OpenSSL and MSRV gates all existed only locally.
 # List dotfiles individually instead.
+
+# Acceptance evidence: real addresses and message contents. Attach a sealed
+# run to a release deliberately; do not commit it by accident.
+evidence/

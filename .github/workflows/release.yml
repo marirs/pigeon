@@ -122,5 +122,14 @@ jobs:
             transit. Checking the signature proves it is the file this project
             published. They are different questions and both are worth asking.
 
+            ## Status of this release
+
+            Implementation complete. Unless the release notes above link
+            acceptance evidence, this build has **not** been validated against
+            real providers — no confirmation that Gmail, Outlook, Yahoo,
+            Fastmail or Proton authenticate its DKIM and ARC, place it in an
+            inbox, or that a real bounce returns through SRS. The test suite
+            does not answer those questions. See `docs/ACCEPTANCE.md`.
+
             See `docs/VERSIONING.md` for what this version number promises, and
             `docs/DEPLOY.md` to install.

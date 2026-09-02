@@ -610,6 +610,7 @@ Apache License 2.0. See [LICENSE](LICENSE).
 Start here:
 
 - **[DEPLOY.md](docs/DEPLOY.md)** — from nothing to mail arriving.
+- **[ACCEPTANCE.md](docs/ACCEPTANCE.md)** — proving real providers accept it.
 - **[CLI.md](docs/CLI.md)** — every command.
 - **[OPERATIONS.md](docs/OPERATIONS.md)** — the queue, health, backups, metrics.
 - **[RECOVERY.md](docs/RECOVERY.md)** — after something has gone wrong.
