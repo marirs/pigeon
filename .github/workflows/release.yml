@@ -22,13 +22,12 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -60,21 +59,19 @@ jobs:
           # checked one.
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: dist/*.tar.gz*
-
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-
       - name: One checksum file for the whole release
         run: |
           set -euo pipefail
@@ -100,36 +97,16 @@ jobs:
           shred -u /tmp/minisign.key
 
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
           fail_on_unmatched_files: false
-          body: |
-            ## Verifying this release
-
-            ```sh
-            # the archive matches the published checksum
-            sha256sum -c SHA256SUMS --ignore-missing
-
-            # the checksums were signed by this project's key
-            minisign -Vm SHA256SUMS -P <the public key from README.md>
-            ```
-
-            Checking only the checksum proves the file was not corrupted in
-            transit. Checking the signature proves it is the file this project
-            published. They are different questions and both are worth asking.
-
-            ## Status of this release
-
-            Implementation complete. Unless the release notes above link
-            acceptance evidence, this build has **not** been validated against
-            real providers — no confirmation that Gmail, Outlook, Yahoo,
-            Fastmail or Proton authenticate its DKIM and ARC, place it in an
-            inbox, or that a real bounce returns through SRS. The test suite
-            does not answer those questions. See `docs/ACCEPTANCE.md`.
-
-            See `docs/VERSIONING.md` for what this version number promises, and
-            `docs/DEPLOY.md` to install.
+          body: "## Verifying this release\n\n```sh\n# the archive matches the published checksum\nsha256sum -c SHA256SUMS --ignore-missing\n\n# the checksums were signed by this project's\
+            \ key\nminisign -Vm SHA256SUMS -P <the public key from README.md>\n```\n\nChecking only the checksum proves the file was not corrupted in\ntransit. Checking the signature proves\
+            \ it is the file this project\npublished. They are different questions and both are worth asking.\n\n## Status of this release\n\nImplementation complete. Unless the release notes\
+            \ above link\nacceptance evidence, this build has **not** been validated against\nreal providers \u2014 no confirmation that Gmail, Outlook, Yahoo,\nFastmail or Proton authenticate\
+            \ its DKIM and ARC, place it in an\ninbox, or that a real bounce returns through SRS. The test suite\ndoes not answer those questions. See `docs/ACCEPTANCE.md`.\n\nSee `docs/VERSIONING.md`\
+            \ for what this version number promises, and\n`docs/DEPLOY.md` to install.\n"
