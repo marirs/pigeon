@@ -12,9 +12,9 @@ env:
 jobs:
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -31,9 +31,9 @@ jobs:
 
   no-openssl:
     name: no openssl
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -153,7 +153,7 @@ jobs:
 
   msrv:
     name: minimum supported Rust
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # rust-toolchain.toml pins `channel = "stable"`, and rustup's directory
     # override beats the toolchain this action installs. Without the explicit
     # override below the job silently ran on current stable and could not fail,
@@ -161,7 +161,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: 1.88.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - name: Confirm the pinned toolchain is actually in use
