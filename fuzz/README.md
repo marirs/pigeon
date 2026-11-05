@@ -8,6 +8,10 @@ This is a separate workspace on purpose. `libfuzzer-sys` needs nightly and a
 sanitizer runtime; making the stable CI gates depend on that would trade gates
 that always run for gates that sometimes can.
 
+Fuzzing runs locally only, with the commands below. There is no fuzz workflow in
+GitHub Actions: it was removed on 2026-11-05 at the owner's request, since CI is
+for build, lint and tests.
+
 ## Running
 
 ```bash
